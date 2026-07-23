@@ -1,6 +1,6 @@
 {
   "name": "bridger",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Let two Claude Code sessions talk to each other: named peers, file-based message threads, ask/answer with full live context.",
   "author": {
     "name": "Houssem Djeghri"
