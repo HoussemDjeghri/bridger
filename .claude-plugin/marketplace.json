@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "houssem-plugins",
+  "description": "Claude Code plugins by Houssem Djeghri.",
+  "owner": {
+    "name": "Houssem Djeghri",
+    "url": "https://github.com/HoussemDjeghri"
+  },
+  "plugins": [
+    {
+      "name": "bridger",
+      "description": "Let two Claude Code sessions message each other: named peers, file-based threads, ask/answer with full live context.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

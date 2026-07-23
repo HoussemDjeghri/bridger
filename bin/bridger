@@ -1,0 +1,747 @@
+#!/usr/bin/env bash
+# bridger — file-based message bus between Claude Code sessions.
+#
+# Layout under $BRIDGER_ROOT (default ~/.claude/bridger):
+#   peers/<name>.json        peer registration: {name, cwd, repo, branch, ...}
+#   peers/<name>.beat        touched by the watcher; freshness = "listening"
+#   threads/<a>--<b>/        one directory per peer pair, names sorted
+#     00001.json ...         immutable messages, zero-padded sequence number
+#     cursor-<name>          highest seq <name> has consumed
+#
+# Invariants:
+#   - Messages are never modified after creation. Each reader tracks its
+#     position with a cursor file, so every thread doubles as an audit log.
+#   - A message lands via hard-link from a temp file: if two sessions race
+#     for the same seq, one link fails and that writer retries with the
+#     next seq. No locks needed for the two-writers-per-thread case.
+#   - Peer names must not contain "--" so "<a>--<b>" directory names stay
+#     unambiguous.
+#   - A name is a durable address: a message sent to a closed session is still
+#     addressed correctly when it starts again. Liveness is a separate, soft
+#     signal (the heartbeat).
+#   - Identity is per session, not per directory: two sessions working one
+#     directory (say two Claude Code sessions on the same branch) register
+#     distinct names and each resolves to its own. A session is recognised by
+#     its Claude Code session id; the directory is the fallback when only one
+#     session is there. A name is held by one live session at a time.
+set -euo pipefail
+
+BRIDGER_ROOT="${BRIDGER_ROOT:-$HOME/.claude/bridger}"
+
+die() { echo "bridger: $*" >&2; exit 1; }
+
+# Suggest the install command that fits the machine's package manager, so a
+# user missing jq gets a line they can paste rather than a bare URL.
+jq_install_hint() {
+  if command -v brew >/dev/null 2>&1; then echo "brew install jq"
+  elif command -v apt >/dev/null 2>&1; then echo "sudo apt install jq"
+  elif command -v dnf >/dev/null 2>&1; then echo "sudo dnf install jq"
+  elif command -v pacman >/dev/null 2>&1; then echo "sudo pacman -S jq"
+  elif command -v apk >/dev/null 2>&1; then echo "sudo apk add jq"
+  else echo "see https://jqlang.github.io/jq/download/"
+  fi
+}
+
+command -v jq >/dev/null 2>&1 || die "jq is required — install it: $(jq_install_hint)"
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+valid_name() {
+  case "$1" in
+    *--*) return 1 ;;
+    *) printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9-]{0,31}$' ;;
+  esac
+}
+
+peer_file() { echo "$BRIDGER_ROOT/peers/$1.json"; }
+beat_file() { echo "$BRIDGER_ROOT/peers/$1.beat"; }
+
+# Directories that asked to stay out. One absolute path per line, so you can
+# read and edit the list with any tool. `bridger leave` adds, `join` removes.
+optout_file() { echo "$BRIDGER_ROOT/optout"; }
+
+opted_out() { # dir
+  [ -f "$(optout_file)" ] && grep -qxF "$1" "$(optout_file)"
+}
+
+optout_add() { # dir
+  mkdir -p "$BRIDGER_ROOT"
+  opted_out "$1" || echo "$1" >> "$(optout_file)"
+}
+
+optout_remove() { # dir
+  local f
+  f=$(optout_file)
+  [ -f "$f" ] || return 0
+  grep -vxF "$1" "$f" > "$f.tmp" || true
+  mv "$f.tmp" "$f"
+}
+
+# A peer is "listening" while its watcher keeps the heartbeat fresh. Anything
+# staler than this is reported as "queued": messages still land, they are just
+# read when that session comes back.
+BEAT_STALE_SECS=15
+
+file_age_secs() { # path -> seconds since mtime, or a large number if absent
+  local f="$1" mtime
+  [ -e "$f" ] || { echo 999999; return; }
+  # BSD (macOS) and GNU stat disagree on flags; try both.
+  mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)
+  echo $(( $(date +%s) - mtime ))
+}
+
+peer_status() { # name -> listening | queued
+  if [ "$(file_age_secs "$(beat_file "$1")")" -lt "$BEAT_STALE_SECS" ]; then
+    echo listening
+  else
+    echo queued
+  fi
+}
+
+# Repo identity for scoping: the shared git dir groups worktrees of one repo
+# together (a worktree and its main checkout count as the same repo).
+repo_id() { # dir -> path or empty
+  (cd "$1" 2>/dev/null && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || true
+}
+
+git_branch() {
+  (cd "$1" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null) || true
+}
+
+# Turn a directory into a usable peer name: "my-app" from /code/my-app.
+name_from_dir() {
+  local base
+  base=$(basename "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' \
+         | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-32)
+  [ -n "$base" ] || base=session
+  echo "$base"
+}
+
+# Four hex chars. Reads a fixed two bytes: an unbounded /dev/urandom pipe
+# would end in SIGPIPE under pipefail when the consumer stops first.
+short_id() {
+  od -An -N2 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+require_peer() {
+  [ -f "$(peer_file "$1")" ] || die "unknown peer '$1' (register it first)"
+}
+
+# Pair directory is order-independent: thread_dir a b == thread_dir b a.
+thread_dir() {
+  if [ "$1" \< "$2" ]; then echo "$BRIDGER_ROOT/threads/$1--$2"
+  else echo "$BRIDGER_ROOT/threads/$2--$1"; fi
+}
+
+max_seq() {
+  local dir="$1" max=0 f s
+  for f in "$dir"/[0-9]*.json; do
+    [ -e "$f" ] || continue
+    s=$((10#$(basename "$f" .json)))
+    [ "$s" -gt "$max" ] && max=$s
+  done
+  echo "$max"
+}
+
+# Print unread messages addressed to $2 in thread $1, one compact JSON per
+# line, considering only seqs up to $3. The caller snapshots that bound with
+# max_seq ONCE and reuses it for advance_cursor: scanning and cursor-writing
+# from two different instants would let a message that lands in between be
+# marked read without ever being delivered.
+unread_in_thread() {
+  local dir="$1" me="$2" top="$3" cur=0 f s
+  [ -f "$dir/cursor-$me" ] && cur=$(cat "$dir/cursor-$me")
+  for f in "$dir"/[0-9]*.json; do
+    [ -e "$f" ] || continue
+    s=$((10#$(basename "$f" .json)))
+    [ "$s" -gt "$cur" ] && [ "$s" -le "$top" ] || continue
+    jq -c --arg me "$me" 'select(.to == $me)' "$f"
+  done
+}
+
+advance_cursor() { # thread_dir me top
+  if [ "$3" -gt 0 ]; then echo "$3" > "$1/cursor-$2"; fi
+}
+
+# List every peer name except $1 (candidates for threads involving $1).
+other_peers() {
+  local f n
+  for f in "$BRIDGER_ROOT"/peers/*.json; do
+    [ -e "$f" ] || continue
+    n=$(basename "$f" .json)
+    [ "$n" = "$1" ] || echo "$n"
+  done
+}
+
+# The Claude Code session id — present in every tool call and stable across a
+# session (CLAUDE_CODE_SESSION_ID). The session-start hook also exports it as
+# BRIDGER_SESSION_ID; that explicit value wins so a hook or test can pin one.
+# Empty outside a session (a plain shell, a script). Two sessions can share a
+# working directory, so this is what tells them apart.
+session_id() { echo "${BRIDGER_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}"; }
+
+# Resolve identity from the working directory: the registered peer whose cwd
+# equals $PWD or is its closest ancestor. When two peers share a directory (two
+# sessions on one branch), the one THIS session registered wins; otherwise the
+# longest-matching cwd wins, as before. Callers that need to resolve a DIFFERENT
+# directory prefix the call with PWD=<dir> — an env-var prefix applies to shell
+# functions just as it does to external commands.
+resolve_identity() {
+  local f name cwd sess sid best="" bestlen=-1 mine="" minelen=-1
+  sid=$(session_id)
+  for f in "$BRIDGER_ROOT"/peers/*.json; do
+    [ -e "$f" ] || continue
+    name=$(jq -r .name "$f")
+    cwd=$(jq -r .cwd "$f")
+    sess=$(jq -r '.session // ""' "$f")
+    case "$PWD" in
+      "$cwd"|"$cwd"/*)
+        if [ "${#cwd}" -gt "$bestlen" ]; then best=$name; bestlen=${#cwd}; fi
+        if [ -n "$sid" ] && [ "$sess" = "$sid" ] && [ "${#cwd}" -gt "$minelen" ]; then
+          mine=$name; minelen=${#cwd}
+        fi ;;
+    esac
+  done
+  if [ -n "$mine" ]; then echo "$mine"; elif [ -n "$best" ]; then echo "$best"; fi
+}
+
+# The peer THIS session registered whose directory covers $PWD, or empty. Lets
+# register find a session's own prior identity for a clean rename, without
+# matching peers OTHER sessions registered in the same directory.
+resolve_my_identity() {
+  local f name cwd sess sid best="" bestlen=-1
+  sid=$(session_id)
+  [ -n "$sid" ] || return 0
+  for f in "$BRIDGER_ROOT"/peers/*.json; do
+    [ -e "$f" ] || continue
+    sess=$(jq -r '.session // ""' "$f")
+    [ "$sess" = "$sid" ] || continue
+    name=$(jq -r .name "$f")
+    cwd=$(jq -r .cwd "$f")
+    case "$PWD" in
+      "$cwd"|"$cwd"/*)
+        if [ "${#cwd}" -gt "$bestlen" ]; then best=$name; bestlen=${#cwd}; fi ;;
+    esac
+  done
+  [ -n "$best" ] && echo "$best"
+}
+
+require_identity() {
+  local me
+  me=$(resolve_identity) || true
+  [ -n "${me:-}" ] || die "this directory is not registered as a peer (run: bridger register <name>)"
+  echo "$me"
+}
+
+# Write (or refresh) a peer record. Preserves the summary of an existing peer,
+# since re-registering the same directory must not erase what it said it does.
+# BRIDGER_SESSION_ID, when set (the session-start hook exports it), records
+# which Claude Code session currently answers to this name — the session id is
+# also the transcript filename, so a peer can be traced back to its session.
+write_peer() { # name dir
+  local name="$1" dir="$2" summary="" created session="${BRIDGER_SESSION_ID:-}"
+  created=$(now_utc)
+  if [ -f "$(peer_file "$name")" ]; then
+    summary=$(jq -r '.summary // ""' "$(peer_file "$name")")
+    created=$(jq -r '.created // empty' "$(peer_file "$name")")
+    [ -n "$session" ] || session=$(jq -r '.session // ""' "$(peer_file "$name")")
+    [ -n "$created" ] || created=$(now_utc)
+  fi
+  mkdir -p "$BRIDGER_ROOT/peers"
+  jq -n --arg name "$name" --arg cwd "$dir" --arg created "$created" \
+        --arg repo "$(repo_id "$dir")" --arg branch "$(git_branch "$dir")" \
+        --arg summary "$summary" --arg seen "$(now_utc)" --arg session "$session" \
+    '{name: $name, cwd: $cwd, repo: $repo, branch: $branch,
+      summary: $summary, session: $session, created: $created, last_seen: $seen}' \
+    > "$(peer_file "$name")"
+}
+
+# Does this peer have any message history? Renaming away from a name with a
+# thread would orphan that thread, so it is only safe when there is none.
+peer_has_history() { # name
+  local dir f
+  for dir in "$BRIDGER_ROOT"/threads/*"$1"*; do
+    [ -d "$dir" ] || continue
+    case "$(basename "$dir")" in "$1--"*|*"--$1") ;; *) continue ;; esac
+    for f in "$dir"/[0-9]*.json; do [ -e "$f" ] && return 0; done
+  done
+  return 1
+}
+
+cmd_register() {
+  local name="${1:-}" dir="${2:-$PWD}" sid mine existing holder
+  [ -n "$name" ] || die "usage: bridger register <name> [dir]"
+  valid_name "$name" || die "invalid name '$name' (lowercase letters, digits, single dashes; max 32 chars)"
+  [ -d "$dir" ] || die "no such directory: $dir"
+  dir=$(cd "$dir" && pwd)
+  sid=$(session_id)
+
+  # A clean rename of MY OWN identity in this directory: drop the old name so a
+  # session answers to exactly one. Refused when that name has a thread — its
+  # log would be orphaned; keep it, or `bridger leave` first.
+  mine=$(PWD="$dir" resolve_my_identity) || true
+  if [ -n "${mine:-}" ] && [ "$mine" != "$name" ]; then
+    if peer_has_history "$mine"; then
+      die "you are '$mine', which has message history.
+       Keep that name, or run 'bridger leave' first — its thread stays on disk as a log."
+    fi
+    rm -f "$(peer_file "$mine")" "$(beat_file "$mine")"
+  fi
+
+  # Upgrade a session-less derived name sitting on this exact directory (the
+  # auto-register -> explicit-register path). A name another session owns, or
+  # one with a thread, is left alone — two sessions may share a directory.
+  existing=$(PWD="$dir" resolve_identity) || true
+  if [ -n "${existing:-}" ] && [ "$existing" != "$name" ] \
+     && [ "$(jq -r .cwd "$(peer_file "$existing")")" = "$dir" ] \
+     && [ -z "$(jq -r '.session // ""' "$(peer_file "$existing")")" ] \
+     && ! peer_has_history "$existing"; then
+    rm -f "$(peer_file "$existing")" "$(beat_file "$existing")"
+  fi
+
+  # Same name, a DIFFERENT session, still live: refuse rather than let two
+  # sessions share one mailbox (they would race on the same read cursor). A
+  # dead holder (stale heartbeat) is taken over — how a restart reclaims a role.
+  if [ -f "$(peer_file "$name")" ]; then
+    holder=$(jq -r '.session // ""' "$(peer_file "$name")")
+    if [ -n "$sid" ] && [ -n "$holder" ] && [ "$holder" != "$sid" ] \
+       && [ "$(peer_status "$name")" = "listening" ]; then
+      die "'$name' is held by a live session — stop it or pick another name"
+    fi
+  fi
+
+  optout_remove "$dir"   # naming a directory is an explicit opt-in
+  BRIDGER_SESSION_ID="$sid" write_peer "$name" "$dir"   # claim it for this session
+  echo "registered '$name' -> $dir"
+}
+
+# Stop being addressable from this directory. The peer record goes away, so
+# nothing can be sent here and nothing is listed; existing threads stay on
+# disk as history. Reverse it with `join` (or by naming it with `register`).
+cmd_leave() {
+  local me dir
+  me=$(resolve_identity) || true
+  if [ -z "${me:-}" ]; then
+    optout_add "$PWD"
+    echo "this directory was not a peer; it will not auto-register"
+    return 0
+  fi
+  dir=$(jq -r .cwd "$(peer_file "$me")")
+  rm -f "$(peer_file "$me")" "$(beat_file "$me")"
+  optout_add "$dir"
+  echo "left the bridger as '$me'; $dir will not auto-register (history kept)"
+}
+
+cmd_join() {
+  optout_remove "$PWD"
+  derive_and_register "$PWD" >/dev/null
+  echo "joined the bridger as '$(resolve_identity)'"
+}
+
+# Register a directory under a name derived from it ("my-app" from
+# /code/my-app). Idempotent: a directory that already has a peer keeps its
+# name and mailbox. Shared by `join` and auto-discovery.
+#
+# Naming differs by how deliberate the act was. `join` is a human choice, so
+# the name is the predictable basename (suffixed -2, -3 on collision). Auto-
+# discovery names get a generated tag — "my-app-3f2a" — because a mesh full of
+# bare basenames invites collisions and misdelivery. The tag is minted once
+# per DIRECTORY and persisted, never per session: a per-session name would die
+# with the session, and queued delivery needs an address that outlives it.
+derive_and_register() { # dir [tagged]
+  local dir="$1" existing base name n=2
+  existing=$(PWD="$dir" resolve_identity) || true
+  if [ -n "${existing:-}" ]; then
+    # Refresh branch/last_seen — the identity itself stays put.
+    write_peer "$existing" "$(jq -r .cwd "$(peer_file "$existing")")"
+    echo "$existing"
+    return 0
+  fi
+  base=$(name_from_dir "$dir")
+  if [ "${2:-}" = "tagged" ]; then
+    base=$(echo "$base" | cut -c1-27 | sed 's/-$//')
+    while :; do
+      name="$base-$(short_id)"
+      [ -f "$(peer_file "$name")" ] || break
+    done
+  else
+    name="$base"
+    while [ -f "$(peer_file "$name")" ]; do
+      name="$base-$n"
+      n=$((n + 1))
+    done
+  fi
+  write_peer "$name" "$dir"
+  echo "$name"
+}
+
+# Called by the session-start hook. The bridger is OPT-IN by default: a session
+# only becomes addressable when its directory was explicitly registered (or
+# joined). Set CLAUDE_BRIDGER_AUTO=1 to let every session join on its own —
+# peers-style discovery for people who want a machine-wide mesh.
+cmd_autoregister() {
+  local dir="${1:-$PWD}" existing
+  dir=$(cd "$dir" && pwd)
+  existing=$(PWD="$dir" resolve_identity) || true
+  if [ -n "${existing:-}" ]; then
+    write_peer "$existing" "$(jq -r .cwd "$(peer_file "$existing")")"
+    echo "$existing"
+    return 0
+  fi
+  [ "${CLAUDE_BRIDGER_AUTO:-0}" = "1" ] || exit 1
+  opted_out "$dir" && exit 1
+  derive_and_register "$dir" tagged
+}
+
+# Say what this session is working on, so other agents can pick the right peer.
+cmd_summary() {
+  local text="${*:-}" me
+  [ -n "$text" ] || die "usage: bridger summary <text>"
+  me=$(require_identity)
+  jq --arg s "$text" '.summary = $s' "$(peer_file "$me")" > "$(peer_file "$me").tmp"
+  mv "$(peer_file "$me").tmp" "$(peer_file "$me")"
+  echo "summary set for '$me'"
+}
+
+# Who else is out there. Scope narrows the list; default is everything on this
+# machine. Status is a soft signal — a "queued" peer still receives messages.
+cmd_peers() {
+  local scope=machine me my_repo f name cwd repo branch summary status mark
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --machine|--repo|--dir) scope="${1#--}"; shift ;;
+      *) die "usage: bridger peers [--machine|--repo|--dir]" ;;
+    esac
+  done
+  me=$(resolve_identity) || true
+  my_repo=$(repo_id "$PWD")
+  for f in "$BRIDGER_ROOT"/peers/*.json; do
+    [ -e "$f" ] || continue
+    name=$(jq -r .name "$f"); cwd=$(jq -r .cwd "$f")
+    repo=$(jq -r '.repo // ""' "$f"); branch=$(jq -r '.branch // ""' "$f")
+    summary=$(jq -r '.summary // ""' "$f")
+    case "$scope" in
+      repo) [ -n "$my_repo" ] && [ "$repo" = "$my_repo" ] || continue ;;
+      dir)  [ "$cwd" = "$PWD" ] || continue ;;
+    esac
+    status=$(peer_status "$name")
+    mark=""; [ "$name" = "${me:-}" ] && mark=" (you)"
+    printf '%s [%s]%s %s%s%s\n' "$name" "$status" "$mark" "$cwd" \
+      "$([ -n "$branch" ] && echo " @$branch")" \
+      "$([ -n "$summary" ] && echo " — $summary")"
+  done
+}
+
+cmd_whoami() {
+  local me
+  me=$(resolve_identity) || true
+  [ -n "${me:-}" ] || exit 1
+  echo "$me"
+}
+
+cmd_send() {
+  local from="" to="" type="" body="" ref=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) from="$2"; shift 2 ;;
+      --ref)  ref="$2";  shift 2 ;;
+      *)
+        if [ -z "$to" ]; then to="$1"
+        elif [ -z "$type" ]; then type="$1"
+        elif [ -z "$body" ]; then body="$1"
+        else die "unexpected argument: $1"
+        fi
+        shift ;;
+    esac
+  done
+  [ -n "$to" ] && [ -n "$type" ] && [ -n "$body" ] || die "usage: bridger send <to>[,<to>...]|@all <type> <body> [--ref N] [--from <name>]"
+  [ -n "$from" ] || from=$(require_identity)
+
+  # Routing: "@all" fans out to every other peer; "a,b" to exactly those.
+  # Each recipient gets the message in its own pairwise thread, so peers the
+  # message doesn't concern never see it. Fan-out prints "<peer> <seq>" per
+  # recipient; single sends keep printing the bare seq (ask relies on it).
+  local recipients="" r
+  if [ "$to" = "@all" ]; then
+    recipients=$(other_peers "$from")
+    [ -n "$recipients" ] || die "no other peers to broadcast to"
+  elif [ "${to#*,}" != "$to" ]; then
+    case ",$to," in *",@all,"*) die "cannot mix @all with a peer list" ;; esac
+    recipients=$(echo "$to" | tr ',' '\n')
+  fi
+  if [ -n "$recipients" ]; then
+    for r in $recipients; do
+      echo "$r $(cmd_send "$r" "$type" "$body" --from "$from" ${ref:+--ref "$ref"})"
+    done
+    return 0
+  fi
+
+  require_peer "$from"; require_peer "$to"
+  [ "$from" != "$to" ] || die "cannot send to yourself"
+
+  local dir tmp seq target
+  dir=$(thread_dir "$from" "$to")
+  mkdir -p "$dir"
+  tmp=$(mktemp "$dir/.msg.XXXXXX")
+  while :; do
+    seq=$(( $(max_seq "$dir") + 1 ))
+    jq -n --argjson seq "$seq" --arg from "$from" --arg to "$to" \
+          --arg type "$type" --arg body "$body" --arg ts "$(now_utc)" --arg ref "$ref" \
+      '{seq: $seq, from: $from, to: $to, type: $type, body: $body, ts: $ts}
+       + (if $ref == "" then {} else {ref: ($ref | tonumber)} end)' > "$tmp"
+    target=$(printf '%s/%05d.json' "$dir" "$seq")
+    # Hard-link is atomic and fails if the seq was taken meanwhile — retry.
+    # A failure with the target absent is NOT a collision (disk full,
+    # permissions, read-only fs): retrying would spin forever, so die.
+    if ln "$tmp" "$target" 2>/dev/null; then
+      rm -f "$tmp"
+      echo "$seq"
+      return 0
+    fi
+    [ -e "$target" ] || { rm -f "$tmp"; die "cannot write message into $dir"; }
+  done
+}
+
+# Render message JSON as one terse line per message — the delivery format.
+# Newlines in bodies are escaped so "one line = one message" always holds.
+render_lines() {
+  jq -r '"#\(.seq) \(.from) \(.type)\(if .ref then " re#\(.ref)" else "" end): \(.body | gsub("\n"; "\\n"))"'
+}
+
+# Consume (or peek at) unread messages across every thread involving me.
+# Default output is the terse line format (token-cheap for agents); --json
+# emits the full stored objects for scripting.
+cmd_poll() {
+  local peek=0 json=0 me peer dir
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --peek) peek=1 ;;
+      --json) json=1 ;;
+      *) die "usage: bridger poll [--peek] [--json]" ;;
+    esac
+    shift
+  done
+  me=$(require_identity)
+  local top
+  for peer in $(other_peers "$me"); do
+    dir=$(thread_dir "$me" "$peer")
+    [ -d "$dir" ] || continue
+    top=$(max_seq "$dir")
+    if [ "$json" -eq 1 ]; then
+      unread_in_thread "$dir" "$me" "$top"
+    else
+      unread_in_thread "$dir" "$me" "$top" | render_lines
+    fi
+    [ "$peek" -eq 1 ] || advance_cursor "$dir" "$me" "$top"
+  done
+}
+
+cmd_wait() {
+  local timeout=300 follow=0 me out
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout) timeout="$2"; shift 2 ;;
+      --follow)  follow=1; shift ;;
+      *) die "usage: bridger wait [--timeout S] [--follow]" ;;
+    esac
+  done
+  me=$(require_identity)
+  if [ "$follow" -eq 1 ]; then
+    # One terse line per incoming message, forever. Feed this to a watcher.
+    # Each cycle also refreshes the heartbeat that marks this peer "listening".
+    # Signals must actually exit — a bare cleanup trap would resume the loop.
+    trap 'rm -f "$(beat_file "$me")"' EXIT
+    trap 'exit 0' INT TERM
+    while :; do
+      : > "$(beat_file "$me")"
+      out=$(cmd_poll)
+      [ -n "$out" ] && echo "$out"
+      sleep 0.5
+    done
+  fi
+  local deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    [ -n "$(cmd_poll --peek)" ] && return 0
+    sleep 0.5
+  done
+  echo "bridger: no message within ${timeout}s" >&2
+  return 1
+}
+
+cmd_ask() {
+  local to="" body="" timeout=120 json=0 me seq line ref
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout) timeout="$2"; shift 2 ;;
+      --json) json=1; shift ;;
+      *) if [ -z "$to" ]; then to="$1"; elif [ -z "$body" ]; then body="$1"; else die "unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  [ -n "$to" ] && [ -n "$body" ] || die "usage: bridger ask <to> <body> [--timeout S] [--json]"
+  # ask correlates ONE reply to one question; fan-out targets can't work here.
+  case "$to" in *,*|@all) die "ask takes a single peer (use send for fan-out)" ;; esac
+  me=$(require_identity)
+  seq=$(cmd_send "$to" ask "$body" --from "$me")
+  local deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      ref=$(jq -r '.ref // empty' <<<"$line")
+      if [ "$ref" = "$seq" ]; then
+        if [ "$json" -eq 1 ]; then echo "$line"; else render_lines <<<"$line"; fi
+        return 0
+      fi
+      # Unrelated traffic consumed while waiting — surface it, don't drop it.
+      render_lines <<<"$line" >&2
+    done <<EOF
+$(cmd_poll --json)
+EOF
+    sleep 0.5
+  done
+  echo "bridger: no reply to #$seq within ${timeout}s" >&2
+  return 1
+}
+
+cmd_log() {
+  local peer="" json=0 me dir f
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      *)
+        [ -z "$peer" ] || die "usage: bridger log <peer> [--json]"
+        peer="$1"; shift ;;
+    esac
+  done
+  [ -n "$peer" ] || die "usage: bridger log <peer> [--json]"
+  me=$(require_identity)
+  require_peer "$peer"
+  dir=$(thread_dir "$me" "$peer")
+  [ -d "$dir" ] || { [ "$json" -eq 1 ] || echo "(no messages yet)"; return 0; }
+  for f in "$dir"/[0-9]*.json; do
+    [ -e "$f" ] || continue
+    if [ "$json" -eq 1 ]; then
+      jq -c . "$f"
+    else
+      jq -r '"#\(.seq)  \(.ts)  \(.from) -> \(.to)  [\(.type)]\(if .ref then " re #\(.ref)" else "" end)  \(.body)"' "$f"
+    fi
+  done
+}
+
+# Render selected message types of a thread as markdown, deterministically:
+# the same thread always produces byte-identical output, so the result can be
+# committed as a governance record and regenerated from any checkout. Output
+# goes to stdout; the caller decides the file. Default types suit a
+# coordinator/worker decision channel; --types all renders everything.
+cmd_mirror() {
+  local peer="" types="stop,ruling" me dir f t
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --types) types="$2"; shift 2 ;;
+      *) [ -z "$peer" ] && { peer="$1"; shift; } || die "usage: bridger mirror <peer> [--types t1,t2|all]" ;;
+    esac
+  done
+  [ -n "$peer" ] || die "usage: bridger mirror <peer> [--types t1,t2|all]"
+  me=$(require_identity)
+  require_peer "$peer"
+  dir=$(thread_dir "$me" "$peer")
+
+  # Stable header: names in thread (sorted) order, no generation timestamp.
+  printf '# Channel log — %s\n\n' "$(basename "$dir" | sed 's/--/ <-> /')"
+  printf '<!-- Generated from the message thread by `bridger mirror`. Do not edit; regenerate. -->\n'
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/[0-9]*.json; do
+    [ -e "$f" ] || continue
+    t=$(jq -r .type "$f")
+    case ",$types," in
+      *",$t,"* | ",all,") ;;
+      *) continue ;;
+    esac
+    printf '\n## #%s %s — %s\n\n' \
+      "$(jq -r .seq "$f")" \
+      "$(jq -r '"\(.type)\(if .ref then " re #\(.ref)" else "" end)"' "$f")" \
+      "$(jq -r '"\(.ts) \(.from) -> \(.to)"' "$f")"
+    jq -r .body "$f"
+  done
+}
+
+cmd_offline() {
+  local me
+  me=$(resolve_identity) || exit 0
+  rm -f "$(beat_file "$me")"
+}
+
+cmd_status() {
+  local me peer dir n
+  me=$(resolve_identity) || true
+  echo "identity: ${me:-<none — run: bridger register <name>>}"
+  [ -n "${me:-}" ] || return 0
+  for peer in $(other_peers "$me"); do
+    dir=$(thread_dir "$me" "$peer")
+    n=0
+    [ -d "$dir" ] && n=$(unread_in_thread "$dir" "$me" "$(max_seq "$dir")" | grep -c . || true)
+    echo "peer: $peer  unread: $n"
+  done
+}
+
+cmd_help() {
+  cat <<'EOF'
+bridger — message bus between Claude Code sessions (file-based, jq only)
+
+usage:
+  bridger peers [--machine|--repo|--dir]
+                                      list peers: name, status, directory, branch, summary
+  bridger summary <text>               say what this session is working on
+  bridger register <name> [dir]        make this (or given) directory addressable, by name
+  bridger join                         register with a name derived from the directory
+  bridger leave                        stop being addressable here (history kept)
+  bridger whoami                       print the peer name matching the current directory
+  bridger send <to>[,<to>...]|@all <type> <body> [--ref N] [--from <name>]
+                                      send a message; prints its seq. A comma list
+                                      reaches exactly those peers; @all reaches every
+                                      other peer (one copy per pairwise thread)
+  bridger poll [--peek] [--json]       print unread messages, one line each:
+                                      "#<seq> <from> <type>[ re#<n>]: <body>"; --peek keeps
+                                      them unread; --json emits full stored objects
+  bridger wait [--timeout S]           block until a message arrives (default 300s)
+  bridger wait --follow                stream incoming messages forever, one line each
+  bridger ask <to> <body> [--timeout S] [--json]
+                                      send an 'ask' and block for the reply (matched by ref)
+  bridger log <peer> [--json]          full conversation with a peer
+  bridger mirror <peer> [--types t1,t2|all]
+                                      render selected types as committable markdown
+                                      (deterministic; default types: stop,ruling)
+  bridger status                       identity, peers, unread counts
+
+message types are free-form strings; conventions: chat, ask, answer.
+peer status: "listening" (its watcher is running) or "queued" (messages wait
+on disk until that session starts again). Both are addressable.
+OPT-IN by default: only directories you register or join are addressable.
+Two sessions in one directory each get their own name — identity follows the
+session, not just the directory — so sessions on the same branch can talk.
+CLAUDE_BRIDGER_AUTO=1 makes every session join on its own (peers-style mesh);
+`bridger leave` keeps a directory out of that mode for good.
+data lives under $BRIDGER_ROOT (default ~/.claude/bridger).
+EOF
+}
+
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+  register) cmd_register "$@" ;;
+  autoregister) cmd_autoregister "$@" ;;
+  leave)    cmd_leave "$@" ;;
+  join)     cmd_join "$@" ;;
+  peers)    cmd_peers "$@" ;;
+  summary)  cmd_summary "$@" ;;
+  offline)  cmd_offline "$@" ;;
+  whoami)   cmd_whoami "$@" ;;
+  send)     cmd_send "$@" ;;
+  poll)     cmd_poll "$@" ;;
+  wait)     cmd_wait "$@" ;;
+  ask)      cmd_ask "$@" ;;
+  log)      cmd_log "$@" ;;
+  mirror)   cmd_mirror "$@" ;;
+  status)   cmd_status "$@" ;;
+  help|--help|-h) cmd_help ;;
+  *) die "unknown command '$cmd' (try: bridger help)" ;;
+esac
