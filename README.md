@@ -18,6 +18,7 @@
   <a href="#install">Install</a> ·
   <a href="#real-use-cases">Use cases</a> ·
   <a href="#quick-start">Quick start</a> ·
+  <a href="#staying-up-to-date">Updating</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#comparison">Compare</a> ·
   <a href="#faq">FAQ</a>
@@ -71,6 +72,8 @@ Identity follows the **session**, not the folder, so two sessions sharing one di
 /plugin install bridger@houssem-plugins
 ```
 
+> **Then turn on auto-update** so fixes reach you automatically: `/plugin` → **Marketplaces** → **houssem-plugins** → **Enable auto-update**. Community marketplaces ship with it *off* and Claude Code won't prompt you about new versions — this one-time switch is what keeps you current. (See [Staying up to date](#staying-up-to-date).)
+
 **2. Register** each session, once
 ```
 /bridger:register my-library
@@ -83,6 +86,15 @@ Identity follows the **session**, not the folder, so two sessions sharing one di
 ```
 
 Restart your sessions after installing so the `SessionStart` hook is active.
+
+## Staying up to date
+
+Community marketplaces install with **auto-update off**, and Claude Code shows no "update available" prompt — so by default you keep the version you first installed. Two ways to stay current:
+
+- **Turn on auto-update — recommended, one-time:** `/plugin` → **Marketplaces** → **houssem-plugins** → **Enable auto-update**. New versions then install silently within ~10 minutes of a session start; run `/reload-plugins` (or relaunch) to load them.
+- **Update by hand, any time:** `/plugin marketplace update houssem-plugins`, then `/reload-plugins`.
+
+Version history is the git tags (`vX.Y.Z`) at [github.com/HoussemDjeghri/bridger/releases](https://github.com/HoussemDjeghri/bridger/releases).
 
 ## Live Example
 
