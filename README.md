@@ -268,7 +268,7 @@ Message data under `~/.claude/bridger/` is yours; delete it separately if you wa
 |---|---|
 | `/bridger:register <name>` | Register the current project as a peer and arm the watch |
 | `/bridger:peers` | Who is addressable, their status and what they're doing |
-| `/bridger:ask <peer> <question>` | Ask a peer and wait for its answer (blocks, ~120s timeout) |
+| `/bridger:ask <peer> <question>` | Ask a peer and wait for its answer (blocks; 300s default, tune with `--timeout` or `$BRIDGER_ASK_TIMEOUT`) |
 | `/bridger:send <peer> <message>` | Fire-and-forget message |
 | `/bridger:status` | Identity, known peers, unread counts |
 | `/bridger:log <peer>` | Full conversation history with a peer |

@@ -83,6 +83,15 @@ fi
 (cd "$work/app" && "$bridger" wait --timeout 10 >/dev/null) || fail "wait must return 0 when unread exists"
 pass "ask/wait timeout paths"
 
+# --- ask rejects a non-numeric timeout, from the flag or the env override ----
+if (cd "$work/app" && "$bridger" ask liba "x" --timeout abc >/dev/null 2>&1); then
+  fail "ask must reject a non-numeric --timeout"
+fi
+if (cd "$work/app" && BRIDGER_ASK_TIMEOUT=oops "$bridger" ask liba "x" >/dev/null 2>&1); then
+  fail "ask must reject a non-numeric \$BRIDGER_ASK_TIMEOUT"
+fi
+pass "ask validates the timeout value (flag and env)"
+
 # --- concurrent sends land with distinct seqs -------------------------------
 before=$(ls "$BRIDGER_ROOT"/threads/app--liba/ | grep -c '\.json$')
 (cd "$work/app" && "$bridger" send liba chat "race one" >/dev/null) &

@@ -569,7 +569,11 @@ cmd_wait() {
 }
 
 cmd_ask() {
-  local to="" body="" timeout=120 json=0 me seq line ref
+  local to="" body="" json=0 me seq line ref
+  # A reasoning peer can take minutes to answer; the old 120s default cut
+  # max-effort replies off mid-thought. Precedence: --timeout flag wins, else
+  # $BRIDGER_ASK_TIMEOUT (export it once for an unattended run), else 300s.
+  local timeout="${BRIDGER_ASK_TIMEOUT:-300}"
   while [ $# -gt 0 ]; do
     case "$1" in
       --timeout) timeout="$2"; shift 2 ;;
@@ -578,6 +582,7 @@ cmd_ask() {
     esac
   done
   [ -n "$to" ] && [ -n "$body" ] || die "usage: bridger ask <to> <body> [--timeout S] [--json]"
+  case "$timeout" in ''|*[!0-9]*) die "timeout must be a whole number of seconds (got: '$timeout')" ;; esac
   # ask correlates ONE reply to one question; fan-out targets can't work here.
   case "$to" in *,*|@all) die "ask takes a single peer (use send for fan-out)" ;; esac
   me=$(require_identity)
@@ -705,7 +710,8 @@ usage:
   bridger wait [--timeout S]           block until a message arrives (default 300s)
   bridger wait --follow                stream incoming messages forever, one line each
   bridger ask <to> <body> [--timeout S] [--json]
-                                      send an 'ask' and block for the reply (matched by ref)
+                                      send an 'ask' and block for the reply (matched by ref);
+                                      waits 300s by default, or $BRIDGER_ASK_TIMEOUT
   bridger log <peer> [--json]          full conversation with a peer
   bridger mirror <peer> [--types t1,t2|all]
                                       render selected types as committable markdown
