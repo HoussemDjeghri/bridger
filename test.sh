@@ -11,6 +11,13 @@ work=$(mktemp -d)
 export BRIDGER_ROOT
 trap 'rm -rf "$BRIDGER_ROOT" "$work"' EXIT
 
+# Determinism: identity resolution is session-aware, so the suite must not
+# inherit a real CLAUDE_CODE_SESSION_ID from the shell that runs it (that would
+# make id-less cases behave differently inside vs. outside a Claude Code
+# session). Tests that exercise session semantics set the id explicitly, per
+# call. The default here is id-less — the plain-CLI path.
+unset CLAUDE_CODE_SESSION_ID BRIDGER_SESSION_ID 2>/dev/null || true
+
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "ok - $*"; }
 
@@ -155,14 +162,17 @@ grep -q "plain \[queued\]" <<<"$(cd "$disc/plain" && "$bridger" peers --dir)" ||
 [ ! -e "$BRIDGER_ROOT/peers/plain.beat" ] || fail "offline must clear the heartbeat"
 pass "heartbeat: listening while watched, queued when stopped or stale"
 
-# Re-registering must not erase what the peer said it was doing, and must
-# record the current session id when the hook provides one.
-(cd "$disc/plain" && BRIDGER_SESSION_ID=sess-abc123 "$bridger" autoregister >/dev/null)
-grep -q "still building" <<<"$(cd "$disc/plain" && "$bridger" peers --dir)" || fail "autoregister must preserve summary"
-[ "$(jq -r .session "$BRIDGER_ROOT/peers/plain.json")" = "sess-abc123" ] || fail "peer must record its session id"
+# Re-registering must not erase the summary, and register records the session id.
+# Explicit register claims the session-less name `join` created — under the
+# per-session model a different session never adopts it implicitly.
+(cd "$disc/plain" && CLAUDE_CODE_SESSION_ID=sess-abc123 "$bridger" register plain >/dev/null)
+[ "$(jq -r .session "$BRIDGER_ROOT/peers/plain.json")" = "sess-abc123" ] || fail "register must record its session id"
+grep -q "still building" <<<"$(cd "$disc/plain" && "$bridger" peers --dir)" || fail "register must preserve the summary"
+# An id-less refresh (a plain-CLI autoregister, resolves by directory) must not
+# wipe the recorded session.
 (cd "$disc/plain" && "$bridger" autoregister >/dev/null)
-[ "$(jq -r .session "$BRIDGER_ROOT/peers/plain.json")" = "sess-abc123" ] || fail "session id must survive refresh without one"
-pass "re-registration preserves peer metadata and tracks the session id"
+[ "$(jq -r .session "$BRIDGER_ROOT/peers/plain.json")" = "sess-abc123" ] || fail "id-less refresh must preserve the session id"
+pass "re-registration preserves peer metadata and records the session id"
 
 # --- opting out --------------------------------------------------------------
 mkdir -p "$disc/private"
@@ -177,22 +187,23 @@ if (cd "$disc/private" && "$bridger" autoregister >/dev/null 2>&1); then fail "a
 pass "leave / join under auto mode"
 
 # --- explicit names override derived ones (the coordinator/worker case) ------
-# Two checkouts of one project: each auto-registers from its directory name,
-# then takes an explicit role name. The rename must be clean, not additive.
+# Two checkouts of one project, each its own session: each auto-registers from
+# its directory name, then takes an explicit role name. The rename must be
+# clean, not additive.
 mkdir -p "$disc/proj" "$disc/proj-worktree"
-derived=$(cd "$disc/proj" && "$bridger" autoregister)
-(cd "$disc/proj-worktree" && "$bridger" autoregister >/dev/null)
-(cd "$disc/proj" && "$bridger" register lead >/dev/null)
-(cd "$disc/proj-worktree" && "$bridger" register worker >/dev/null)
-[ "$(cd "$disc/proj" && "$bridger" whoami)" = "lead" ] || fail "explicit name must win over the derived one"
-[ "$(cd "$disc/proj-worktree" && "$bridger" whoami)" = "worker" ] || fail "second checkout keeps its own identity"
+derived=$(cd "$disc/proj" && CLAUDE_CODE_SESSION_ID=sess-lead "$bridger" autoregister)
+(cd "$disc/proj-worktree" && CLAUDE_CODE_SESSION_ID=sess-worker "$bridger" autoregister >/dev/null)
+(cd "$disc/proj" && CLAUDE_CODE_SESSION_ID=sess-lead "$bridger" register lead >/dev/null)
+(cd "$disc/proj-worktree" && CLAUDE_CODE_SESSION_ID=sess-worker "$bridger" register worker >/dev/null)
+[ "$(cd "$disc/proj" && CLAUDE_CODE_SESSION_ID=sess-lead "$bridger" whoami)" = "lead" ] || fail "explicit name must win over the derived one"
+[ "$(cd "$disc/proj-worktree" && CLAUDE_CODE_SESSION_ID=sess-worker "$bridger" whoami)" = "worker" ] || fail "second checkout keeps its own identity"
 [ ! -f "$BRIDGER_ROOT/peers/$derived.json" ] || fail "derived name must be replaced, not kept alongside"
-[ "$(cd "$disc/proj" && "$bridger" peers --dir | grep -c .)" = "1" ] || fail "one identity per directory"
-(cd "$disc/proj" && "$bridger" send worker chat "roles work" >/dev/null)
-[ "$(cd "$disc/proj-worktree" && "$bridger" poll)" = "#1 lead chat: roles work" ] || fail "renamed peers can talk"
+[ "$(cd "$disc/proj" && CLAUDE_CODE_SESSION_ID=sess-lead "$bridger" peers --dir | grep -c .)" = "1" ] || fail "one identity per directory"
+(cd "$disc/proj" && CLAUDE_CODE_SESSION_ID=sess-lead "$bridger" send worker chat "roles work" >/dev/null)
+[ "$(cd "$disc/proj-worktree" && CLAUDE_CODE_SESSION_ID=sess-worker "$bridger" poll)" = "#1 lead chat: roles work" ] || fail "renamed peers can talk"
 
 # Once a name has history, silently renaming it would orphan the thread.
-if (cd "$disc/proj" && "$bridger" register lead-2 >/dev/null 2>&1); then
+if (cd "$disc/proj" && CLAUDE_CODE_SESSION_ID=sess-lead "$bridger" register lead-2 >/dev/null 2>&1); then
   fail "renaming a peer with history must be refused"
 fi
 pass "explicit role names override derived names; history-bearing names are protected"
@@ -232,6 +243,77 @@ kill "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true
 [ "$(cd "$disc/role" && CLAUDE_CODE_SESSION_ID=sess-2 "$bridger" whoami)" = "worker" ] \
   || fail "takeover must bind the name to the reclaiming session"
 pass "same name: live holder refused, dead holder taken over"
+
+# --- no cross-session name adoption (the "wrong role" bug) -------------------
+# A directory that accumulated peers from earlier sessions must not hand its
+# names to an unrelated new session. Isolated root + AUTO off (opt-in mode).
+(
+  BRIDGER_ROOT=$(mktemp -d); bw=$(mktemp -d)
+  export BRIDGER_ROOT
+  unset CLAUDE_BRIDGER_AUTO
+  mkdir -p "$bw/pitch"
+  (cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=old-arch "$bridger" register arch >/dev/null)
+  (cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=old-exec "$bridger" register exec >/dev/null)
+
+  # A brand-new session in the same directory must NOT inherit arch or exec.
+  got=$(cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=fresh "$bridger" autoregister 2>/dev/null || true)
+  [ -z "$got" ] || fail "new session must not auto-adopt another session's peer (got: $got)"
+  if (cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=fresh "$bridger" whoami >/dev/null 2>&1); then
+    fail "new session in a dir with foreign peers must have no identity until it registers"
+  fi
+
+  # Its own explicit name binds cleanly; the leftovers keep their own sessions.
+  (cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=fresh "$bridger" register barca >/dev/null)
+  [ "$(cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=fresh "$bridger" whoami)" = "barca" ] \
+    || fail "explicit register must bind the chosen name"
+  [ "$(jq -r .session "$BRIDGER_ROOT/peers/arch.json")" = "old-arch" ] \
+    || fail "a foreign peer must not be rebound by another session"
+
+  # The owning session still resolves to its own peer (durable address kept).
+  [ "$(cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=old-arch "$bridger" whoami)" = "arch" ] \
+    || fail "the owning session must still resolve to its peer"
+
+  # `join` binds to the joining session, so a LATER session does not inherit it.
+  mkdir -p "$bw/lib"
+  (cd "$bw/lib" && CLAUDE_CODE_SESSION_ID=joiner "$bridger" join >/dev/null)
+  [ "$(jq -r .session "$BRIDGER_ROOT/peers/lib.json")" = "joiner" ] || fail "join must bind the peer to the joining session"
+  got2=$(cd "$bw/lib" && CLAUDE_CODE_SESSION_ID=later "$bridger" autoregister 2>/dev/null || true)
+  [ -z "$got2" ] || fail "a later session must not inherit a join'd name (got: $got2)"
+  rm -rf "$BRIDGER_ROOT" "$bw"
+)
+pass "no cross-session name adoption; join binds; owning session still resolves"
+
+# --- reclaim a dormant name + its queued messages ----------------------------
+# arch is registered and gets a message; its holder dies; a NEW session reclaims
+# the name and reads everything queued to it. The dormant hint lists it first.
+(
+  BRIDGER_ROOT=$(mktemp -d); bw=$(mktemp -d)
+  export BRIDGER_ROOT
+  unset CLAUDE_BRIDGER_AUTO
+  mkdir -p "$bw/pitch" "$bw/coach"
+  (cd "$bw/coach" && CLAUDE_CODE_SESSION_ID=coach-s "$bridger" register coach >/dev/null)
+  (cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=arch-old "$bridger" register arch >/dev/null)
+  (cd "$bw/coach" && CLAUDE_CODE_SESSION_ID=coach-s "$bridger" send arch chat "tactics for arch" >/dev/null)
+
+  # Holder dies: heartbeat forced stale. The name is now dormant + reclaimable.
+  : > "$BRIDGER_ROOT/peers/arch.beat"; touch -t 202001010000 "$BRIDGER_ROOT/peers/arch.beat"
+  d=$(cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=fresh "$bridger" dormant)
+  [ "$d" = "$(printf 'arch\t1')" ] || fail "dormant must list the reclaimable peer with its queued count (got: $(printf %q "$d"))"
+
+  # A new session reclaims the name and receives the queued message.
+  (cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=arch-new "$bridger" register arch >/dev/null) \
+    || fail "a dead holder's name must be reclaimable"
+  [ "$(cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=arch-new "$bridger" whoami)" = "arch" ] \
+    || fail "reclaimed name must bind to the new session"
+  got=$(cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=arch-new "$bridger" poll)
+  grep -q "tactics for arch" <<<"$got" || fail "reclaiming a name must deliver its queued messages (got: $got)"
+
+  # Once reclaimed and owned, the caller's own name is not listed as dormant.
+  [ -z "$(cd "$bw/pitch" && CLAUDE_CODE_SESSION_ID=arch-new "$bridger" dormant | grep '^arch')" ] \
+    || fail "dormant must not list the caller's own peer"
+  rm -rf "$BRIDGER_ROOT" "$bw"
+)
+pass "dormant name reclaimed by a new session; queued messages delivered"
 
 unset CLAUDE_BRIDGER_AUTO
 rm -rf "$disc"

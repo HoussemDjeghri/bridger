@@ -41,7 +41,25 @@ fi
 # only renders in a live session, so old files are pure litter.
 find "$BRIDGER_ROOT/statusline" -type f -mtime +30 -delete 2>/dev/null || true
 
-me=$(cd "$cwd" && "$bridger" autoregister 2>/dev/null) || exit 0
+me=$(cd "$cwd" && "$bridger" autoregister 2>/dev/null) || me=""
+
+# No identity for this session (opt-in and this directory was never registered
+# by THIS session). Identity is per session and never inherited, so a session
+# reopened where it — or another session — once had a name does not silently
+# resume it. If names WERE registered here and no live session wears them,
+# surface them: the user may want to reclaim one (with its queued messages) or
+# pick a fresh name. This lands in the session's context; the user still acts.
+if [ -z "$me" ]; then
+  dormant=$(cd "$cwd" && "$bridger" dormant 2>/dev/null || true)
+  if [ -n "$dormant" ]; then
+    echo "bridger: this directory has registered peer name(s) that no live session holds. Identity is per session — nothing is adopted automatically. Offer the user to reclaim one (which also delivers the messages queued to it) via CLI \`register <name>\`, or to register a fresh name. Reclaimable (queued unread):"
+    printf '%s\n' "$dormant" | while IFS="$(printf '\t')" read -r nm cnt; do
+      echo "  $nm ($cnt queued)"
+    done
+    echo "CLI: $bridger"
+  fi
+  exit 0
+fi
 
 # Keep this terse: it lands in the session's context on every start.
 echo "bridger: peer '$me'. CLI: $bridger"

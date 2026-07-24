@@ -22,8 +22,12 @@
 #   - Identity is per session, not per directory: two sessions working one
 #     directory (say two Claude Code sessions on the same branch) register
 #     distinct names and each resolves to its own. A session is recognised by
-#     its Claude Code session id; the directory is the fallback when only one
-#     session is there. A name is held by one live session at a time.
+#     its Claude Code session id and only ever resolves to the peer it itself
+#     registered — a name left in a directory by an earlier session is never
+#     inherited; reclaiming it is a deliberate `register <name>` (a dead holder
+#     is reclaimable, queued messages intact). Only an id-less caller (a plain
+#     shell, a script) falls back to the directory match, and it never rebinds.
+#     A name is held by one live session at a time.
 set -euo pipefail
 
 BRIDGER_ROOT="${BRIDGER_ROOT:-$HOME/.claude/bridger}"
@@ -221,14 +225,24 @@ statusline_clear() { # drop THIS session's badge state
   local f
   f=$(statusline_state_file "$(session_id)") || return 0
   [ -n "$f" ] && rm -f "$f"
+  return 0   # a no-op (no session id) must not report failure to a set -e caller
 }
 
 # Resolve identity from the working directory: the registered peer whose cwd
-# equals $PWD or is its closest ancestor. When two peers share a directory (two
-# sessions on one branch), the one THIS session registered wins; otherwise the
-# longest-matching cwd wins, as before. Callers that need to resolve a DIFFERENT
-# directory prefix the call with PWD=<dir> — an env-var prefix applies to shell
-# functions just as it does to external commands.
+# equals $PWD or is its closest ancestor. Callers that need to resolve a
+# DIFFERENT directory prefix the call with PWD=<dir> — an env-var prefix applies
+# to shell functions just as it does to external commands.
+#
+# Identity is per SESSION, never inherited from a directory's history. A caller
+# that carries a session id (every call inside a Claude Code session does) is
+# ONLY ever the peer that same session registered — it never adopts a name an
+# earlier session left in this directory, even one that is now dormant. That is
+# what stops a fresh session from silently becoming "arch" just because "arch"
+# was registered here once; to take that name it must `register arch` on purpose
+# (a dead holder is reclaimable), which also recovers the messages queued to it.
+# A caller WITHOUT a session id (a plain-shell CLI query, a script) is not a
+# competing identity and never rebinds a peer, so it keeps the old convenience:
+# the longest-cwd directory match.
 resolve_identity() {
   local f name cwd sess sid best="" bestlen=-1 mine="" minelen=-1
   sid=$(session_id)
@@ -245,7 +259,11 @@ resolve_identity() {
         fi ;;
     esac
   done
-  if [ -n "$mine" ]; then echo "$mine"; elif [ -n "$best" ]; then echo "$best"; fi
+  if [ -n "$sid" ]; then
+    [ -n "$mine" ] && echo "$mine"
+  else
+    [ -n "$best" ] && echo "$best"
+  fi
 }
 
 # The peer THIS session registered whose directory covers $PWD, or empty. Lets
@@ -378,9 +396,11 @@ cmd_leave() {
 }
 
 cmd_join() {
+  local me
   optout_remove "$PWD"
-  derive_and_register "$PWD" >/dev/null
-  echo "joined the bridger as '$(resolve_identity)'"
+  me=$(derive_and_register "$PWD")
+  statusline_write "$me"
+  echo "joined the bridger as '$me'"
 }
 
 # Register a directory under a name derived from it ("my-app" from
@@ -416,7 +436,10 @@ derive_and_register() { # dir [tagged]
       n=$((n + 1))
     done
   fi
-  write_peer "$name" "$dir"
+  # Bind the freshly minted name to the session that created it, so that session
+  # resolves as its owner (not via a directory fallback) and no LATER session
+  # inherits it. An id-less caller binds nothing — session stays empty.
+  BRIDGER_SESSION_ID="$(session_id)" write_peer "$name" "$dir"
   echo "$name"
 }
 
@@ -736,6 +759,33 @@ cmd_status() {
   done
 }
 
+# Names registered in THIS directory that no live session wears and that this
+# session does not already own — the names a restarted session can reclaim.
+# Since identity is per session, a session reopened in a directory it once had a
+# name in cannot know which name was its own (there may be several); this lists
+# them with the count of messages waiting, so the reclaim is an informed choice.
+# One line each: "<name>\t<unread>". Skips a peer with a live watcher (someone
+# is using that name right now).
+cmd_dormant() {
+  local sid f name cwd sess n peer dir top
+  sid=$(session_id)
+  for f in "$BRIDGER_ROOT"/peers/*.json; do
+    [ -e "$f" ] || continue
+    name=$(jq -r .name "$f"); cwd=$(jq -r .cwd "$f"); sess=$(jq -r '.session // ""' "$f")
+    case "$PWD" in "$cwd"|"$cwd"/*) ;; *) continue ;; esac
+    [ -n "$sid" ] && [ "$sess" = "$sid" ] && continue        # already mine
+    [ "$(peer_status "$name")" = "listening" ] && continue   # a live session holds it
+    n=0
+    for peer in $(other_peers "$name"); do
+      dir=$(thread_dir "$name" "$peer")
+      [ -d "$dir" ] || continue
+      top=$(max_seq "$dir")
+      n=$(( n + $(unread_in_thread "$dir" "$name" "$top" | grep -c . || true) ))
+    done
+    printf '%s\t%s\n' "$name" "$n"
+  done
+}
+
 cmd_help() {
   cat <<'EOF'
 bridger — message bus between Claude Code sessions (file-based, jq only)
@@ -899,6 +949,7 @@ case "$cmd" in
   log)      cmd_log "$@" ;;
   mirror)   cmd_mirror "$@" ;;
   status)   cmd_status "$@" ;;
+  dormant)  cmd_dormant "$@" ;;
   statusline)        cmd_statusline "$@" ;;
   statusline-status) cmd_statusline_status "$@" ;;
   help|--help|-h) cmd_help ;;
