@@ -314,4 +314,79 @@ statusout=$(cd "$work/app" && "$bridger" status)
 grep -q "app" <<<"$statusout" || fail "status shows identity"
 pass "log + status"
 
+# --- statusline badge + drop-in wiring ---------------------------------------
+# Fully isolated: its own BRIDGER_ROOT (badge state) and CLAUDE_CONFIG_DIR
+# (settings.json + statusline.d), so it never touches the real ~/.claude.
+(
+  badge="$here/hooks/statusline.sh"
+  BRIDGER_ROOT=$(mktemp -d); cfg=$(mktemp -d); sw=$(mktemp -d)
+  export BRIDGER_ROOT
+  export CLAUDE_CONFIG_DIR="$cfg"
+  mkdir -p "$sw/proj"
+
+  render_badge() { printf '{"session_id":"%s"}' "$1" | bash "$badge"; }
+
+  # Badge shows the name this session registered — written by register, no
+  # statusLine rewrite; the badge reads the per-session state file each tick.
+  (cd "$sw/proj" && CLAUDE_CODE_SESSION_ID=badge-sess "$bridger" register architect >/dev/null)
+  out=$(render_badge badge-sess)
+  case "$out" in *"BRIDGER:architect"*) ;; *) fail "badge must show the registered name (got: $out)" ;; esac
+  # A different session with no registration gets no badge.
+  [ -z "$(render_badge other-sess)" ] || fail "badge must be empty for an unregistered session"
+
+  # Unregister → state file deleted → badge gone next tick.
+  (cd "$sw/proj" && CLAUDE_CODE_SESSION_ID=badge-sess "$bridger" leave >/dev/null)
+  [ -z "$(render_badge badge-sess)" ] || fail "badge must vanish after leave"
+  pass "badge reflects registration: shows name, gone when unregistered"
+
+  # Name sanitization: the state file is dynamic, session-supplied content. A
+  # crafted name must not smuggle control chars / ANSI escapes to the terminal.
+  mkdir -p "$BRIDGER_ROOT/statusline"
+  # Whitelist keeps [A-Za-z0-9._-]: ESC, '[', BEL and ';' are dropped, the safe
+  # bytes of the escape ("31m") survive as ordinary text — harmless, no injection.
+  printf 'bad\033[31mX\007;Y' > "$BRIDGER_ROOT/statusline/evil-sess"
+  out=$(render_badge evil-sess)
+  case "$out" in *$'\007'*) fail "badge leaked a BEL control char from a crafted name" ;; esac
+  # Strip the badge's own colour codes; what remains must be only the safe charset.
+  clean=$(printf '%s' "$out" | sed "s/$(printf '\033')\[[0-9;]*m//g")
+  [ "$clean" = "[⇄ BRIDGER:bad31mXY]" ] || fail "badge must strip to a safe charset (got: $(printf %q "$clean"))"
+  pass "badge sanitizes crafted names (no ANSI/control-char injection)"
+
+  # Fresh wiring: no settings.json → installs dispatcher + fragment, points at it.
+  "$bridger" statusline >/dev/null
+  [ -f "$cfg/statusline.d/50-bridger.sh" ]      || fail "wiring must drop the 50-bridger.sh fragment"
+  [ -f "$cfg/hooks/bridger-statusline.sh" ]     || fail "wiring must install the stable badge copy"
+  [ -f "$cfg/hooks/statusline-dispatch.sh" ]    || fail "wiring must install the dispatcher when none exists"
+  grep -q statusline-dispatch "$cfg/settings.json" || fail "settings.json must point at the dispatcher"
+  jq -e . "$cfg/settings.json" >/dev/null        || fail "settings.json must stay valid JSON"
+  "$bridger" statusline-status >/dev/null 2>&1  || fail "wired-detection must be true after install"
+  pass "statusline fresh install: dispatcher + fragment wired, detection true"
+
+  # Idempotent: a second run finds itself wired and never prompts a choice.
+  out=$("$bridger" statusline)
+  case "$out" in *NEEDS-CHOICE*) fail "re-running on an already-wired setup must not prompt NEEDS-CHOICE" ;; esac
+  pass "statusline re-wire is idempotent"
+
+  # Foreign statusline: never overwrite it — surface NEEDS-CHOICE, leave it byte-identical.
+  rm -rf "$cfg"; mkdir -p "$cfg"
+  printf '{"statusLine":{"type":"command","command":"bash /opt/othertool.sh"}}' > "$cfg/settings.json"
+  before=$(cat "$cfg/settings.json")
+  if out=$("$bridger" statusline); then fail "a foreign statusline must make wiring exit non-zero"; fi
+  case "$out" in *NEEDS-CHOICE*othertool*) ;; *) fail "foreign statusline must surface NEEDS-CHOICE with the current command (got: $out)" ;; esac
+  [ "$(cat "$cfg/settings.json")" = "$before" ] || fail "a foreign statusline must be left untouched"
+  "$bridger" statusline-status >/dev/null 2>&1 && fail "wired-detection must be false against a foreign statusline"
+  pass "statusline no-clobber of a foreign command; wired-detection false"
+
+  # Self-heal signal: wired → a foreign setup repoints settings → detection flips
+  # to unwired (this flip is exactly what the SessionStart hook re-offers on).
+  rm -rf "$cfg"; mkdir -p "$cfg"
+  "$bridger" statusline >/dev/null
+  "$bridger" statusline-status >/dev/null 2>&1 || fail "self-heal: must read wired right after wiring"
+  printf '{"statusLine":{"type":"command","command":"bash /opt/othertool.sh"}}' > "$cfg/settings.json"
+  "$bridger" statusline-status >/dev/null 2>&1 && fail "self-heal: must read unwired after a foreign takeover"
+  pass "statusline self-heal detection: wired after wiring, unwired after takeover"
+
+  rm -rf "$BRIDGER_ROOT" "$cfg" "$sw"
+)
+
 echo "PASS: all bridger self-checks green"

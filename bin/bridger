@@ -28,6 +28,22 @@ set -euo pipefail
 
 BRIDGER_ROOT="${BRIDGER_ROOT:-$HOME/.claude/bridger}"
 
+# The plugin's own directory, so the wiring command can copy the shipped badge
+# and dispatcher out to a stable location that survives plugin updates.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Claude Code config dir + the statusline wiring under it. The badge is a
+# "fragment" dropped into statusline.d/, which a dispatcher (the user's
+# statusLine command points at it) runs alongside every other fragment — a
+# drop-in dir so tools that each want a badge never fight over Claude Code's
+# single statusLine slot.
+CLAUDE_CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+STATUSLINE_D="$CLAUDE_CFG_DIR/statusline.d"
+STATUSLINE_BADGE="$CLAUDE_CFG_DIR/hooks/bridger-statusline.sh"
+STATUSLINE_FRAGMENT="$STATUSLINE_D/50-bridger.sh"
+STATUSLINE_DISPATCH="$CLAUDE_CFG_DIR/hooks/statusline-dispatch.sh"
+SETTINGS_FILE="$CLAUDE_CFG_DIR/settings.json"
+
 die() { echo "bridger: $*" >&2; exit 1; }
 
 # Suggest the install command that fits the machine's package manager, so a
@@ -180,6 +196,33 @@ other_peers() {
 # working directory, so this is what tells them apart.
 session_id() { echo "${BRIDGER_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}"; }
 
+# Per-session statusline state: one file per session id holding the registered
+# name. The badge script reads it on every render tick, so registration state
+# IS badge state — register writes it (badge appears next tick), leave deletes
+# it (badge vanishes next tick), with no statusLine rewrite in between. Keyed
+# by the Claude Code session id, which the badge also reads from its stdin JSON;
+# charset-limited before it becomes a filename, exactly as the badge does.
+statusline_state_file() { # session_id -> path (empty if id unusable)
+  local sid="$1"
+  [ -n "$sid" ] || return 0
+  case "$sid" in *[!A-Za-z0-9._-]*) return 0 ;; esac
+  echo "$BRIDGER_ROOT/statusline/$sid"
+}
+
+statusline_write() { # name — record THIS session's registered name for the badge
+  local f
+  f=$(statusline_state_file "$(session_id)") || return 0
+  [ -n "$f" ] || return 0
+  mkdir -p "$(dirname "$f")"
+  printf '%s' "$1" > "$f"
+}
+
+statusline_clear() { # drop THIS session's badge state
+  local f
+  f=$(statusline_state_file "$(session_id)") || return 0
+  [ -n "$f" ] && rm -f "$f"
+}
+
 # Resolve identity from the working directory: the registered peer whose cwd
 # equals $PWD or is its closest ancestor. When two peers share a directory (two
 # sessions on one branch), the one THIS session registered wins; otherwise the
@@ -312,6 +355,7 @@ cmd_register() {
 
   optout_remove "$dir"   # naming a directory is an explicit opt-in
   BRIDGER_SESSION_ID="$sid" write_peer "$name" "$dir"   # claim it for this session
+  statusline_write "$name"   # light the badge this tick, no statusLine rewrite
   echo "registered '$name' -> $dir"
 }
 
@@ -328,6 +372,7 @@ cmd_leave() {
   fi
   dir=$(jq -r .cwd "$(peer_file "$me")")
   rm -f "$(peer_file "$me")" "$(beat_file "$me")"
+  statusline_clear   # unregistered → badge gone next tick
   optout_add "$dir"
   echo "left the bridger as '$me'; $dir will not auto-register (history kept)"
 }
@@ -380,17 +425,20 @@ derive_and_register() { # dir [tagged]
 # joined). Set CLAUDE_BRIDGER_AUTO=1 to let every session join on its own —
 # peers-style discovery for people who want a machine-wide mesh.
 cmd_autoregister() {
-  local dir="${1:-$PWD}" existing
+  local dir="${1:-$PWD}" existing name
   dir=$(cd "$dir" && pwd)
   existing=$(PWD="$dir" resolve_identity) || true
   if [ -n "${existing:-}" ]; then
     write_peer "$existing" "$(jq -r .cwd "$(peer_file "$existing")")"
+    statusline_write "$existing"
     echo "$existing"
     return 0
   fi
   [ "${CLAUDE_BRIDGER_AUTO:-0}" = "1" ] || exit 1
   opted_out "$dir" && exit 1
-  derive_and_register "$dir" tagged
+  name=$(derive_and_register "$dir" tagged)
+  statusline_write "$name"
+  echo "$name"
 }
 
 # Say what this session is working on, so other agents can pick the right peer.
@@ -730,6 +778,109 @@ data lives under $BRIDGER_ROOT (default ~/.claude/bridger).
 EOF
 }
 
+# Strip quotes and expand $HOME / $CLAUDE_CONFIG_DIR in a statusLine token, so a
+# path pulled from settings.json can be tested on disk. Best-effort: an exotic
+# expansion it does not know degrades to a non-existent path (→ "not wired"),
+# never to a wrong positive.
+_expand_config_path() { # token
+  local t="$1"
+  t=${t//\"/}; t=${t//\'/}
+  t=${t//\$\{HOME\}/$HOME}; t=${t//\$HOME/$HOME}
+  t=${t//\$\{CLAUDE_CONFIG_DIR\}/$CLAUDE_CFG_DIR}; t=${t//\$CLAUDE_CONFIG_DIR/$CLAUDE_CFG_DIR}
+  printf '%s' "$t"
+}
+
+# Is the badge reachable from the ACTIVE statusLine command? True when that
+# command names our badge script, iterates the statusline.d drop-in dir (with
+# our fragment present), or names a script that — one level down — does either.
+# Keys off the current entry point only: a stale chain a file no longer points
+# at reads as un-wired. Heuristic but safe — a command it cannot resolve
+# degrades to "not wired", at worst one extra re-offer line, never a wrong badge.
+statusline_wired() {
+  [ -f "$SETTINGS_FILE" ] || return 1
+  local cmd tok rt
+  cmd=$(jq -r '.statusLine.command // empty' "$SETTINGS_FILE" 2>/dev/null) || return 1
+  [ -n "$cmd" ] || return 1
+  case "$cmd" in
+    *bridger-statusline.sh*) return 0 ;;
+    *statusline.d*) [ -f "$STATUSLINE_FRAGMENT" ] && return 0 ;;
+  esac
+  for tok in $cmd; do
+    rt=$(_expand_config_path "$tok")
+    [ -f "$rt" ] || continue
+    grep -qs 'bridger-statusline\.sh' "$rt" && return 0
+    grep -qs 'statusline\.d' "$rt" && [ -f "$STATUSLINE_FRAGMENT" ] && return 0
+  done
+  return 1
+}
+
+# Set settings.json .statusLine to a command, preserving other keys. Backs up
+# first and validates the result before replacing — a broken edit never lands.
+_set_statusline_command() { # command
+  local cmd="$1" tmp="$SETTINGS_FILE.tmp.$$"
+  mkdir -p "$(dirname "$SETTINGS_FILE")"
+  if [ -f "$SETTINGS_FILE" ]; then
+    cp "$SETTINGS_FILE" "$SETTINGS_FILE.bridger.bak"
+    jq --arg c "$cmd" '.statusLine = {type:"command", command:$c}' "$SETTINGS_FILE" > "$tmp" 2>/dev/null \
+      || { rm -f "$tmp"; return 1; }
+  else
+    jq -n --arg c "$cmd" '{statusLine:{type:"command", command:$c}}' > "$tmp" 2>/dev/null \
+      || { rm -f "$tmp"; return 1; }
+  fi
+  jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$SETTINGS_FILE"
+}
+
+# Wire the badge as a drop-in fragment — never overwriting another tool's
+# statusline. The badge is a stable copy (survives plugin updates) run by a
+# fragment in statusline.d/. Exit 3 + a NEEDS-CHOICE line means the user already
+# runs their own statusline and the caller must decide how to join it.
+cmd_statusline() {
+  mkdir -p "$STATUSLINE_D" "$(dirname "$STATUSLINE_BADGE")"
+  if ! cp "$ROOT/hooks/statusline.sh" "$STATUSLINE_BADGE" || ! chmod +x "$STATUSLINE_BADGE"; then
+    die "could not install the badge script to $STATUSLINE_BADGE"
+  fi
+  cat > "$STATUSLINE_FRAGMENT" <<EOF
+#!/bin/bash
+# statusline.d fragment — bridger peer badge. Needs the Claude Code statusline
+# JSON on stdin. Drop-in: delete this file to remove the badge.
+exec bash "$STATUSLINE_BADGE"
+EOF
+  chmod +x "$STATUSLINE_FRAGMENT" 2>/dev/null || true
+
+  # Already reachable (an existing dispatcher picks up the fragment, or a prior
+  # chain names the badge) → nothing to wire.
+  if statusline_wired; then
+    echo "bridger: badge wired — your statusline runs the drop-in fragment."
+    return 0
+  fi
+
+  local cmd
+  cmd=$(jq -r '.statusLine.command // empty' "$SETTINGS_FILE" 2>/dev/null || true)
+  if [ -z "$cmd" ]; then
+    # No statusline yet: install the generic dispatcher and point at it. Nothing
+    # to clobber, and a dispatcher lets the next tool drop a fragment too.
+    if ! cp "$ROOT/hooks/statusline-dispatch.sh" "$STATUSLINE_DISPATCH" || ! chmod +x "$STATUSLINE_DISPATCH"; then
+      die "could not install the dispatcher to $STATUSLINE_DISPATCH"
+    fi
+    _set_statusline_command "bash \"$STATUSLINE_DISPATCH\"" || die "could not update $SETTINGS_FILE"
+    echo "bridger: installed a drop-in statusline showing the badge. Other tools can add badges by dropping a file in $STATUSLINE_D."
+    return 0
+  fi
+
+  # A statusline exists and does not reach us — never overwrite it. Hand the
+  # decision (join it vs. convert to the drop-in dispatcher) back to the caller.
+  printf 'NEEDS-CHOICE\t%s\n' "$cmd"
+  return 3
+}
+
+# Exit 0 iff the badge is reachable from the active statusLine. The SessionStart
+# hook branches on this for the one-time offer and the wired→unwired self-heal.
+cmd_statusline_status() {
+  statusline_wired && { echo wired; return 0; }
+  echo unwired; return 1
+}
+
 cmd="${1:-help}"
 shift || true
 case "$cmd" in
@@ -748,6 +899,8 @@ case "$cmd" in
   log)      cmd_log "$@" ;;
   mirror)   cmd_mirror "$@" ;;
   status)   cmd_status "$@" ;;
+  statusline)        cmd_statusline "$@" ;;
+  statusline-status) cmd_statusline_status "$@" ;;
   help|--help|-h) cmd_help ;;
   *) die "unknown command '$cmd' (try: bridger help)" ;;
 esac
