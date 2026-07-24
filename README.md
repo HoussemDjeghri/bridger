@@ -9,7 +9,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.7.0" src="https://img.shields.io/badge/version-0.7.0-191919">
+  <img alt="version 0.7.1" src="https://img.shields.io/badge/version-0.7.1-191919">
   <img alt="dependencies: bash and jq" src="https://img.shields.io/badge/deps-bash%20%2B%20jq-D4A27F">
   <img alt="no daemon, no runtime" src="https://img.shields.io/badge/no-daemon-555">
 </p>

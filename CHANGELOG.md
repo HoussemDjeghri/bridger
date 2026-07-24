@@ -4,6 +4,10 @@ All notable changes to bridger are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and bridger uses
 [semantic versioning](https://semver.org/).
 
+## [0.7.1] — 2026-07-24
+
+- fix(identity): per-session identity — never inherit a directory's names
+
 ## [0.7.0] — 2026-07-24
 
 - feat(statusline): live per-session badge showing the registered peer name
@@ -56,6 +60,7 @@ All notable changes to bridger are recorded here. The format follows
   fresh heartbeat, a second session is refused that name; once the holder goes
   away, the name can be taken over — how a restarted session reclaims its role.
 
+[0.7.1]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.7.1
 [0.7.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.7.0
 [0.6.2]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.6.2
 [0.6.1]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.6.1
