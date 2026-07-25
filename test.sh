@@ -397,7 +397,32 @@ logout=$(cd "$work/app" && "$bridger" log liba)
 grep -q "hello lib" <<<"$logout" || fail "log shows history"
 statusout=$(cd "$work/app" && "$bridger" status)
 grep -q "app" <<<"$statusout" || fail "status shows identity"
+grep -q "unread-by-them:" <<<"$statusout" || fail "status must show what the peer has not read yet"
 pass "log + status"
+
+# --- a send to a peer that is not listening must say so ----------------------
+# Otherwise the sender has no way to tell "hasn't replied yet" from "cannot
+# hear me", and keeps queueing messages nobody is reading.
+mkdir -p "$work/deaf"
+"$bridger" register deaf "$work/deaf" >/dev/null
+warned=$( (cd "$work/app" && "$bridger" send deaf chat "anyone there" >/dev/null) 2>&1 )
+grep -q "'deaf' is not listening" <<<"$warned" || fail "send must warn when the target has no watcher (got: $warned)"
+grep -q "1 message(s) from you are unread" <<<"$warned" || fail "the warning must count what is already waiting"
+(cd "$work/app" && "$bridger" send deaf chat "still there" >/dev/null) 2>&1 \
+  | grep -q "2 message(s) from you are unread" || fail "the backlog count must grow with each unheard send"
+
+# The warning is stderr only: stdout stays the bare sequence number.
+[ "$( (cd "$work/app" && "$bridger" send deaf chat "third") 2>/dev/null )" = "3" ] \
+  || fail "the warning must not pollute the seq on stdout"
+
+(cd "$work/deaf"; exec "$bridger" wait --follow >/dev/null 2>&1) &
+dw=$!
+sleep 3
+[ -z "$( (cd "$work/app" && "$bridger" send deaf chat "now?" >/dev/null) 2>&1 )" ] \
+  || fail "send must not warn when the target is listening"
+kill "$dw" 2>/dev/null || true
+wait "$dw" 2>/dev/null || true
+pass "send warns the sender when the target cannot hear it"
 
 # --- statusline badge + drop-in wiring ---------------------------------------
 # Fully isolated: its own BRIDGER_ROOT (badge state) and CLAUDE_CONFIG_DIR
@@ -516,7 +541,7 @@ pass "log + status"
 
   [ -z "$(printf '%s' "$ups" | bash "$hook")" ] || fail "hook must stay silent with no unread"
 
-  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send reader ask "ruling: use v2" >/dev/null)
+  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send reader ask "ruling: use v2" >/dev/null 2>/dev/null)
   out=$(printf '%s' "$ups" | bash "$hook")
   grep -q "writer ask: ruling: use v2" <<<"$out" || fail "hook must surface the unread message (got: $out)"
   grep -q "1 unread" <<<"$out" || fail "hook must report the unread count"
@@ -541,7 +566,7 @@ pass "log + status"
 
   # ... but a message that lands after that must still get through.
   sleep 1
-  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send reader chat "and v2.1 too" >/dev/null)
+  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send reader chat "and v2.1 too" >/dev/null 2>/dev/null)
   jq -r '.hookSpecificOutput.additionalContext' <<<"$(printf '%s' "$ptu" | bash "$hook")" \
     | grep -q "and v2.1 too" || fail "PostToolUse must report a message that arrives later"
 

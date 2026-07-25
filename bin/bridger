@@ -518,6 +518,21 @@ cmd_whoami() {
   echo "$me"
 }
 
+# A send is fire-and-forget: it succeeds whether or not anything is reading at
+# the other end, and the sender is told only the sequence number. That silence
+# is how a session ends up monologuing — sending message after message to a
+# peer that never armed a watch, with nothing to distinguish it from a peer
+# that is listening and simply hasn't replied yet. Say so on the first send.
+# stderr, so stdout stays the bare seq that callers (including the multi-
+# recipient path below) parse.
+warn_if_unheard() { # to from
+  local to="$1" from="$2" dir n
+  [ "$(peer_status "$to")" = listening ] && return 0
+  dir=$(thread_dir "$from" "$to")
+  n=$(unread_in_thread "$dir" "$to" "$(max_seq "$dir")" | grep -c . || true)
+  echo "warning: '$to' is not listening — no watcher is running there, and $n message(s) from you are unread. It will read them on its next activity, not now. Sending more will not reach it any sooner." >&2
+}
+
 cmd_send() {
   local from="" to="" type="" body="" ref=""
   while [ $# -gt 0 ]; do
@@ -574,6 +589,7 @@ cmd_send() {
     # permissions, read-only fs): retrying would spin forever, so die.
     if ln "$tmp" "$target" 2>/dev/null; then
       rm -f "$tmp"
+      warn_if_unheard "$to" "$from"
       echo "$seq"
       return 0
     fi
@@ -755,15 +771,22 @@ cmd_offline() {
 }
 
 cmd_status() {
-  local me peer dir n
+  local me peer dir top n m
   me=$(resolve_identity) || true
   echo "identity: ${me:-<none — run: bridger register <name>>}"
   [ -n "${me:-}" ] || return 0
+  # Both directions. "unread" is what is waiting for you; "unread-by-them" is
+  # what you have said that has not landed yet — the number that tells you
+  # whether you are being heard or talking to yourself.
   for peer in $(other_peers "$me"); do
     dir=$(thread_dir "$me" "$peer")
-    n=0
-    [ -d "$dir" ] && n=$(unread_in_thread "$dir" "$me" "$(max_seq "$dir")" | grep -c . || true)
-    echo "peer: $peer  unread: $n"
+    n=0; m=0
+    if [ -d "$dir" ]; then
+      top=$(max_seq "$dir")
+      n=$(unread_in_thread "$dir" "$me" "$top" | grep -c . || true)
+      m=$(unread_in_thread "$dir" "$peer" "$top" | grep -c . || true)
+    fi
+    echo "peer: $peer [$(peer_status "$peer")]  unread: $n  unread-by-them: $m"
   done
 }
 

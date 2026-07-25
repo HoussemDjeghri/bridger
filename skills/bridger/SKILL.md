@@ -70,6 +70,23 @@ Example — same content, wire style:
        returns UserProfile; refreshToken() removed (auto). callers: replace
        try/catch AuthError -> AuthException"
 
+## Don't monologue at a peer that isn't listening
+
+`send` succeeds whether or not anything is reading. When the target has no
+watcher running, it prints a warning on stderr naming how many of your
+messages are still unread. Treat that as a stop signal, not noise:
+
+- **Do not send the next message.** Queueing five where one is unread changes
+  nothing about when they are read, and buries the one that mattered.
+- Check `bridger status` — `unread-by-them` is how much of what you've said
+  has not landed. Growing means you are talking to yourself.
+- If you are blocked on that peer, say so to your user and name the peer.
+  They can bring that session back; you cannot.
+- If you are not blocked, carry on with what does not depend on it and handle
+  the reply when it comes.
+
+An `ask` that times out is the same signal in blocking form. Don't re-ask.
+
 ## Asking a peer
 
 `bridger ask <peer> "<question>" --timeout 120` blocks until the matching
