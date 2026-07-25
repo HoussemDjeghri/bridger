@@ -4,6 +4,30 @@ All notable changes to bridger are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and bridger uses
 [semantic versioning](https://semver.org/).
 
+## [0.11.0] — 2026-07-25
+
+A send succeeds whether or not anything is reading at the other end, and it reported only the sequence number. From the sender's side, "hasn't replied yet" and "cannot hear me" looked identical — so a session could send five messages to a peer that never armed a watch and get no hint it was talking to itself.
+
+**`send` now warns when the target is not listening**, with the count of messages from you still unread — so the first send says it, not the fifth:
+
+```
+warning: 'exec' is not listening — no watcher is running there, and 1 message(s)
+from you are unread. It will read them on its next activity, not now. Sending
+more will not reach it any sooner.
+```
+
+On stderr specifically: stdout stays the bare sequence number that callers and the multi-recipient path parse.
+
+**`status` grows the other direction.** Alongside each peer's live status, `unread-by-them` is how much of what you have said has not landed yet. Growing means you are not being heard.
+
+```
+peer: exec [queued]  unread: 0  unread-by-them: 5
+```
+
+The bundled skill turns that into a rule: treat the warning as a stop signal, don't queue more behind it, check `unread-by-them`, and escalate to the user by name when blocked on that peer — a human can bring that session back, the agent cannot.
+
+Completes the arc of v0.9.0 and v0.10.0, which made the receiving side reliable. This is the sending side finally being told the truth.
+
 ## [0.10.0] — 2026-07-25
 
 Registering a session made it addressable but not reachable. Receiving needs a watcher (`wait --follow`), and starting it was one line of prose at the end of a command doc — skip it and the session is registered and deaf. Joined to the channel, muted.
@@ -93,6 +117,7 @@ Also updated: the bridger skill, `/bridger:peers`, the `SessionStart` guidance, 
   fresh heartbeat, a second session is refused that name; once the holder goes
   away, the name can be taken over — how a restarted session reclaims its role.
 
+[0.11.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.11.0
 [0.10.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.10.0
 [0.9.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.9.0
 [0.8.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.8.0
