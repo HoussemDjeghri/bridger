@@ -138,7 +138,10 @@ listed=$(cd "$disc/plain" && "$bridger" peers)
 grep -q "building the parser" <<<"$listed" || fail "peers shows summaries"
 grep -q "plain \[queued\] (you)" <<<"$listed" || fail "peers marks self and queued status"
 grep -q "my-service-" <<<"$listed" || fail "peers lists other peers on the machine"
-[ "$(cd "$disc/plain" && "$bridger" peers --dir | grep -c .)" = "1" ] || fail "--dir scopes to this directory"
+# A reader holding only this output must not read "queued" as "unreachable".
+grep -q "Reachability is proven by 'ask'" <<<"$listed" || fail "a queued other peer must draw the addressability note"
+# Self-only listing: nothing actionable to explain, so no note (and --dir stays one line).
+[ "$(cd "$disc/plain" && "$bridger" peers --dir | grep -c .)" = "1" ] || fail "--dir scopes to this directory, with no note for a queued self"
 (cd "$disc/plain" && "$bridger" summary "still building") >/dev/null
 grep -q "still building" <<<"$(cd "$disc/plain" && "$bridger" peers --dir)" || fail "summary is updatable"
 pass "peers listing, summaries, and --dir scope"
@@ -494,6 +497,47 @@ pass "log + status"
   pass "register never self-wires against a foreign statusline"
 
   rm -rf "$BRIDGER_ROOT" "$cfg" "$sw"
+)
+
+# --- UserPromptSubmit hook: delivery when no watcher is running --------------
+# The watcher is the one step a hook cannot perform for the agent, so this hook
+# is the backstop: it must surface waiting messages on a turn when nothing is
+# watching, and must stay silent when the watcher already pushes them.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  up=$(mktemp -d); mkdir -p "$up/reader" "$up/writer"
+  hook="$here/hooks/user-prompt-submit.sh"
+  payload='{"cwd":"'"$up/reader"'","session_id":"reader-sess"}'
+
+  (cd "$up/reader" && BRIDGER_SESSION_ID=reader-sess "$bridger" register reader >/dev/null)
+  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" register writer >/dev/null)
+
+  [ -z "$(printf '%s' "$payload" | bash "$hook")" ] || fail "hook must stay silent with no unread"
+
+  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send reader ask "ruling: use v2" >/dev/null)
+  out=$(printf '%s' "$payload" | bash "$hook")
+  grep -q "writer ask: ruling: use v2" <<<"$out" || fail "hook must surface the unread message (got: $out)"
+  grep -q "1 unread" <<<"$out" || fail "hook must report the unread count"
+
+  # --peek, not poll: re-shown until acted on, and never consumed out from
+  # under the agent (or a watcher) by the hook itself.
+  grep -q "writer ask: ruling: use v2" <<<"$(printf '%s' "$payload" | bash "$hook")" \
+    || fail "hook must peek, not consume — the message must survive to the next turn"
+
+  # A live watcher already pushes each message; a second copy is wasted context.
+  (cd "$up/reader"; exec env BRIDGER_SESSION_ID=reader-sess "$bridger" wait --follow >/dev/null 2>&1) &
+  w=$!
+  sleep 3
+  [ -z "$(printf '%s' "$payload" | bash "$hook")" ] || fail "hook must stay silent while a watcher is listening"
+  kill "$w" 2>/dev/null || true
+  wait "$w" 2>/dev/null || true
+
+  # An unregistered session has no mailbox to report on.
+  [ -z "$(printf '{"cwd":"%s","session_id":"nobody"}' "$up" | bash "$hook")" ] \
+    || fail "hook must stay silent for an unregistered session"
+
+  pass "UserPromptSubmit hook surfaces unread only when no watcher is running"
+  rm -rf "$BRIDGER_ROOT" "$up"
 )
 
 echo "PASS: all bridger self-checks green"

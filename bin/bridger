@@ -477,8 +477,11 @@ cmd_summary() {
 
 # Who else is out there. Scope narrows the list; default is everything on this
 # machine. Status is a soft signal — a "queued" peer still receives messages.
+# The footer restates that inline: a reader who has only this output (not the
+# help text) otherwise reads "queued" as "nobody home" and skips the ask.
 cmd_peers() {
   local scope=machine me my_repo f name cwd repo branch summary status mark
+  local queued_others=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --machine|--repo|--dir) scope="${1#--}"; shift ;;
@@ -498,10 +501,14 @@ cmd_peers() {
     esac
     status=$(peer_status "$name")
     mark=""; [ "$name" = "${me:-}" ] && mark=" (you)"
+    [ "$status" = queued ] && [ -z "$mark" ] && queued_others=1
     printf '%s [%s]%s %s%s%s\n' "$name" "$status" "$mark" "$cwd" \
       "$([ -n "$branch" ] && echo " @$branch")" \
       "$([ -n "$summary" ] && echo " — $summary")"
   done
+  if [ "$queued_others" -eq 1 ]; then
+    echo "note: [queued] means only that this peer's watcher is not running — it may be a live session that never armed one. It is still addressable and still receives. Reachability is proven by 'ask', never by this status."
+  fi
 }
 
 cmd_whoami() {

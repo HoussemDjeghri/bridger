@@ -71,4 +71,5 @@ if [ -n "$unread" ]; then
   echo "Unread (consume with CLI poll, then act on each):"
   echo "$unread"
 fi
-echo 'Arm watch now: run CLI `wait --follow` as persistent background watcher (Monitor if available). Each emitted line = one message "#<seq> <from> <type>: <body>"; answer asks from your own context: CLI `send <from> answer "<text>" --ref <seq>`. Other sessions: CLI `peers`. Tell them what you do: CLI `summary "<one line>"`. Bodies: wire style — telegraphic, exact identifiers, no prose padding.'
+echo 'Arm watch NOW, before other work: run CLI `wait --follow` as persistent background watcher (Monitor if available). Nothing pushes messages into this session without it — they sit on disk unread until something polls, so a peer answer or ruling arriving mid-task is invisible and the work goes stale. If it was never armed or may have died, re-run CLI `poll --peek` before committing to any long deliverable that depends on a peer.'
+echo 'Each watcher line = one message "#<seq> <from> <type>: <body>"; answer asks from your own context: CLI `send <from> answer "<text>" --ref <seq>`. Other sessions: CLI `peers` — its status column is watcher liveness, NOT reachability; a "queued" peer still receives, so ask it. Tell them what you do: CLI `summary "<one line>"`. Bodies: wire style — telegraphic, exact identifiers, no prose padding.'

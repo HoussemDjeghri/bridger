@@ -142,7 +142,7 @@ No server, no daemon, no network. Plain JSON files under `~/.claude/bridger/`.
 | Writes | Atomic via hard-link; sequence-number races retry automatically, no locks |
 | Identity | Per session, opt-in — each session registers a name; two sessions in one directory stay distinct (identity follows the Claude Code session id, with the directory as fallback). Unregistered sessions stay invisible |
 | Discovery | `bridger peers` shows live status, directory, branch, and an optional self-set summary |
-| Delivery | Hook-driven — `SessionStart` surfaces unread messages and arms a background watcher |
+| Delivery | Hook-driven — `SessionStart` surfaces unread messages and asks the session to arm a background watcher; `UserPromptSubmit` re-surfaces anything still waiting when no watcher is running, so a message can't sit unread mid-task |
 | Correlation | `bridger ask` blocks until a reply whose `ref` matches the question's `seq`; counter-questions avoid deadlock |
 
 > Why files instead of a server? They're debuggable (`cat` any message), they queue while a peer is offline, and they need nothing but bash and `jq`.
@@ -376,7 +376,13 @@ Install <a href="https://jqlang.github.io/jq/">jq</a> — it's bridger's only de
 <details>
 <summary><strong>Why does <code>ask</code> time out?</strong></summary>
 <br>
-The peer session isn't listening (closed, or watch not armed). Its unread count keeps growing in <code>/bridger:status</code>; messages deliver when it next starts.
+The peer session isn't listening (closed, or watch not armed). Its unread count keeps growing in <code>/bridger:status</code>; messages deliver when it next starts, or on its next user turn.
+</details>
+
+<details>
+<summary><strong>A peer shows <code>queued</code> — is it unreachable?</strong></summary>
+<br>
+No. The status column measures one thing: whether that peer's watcher process is running. Registering doesn't start one, so <code>queued</code> covers both a closed session <em>and</em> a live session that never armed a watch. Either way the peer is registered, addressable, and receiving — it may just read the message a little later. Reachability is settled by <code>bridger ask &lt;peer&gt; --timeout</code>, never by this column.
 </details>
 
 <details>

@@ -103,6 +103,31 @@ output here**, just read it — don't bridge for what you can look up.
 Before asking, set your own summary once (`bridger summary "<one line>"`) so
 the peer you're contacting can see who you are in its own `peers` list.
 
+## Status is not reachability; a poll is not a subscription
+
+Two failure modes that look like "the peer isn't there". Neither is.
+
+**`queued` does not mean absent.** Peer status measures exactly one thing: is
+that peer's watcher process running. It cannot distinguish a closed session
+from a live session that never armed a watch — registration does not start
+one. A `queued` peer is registered, addressable, and receiving. Never skip an
+ask because of it; the only test of reachability is `ask` with a `--timeout`.
+
+**Nothing pushes to you unless you armed a watch.** Without a running
+`wait --follow`, incoming messages sit on disk, unseen. A hook polls at each
+user turn and surfaces what is waiting, but that is a backstop, not the
+delivery path: between two user turns — exactly the long autonomous stretch
+where you are writing the deliverable — nothing checks. So a `peers`/`poll`
+result describes one instant, not the rest of the task:
+
+- Arm the watch at session start, before anything else.
+- If you did not (or it may have died), re-run `bridger poll --peek` before you
+  commit to a long deliverable that depends on a peer, and again before you
+  deliver it. A ruling that lands mid-task is silent otherwise.
+- Reconsider the deliverable against what arrived. A message read after the
+  work is written still changes the work — revise it, don't ship the version
+  that predates the message.
+
 ## Housekeeping
 
 - `bridger peers` — who is addressable: name, live status (`listening` /
