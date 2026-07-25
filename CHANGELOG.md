@@ -4,6 +4,11 @@ All notable changes to bridger are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and bridger uses
 [semantic versioning](https://semver.org/).
 
+## [0.8.0] — 2026-07-25
+
+- feat(statusline): register self-wires the badge into a live drop-in dispatcher
+- chore: drop shadow marketplace manifest
+
 ## [0.7.1] — 2026-07-24
 
 - fix(identity): per-session identity — never inherit a directory's names
@@ -60,6 +65,7 @@ All notable changes to bridger are recorded here. The format follows
   fresh heartbeat, a second session is refused that name; once the holder goes
   away, the name can be taken over — how a restarted session reclaims its role.
 
+[0.8.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.8.0
 [0.7.1]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.7.1
 [0.7.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.7.0
 [0.6.2]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.6.2
