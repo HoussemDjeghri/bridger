@@ -4,6 +4,22 @@ All notable changes to bridger are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and bridger uses
 [semantic versioning](https://semver.org/).
 
+## [0.10.0] — 2026-07-25
+
+Registering a session made it addressable but not reachable. Receiving needs a watcher (`wait --follow`), and starting it was one line of prose at the end of a command doc — skip it and the session is registered and deaf. Joined to the channel, muted.
+
+The watcher can only be started by the agent: delivery works by its output re-invoking the agent, so a watcher spawned by the CLI or a hook would keep the heartbeat fresh with nobody reading it — a peer advertising `listening` while messages pile up unseen. Honest and unarmed beats armed and lying. So arming stays the agent's job, and this release makes it hard to skip rather than optional.
+
+**`Stop` hook** — a registered session with no watcher is blocked once at the end of its turn, with the command to run as the reason. End of turn is exactly where the watcher stops being optional: nothing else reaches an idle session. Once per session, and the marker is written before blocking, so an agent that ignores it still gets its turn back instead of looping.
+
+**`PostToolUse` hook** — waiting messages are surfaced between tool calls. This closes the case the work started from: a ruling landing while a spec was being written, unseen until the session ended. Reported once per arrival rather than per tool call, gated by a single `find -newer` so the no-op path stays cheap. It also injects the arm-the-watcher instruction next to a `bridger register` call's own result.
+
+**`/bridger:register`** now leads with the watcher as half of registering, and confirms the watch is armed rather than just the name registered.
+
+The `UserPromptSubmit` hook from v0.9.0 is now one of three cadences on the same script (`hooks/deliver.sh`). Its marker no longer advances the `PostToolUse` high-water mark — that was suppressing the first mid-task report of a message seen once at turn start.
+
+Docs stop describing the watcher as a fallback. It is the primary delivery path; the hooks are what cover its absence.
+
 ## [0.9.0] — 2026-07-25
 
 A session could conclude that a live, answering peer was unreachable — and then write a whole deliverable against stale facts. Two causes, both closed.
@@ -77,6 +93,7 @@ Also updated: the bridger skill, `/bridger:peers`, the `SessionStart` guidance, 
   fresh heartbeat, a second session is refused that name; once the holder goes
   away, the name can be taken over — how a restarted session reclaims its role.
 
+[0.10.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.10.0
 [0.9.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.9.0
 [0.8.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.8.0
 [0.7.1]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.7.1
