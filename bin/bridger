@@ -219,6 +219,7 @@ statusline_write() { # name — record THIS session's registered name for the ba
   [ -n "$f" ] || return 0
   mkdir -p "$(dirname "$f")"
   printf '%s' "$1" > "$f"
+  statusline_autowire   # registering is the trigger: light the badge in THIS session
 }
 
 statusline_clear() { # drop THIS session's badge state
@@ -864,6 +865,56 @@ statusline_wired() {
   return 1
 }
 
+# Would a fragment dropped in statusline.d/ render right now? Same resolution as
+# statusline_wired, minus the "our fragment is present" clause — this answers
+# "is a drop-in dispatcher already the active statusline", i.e. can we wire the
+# badge by writing one file and nothing else.
+statusline_dispatcher_active() {
+  local cmd tok rt
+  [ -f "$SETTINGS_FILE" ] || return 1
+  cmd=$(jq -r '.statusLine.command // empty' "$SETTINGS_FILE" 2>/dev/null) || return 1
+  case "$cmd" in
+    '') return 1 ;;
+    *statusline.d*) return 0 ;;
+  esac
+  for tok in $cmd; do
+    rt=$(_expand_config_path "$tok")
+    [ -f "$rt" ] || continue
+    if grep -qs 'statusline\.d' "$rt"; then return 0; fi
+  done
+  return 1
+}
+
+# Install the badge script and the fragment that runs it. The badge is a copy
+# outside the plugin dir so it survives plugin updates. Idempotent, and it never
+# touches settings.json — wiring that file is the caller's decision.
+install_badge_fragment() {
+  mkdir -p "$STATUSLINE_D" "$(dirname "$STATUSLINE_BADGE")" || return 1
+  cp "$ROOT/hooks/statusline.sh" "$STATUSLINE_BADGE" || return 1
+  chmod +x "$STATUSLINE_BADGE" || return 1
+  cat > "$STATUSLINE_FRAGMENT" <<EOF || return 1
+#!/bin/bash
+# statusline.d fragment — bridger peer badge. Needs the Claude Code statusline
+# JSON on stdin. Drop-in: delete this file to remove the badge.
+exec bash "$STATUSLINE_BADGE"
+EOF
+  chmod +x "$STATUSLINE_FRAGMENT" 2>/dev/null || true
+}
+
+# Self-wire on registration, so the badge lights in THIS session with no
+# /bridger:statusline run and no restart. Deliberately narrow: it only drops a
+# file into a drop-in dir that is ALREADY the active statusline — reversible,
+# invisible to every other badge, and nothing a user has to approve. When there
+# is no dispatcher yet, wiring means editing settings.json (and that only takes
+# effect next session), which stays an explicit, offered choice — never a side
+# effect of `register`. Failure is silent: a badge is cosmetic and must never
+# break a registration.
+statusline_autowire() {
+  if [ -f "$STATUSLINE_FRAGMENT" ] && [ -f "$STATUSLINE_BADGE" ]; then return 0; fi
+  statusline_dispatcher_active || return 0
+  install_badge_fragment 2>/dev/null || true
+}
+
 # Set settings.json .statusLine to a command, preserving other keys. Backs up
 # first and validates the result before replacing — a broken edit never lands.
 _set_statusline_command() { # command
@@ -886,17 +937,7 @@ _set_statusline_command() { # command
 # fragment in statusline.d/. Exit 3 + a NEEDS-CHOICE line means the user already
 # runs their own statusline and the caller must decide how to join it.
 cmd_statusline() {
-  mkdir -p "$STATUSLINE_D" "$(dirname "$STATUSLINE_BADGE")"
-  if ! cp "$ROOT/hooks/statusline.sh" "$STATUSLINE_BADGE" || ! chmod +x "$STATUSLINE_BADGE"; then
-    die "could not install the badge script to $STATUSLINE_BADGE"
-  fi
-  cat > "$STATUSLINE_FRAGMENT" <<EOF
-#!/bin/bash
-# statusline.d fragment — bridger peer badge. Needs the Claude Code statusline
-# JSON on stdin. Drop-in: delete this file to remove the badge.
-exec bash "$STATUSLINE_BADGE"
-EOF
-  chmod +x "$STATUSLINE_FRAGMENT" 2>/dev/null || true
+  install_badge_fragment || die "could not install the badge script to $STATUSLINE_BADGE"
 
   # Already reachable (an existing dispatcher picks up the fragment, or a prior
   # chain names the badge) → nothing to wire.

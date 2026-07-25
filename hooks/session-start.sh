@@ -18,15 +18,20 @@ cwd=$(jq -r '.cwd // empty' <<<"$payload" 2>/dev/null || true)
 BRIDGER_SESSION_ID=$(jq -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)
 export BRIDGER_SESSION_ID
 
-# Statusline badge wiring. This runs for every session (before the opt-in
-# autoregister that may exit early), because the badge offer is not tied to
-# having a peer yet. Two jobs, mirrored on the wired-detection verdict:
-#   1. Offer to wire the badge once, on the first session where it is not set up.
+BRIDGER_ROOT="${BRIDGER_ROOT:-$HOME/.claude/bridger}"
+
+me=$(cd "$cwd" && "$bridger" autoregister 2>/dev/null) || me=""
+
+# Statusline badge wiring, evaluated AFTER autoregister: registering self-wires
+# the badge whenever a drop-in dispatcher is already live, so asking first would
+# offer what has just been done. Runs for every session even so — the offer is
+# not tied to having a peer. Two jobs, mirrored on the wired-detection verdict:
+#   1. Offer to wire the badge once, on the first session where it is not set up
+#      (only reachable when there is no dispatcher — otherwise it self-wired).
 #   2. Self-heal: a previously-wired badge no longer reachable from the active
 #      statusLine (a foreign statusline setup repointed settings.json — the one
 #      collision the drop-in dir cannot prevent) re-offers to re-wire, once per
 #      wired→unwired transition, never as a nag.
-BRIDGER_ROOT="${BRIDGER_ROOT:-$HOME/.claude/bridger}"
 badge="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/bridger-statusline.sh"
 if "$bridger" statusline-status >/dev/null 2>&1; then
   mkdir -p "$BRIDGER_ROOT"; : > "$BRIDGER_ROOT/statusline_wired"
@@ -40,8 +45,6 @@ fi
 # Prune per-session badge state left by sessions that ended long ago; the badge
 # only renders in a live session, so old files are pure litter.
 find "$BRIDGER_ROOT/statusline" -type f -mtime +30 -delete 2>/dev/null || true
-
-me=$(cd "$cwd" && "$bridger" autoregister 2>/dev/null) || me=""
 
 # No identity for this session (opt-in and this directory was never registered
 # by THIS session). Identity is per session and never inherited, so a session

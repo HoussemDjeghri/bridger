@@ -3,7 +3,13 @@ description: Wire the always-visible bridger peer-name statusline badge
 ---
 
 Wire the bridger statusline badge (`[⇄ BRIDGER:<name>]`, shows the name this
-session is registered as; nothing when unregistered). Run:
+session is registered as; nothing when unregistered).
+
+Usually nothing to do: when a drop-in dispatcher already runs the statusline,
+`register` wires the badge itself (it only adds a fragment, so the badge lights
+in the same session). This command is for the cases registration will not touch
+on its own — no statusline at all, or one that does not read the drop-in dir.
+Run:
 
 `"${CLAUDE_PLUGIN_ROOT}/bin/bridger" statusline`
 

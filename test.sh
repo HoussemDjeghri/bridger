@@ -404,7 +404,7 @@ pass "log + status"
   BRIDGER_ROOT=$(mktemp -d); cfg=$(mktemp -d); sw=$(mktemp -d)
   export BRIDGER_ROOT
   export CLAUDE_CONFIG_DIR="$cfg"
-  mkdir -p "$sw/proj"
+  mkdir -p "$sw/proj" "$sw/autowired" "$sw/foreign"
 
   render_badge() { printf '{"session_id":"%s"}' "$1" | bash "$badge"; }
 
@@ -467,6 +467,31 @@ pass "log + status"
   printf '{"statusLine":{"type":"command","command":"bash /opt/othertool.sh"}}' > "$cfg/settings.json"
   "$bridger" statusline-status >/dev/null 2>&1 && fail "self-heal: must read unwired after a foreign takeover"
   pass "statusline self-heal detection: wired after wiring, unwired after takeover"
+
+  # Self-wiring on register, the no-restart path: a drop-in dispatcher someone
+  # else installed is already the active statusline, so registering only has to
+  # drop one file for the badge to render in THIS session.
+  rm -rf "$cfg"; mkdir -p "$cfg/hooks"
+  cp "$here/hooks/statusline-dispatch.sh" "$cfg/hooks/othertool.sh"
+  printf '{"statusLine":{"type":"command","command":"bash %s/hooks/othertool.sh"}}' "$cfg" > "$cfg/settings.json"
+  before=$(cat "$cfg/settings.json")
+  (cd "$sw/autowired" && CLAUDE_CODE_SESSION_ID=auto-sess "$bridger" register scout >/dev/null)
+  [ -f "$cfg/statusline.d/50-bridger.sh" ] || fail "register must self-wire the fragment into a live drop-in dispatcher"
+  [ "$(cat "$cfg/settings.json")" = "$before" ] || fail "self-wiring must not touch settings.json"
+  out=$(printf '{"session_id":"auto-sess"}' | bash "$cfg/hooks/othertool.sh")
+  case "$out" in *"BRIDGER:scout"*) ;; *) fail "the badge must render through the existing dispatcher (got: $out)" ;; esac
+  pass "register self-wires the badge into a live dispatcher, settings.json untouched"
+
+  # No dispatcher to join: wiring would mean rewriting a foreign statusline (and
+  # would only show up next session), so register must wire nothing and leave
+  # that choice to the one-time offer.
+  rm -rf "$cfg"; mkdir -p "$cfg"
+  printf '{"statusLine":{"type":"command","command":"bash /opt/othertool.sh"}}' > "$cfg/settings.json"
+  before=$(cat "$cfg/settings.json")
+  (cd "$sw/foreign" && CLAUDE_CODE_SESSION_ID=nowire-sess "$bridger" register lookout >/dev/null)
+  [ -f "$cfg/statusline.d/50-bridger.sh" ] && fail "register must not wire a badge when no drop-in dispatcher is active"
+  [ "$(cat "$cfg/settings.json")" = "$before" ] || fail "register must never edit a foreign statusline"
+  pass "register never self-wires against a foreign statusline"
 
   rm -rf "$BRIDGER_ROOT" "$cfg" "$sw"
 )
