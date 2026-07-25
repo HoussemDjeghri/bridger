@@ -142,7 +142,7 @@ No server, no daemon, no network. Plain JSON files under `~/.claude/bridger/`.
 | Writes | Atomic via hard-link; sequence-number races retry automatically, no locks |
 | Identity | Per session, opt-in — each session registers a name; two sessions in one directory stay distinct (identity follows the Claude Code session id, with the directory as fallback). Unregistered sessions stay invisible |
 | Discovery | `bridger peers` shows live status, directory, branch, and an optional self-set summary |
-| Delivery | Hook-driven — `SessionStart` surfaces unread messages and asks the session to arm a background watcher; `UserPromptSubmit` re-surfaces anything still waiting when no watcher is running, so a message can't sit unread mid-task |
+| Delivery | A background watcher per session — its output re-invokes the agent, so an idle peer wakes up when a message lands. Hooks cover the rest: `Stop` won't let a registered session go idle without one, and while it's missing, `PostToolUse` and `UserPromptSubmit` surface waiting messages mid-task and at each turn |
 | Correlation | `bridger ask` blocks until a reply whose `ref` matches the question's `seq`; counter-questions avoid deadlock |
 
 > Why files instead of a server? They're debuggable (`cat` any message), they queue while a peer is offline, and they need nothing but bash and `jq`.
@@ -376,7 +376,15 @@ Install <a href="https://jqlang.github.io/jq/">jq</a> — it's bridger's only de
 <details>
 <summary><strong>Why does <code>ask</code> time out?</strong></summary>
 <br>
-The peer session isn't listening (closed, or watch not armed). Its unread count keeps growing in <code>/bridger:status</code>; messages deliver when it next starts, or on its next user turn.
+The peer session isn't listening (closed, or watch not armed). Its unread count keeps growing in <code>/bridger:status</code>; messages deliver when it next starts, or on its next turn of activity.
+</details>
+
+<details>
+<summary><strong>Why doesn't registering start the watcher for me?</strong></summary>
+<br>
+Because a watcher started by anything other than the agent delivers nowhere. Messages reach a session because the watcher runs as a <em>background task</em> whose output re-invokes the agent — that's the delivery mechanism. A watcher spawned by the CLI or a hook would refresh the heartbeat while nobody read it, so the peer would advertise <code>listening</code> with messages piling up unseen. Honest and unarmed beats armed and lying.
+<br><br>
+So the agent starts it, and bridger makes that hard to skip rather than optional: <code>/bridger:register</code> arms it as part of registering, a hook injects the same instruction next to the register call's result, and the <code>Stop</code> hook won't let a registered session end its turn unwatched. If one slips through anyway, waiting messages still surface on the session's next tool call or next prompt — just not while it sits idle.
 </details>
 
 <details>

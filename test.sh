@@ -499,45 +499,113 @@ pass "log + status"
   rm -rf "$BRIDGER_ROOT" "$cfg" "$sw"
 )
 
-# --- UserPromptSubmit hook: delivery when no watcher is running --------------
-# The watcher is the one step a hook cannot perform for the agent, so this hook
-# is the backstop: it must surface waiting messages on a turn when nothing is
-# watching, and must stay silent when the watcher already pushes them.
+# --- delivery hooks: reaching a session whose watcher is not running ---------
+# The watcher is the only path into an IDLE session, and only the agent can
+# start it. These hooks cover the states that leaves blind: mid-task
+# (PostToolUse), and the human's next turn (UserPromptSubmit). Both must be
+# no-ops while the watcher is running — it already delivers.
 (
   BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
   up=$(mktemp -d); mkdir -p "$up/reader" "$up/writer"
-  hook="$here/hooks/user-prompt-submit.sh"
-  payload='{"cwd":"'"$up/reader"'","session_id":"reader-sess"}'
+  hook="$here/hooks/deliver.sh"
+  ups='{"hook_event_name":"UserPromptSubmit","cwd":"'"$up/reader"'","session_id":"reader-sess"}'
+  ptu='{"hook_event_name":"PostToolUse","cwd":"'"$up/reader"'","session_id":"reader-sess"}'
 
   (cd "$up/reader" && BRIDGER_SESSION_ID=reader-sess "$bridger" register reader >/dev/null)
   (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" register writer >/dev/null)
 
-  [ -z "$(printf '%s' "$payload" | bash "$hook")" ] || fail "hook must stay silent with no unread"
+  [ -z "$(printf '%s' "$ups" | bash "$hook")" ] || fail "hook must stay silent with no unread"
 
   (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send reader ask "ruling: use v2" >/dev/null)
-  out=$(printf '%s' "$payload" | bash "$hook")
+  out=$(printf '%s' "$ups" | bash "$hook")
   grep -q "writer ask: ruling: use v2" <<<"$out" || fail "hook must surface the unread message (got: $out)"
   grep -q "1 unread" <<<"$out" || fail "hook must report the unread count"
 
   # --peek, not poll: re-shown until acted on, and never consumed out from
   # under the agent (or a watcher) by the hook itself.
-  grep -q "writer ask: ruling: use v2" <<<"$(printf '%s' "$payload" | bash "$hook")" \
+  grep -q "writer ask: ruling: use v2" <<<"$(printf '%s' "$ups" | bash "$hook")" \
     || fail "hook must peek, not consume — the message must survive to the next turn"
 
-  # A live watcher already pushes each message; a second copy is wasted context.
+  # PostToolUse feeds context back only through hookSpecificOutput, so its
+  # output must be JSON carrying the same message.
+  out=$(printf '%s' "$ptu" | bash "$hook")
+  [ "$(jq -r '.hookSpecificOutput.hookEventName' <<<"$out")" = "PostToolUse" ] \
+    || fail "PostToolUse output must be hookSpecificOutput JSON (got: $out)"
+  jq -r '.hookSpecificOutput.additionalContext' <<<"$out" | grep -q "writer ask: ruling: use v2" \
+    || fail "PostToolUse must carry the message in additionalContext"
+
+  # Mid-task the report is per arrival, not per tool call — the same message
+  # must not be re-injected after every subsequent tool.
+  [ -z "$(printf '%s' "$ptu" | bash "$hook")" ] \
+    || fail "PostToolUse must report a message once, not on every tool call"
+
+  # ... but a message that lands after that must still get through.
+  sleep 1
+  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send reader chat "and v2.1 too" >/dev/null)
+  jq -r '.hookSpecificOutput.additionalContext' <<<"$(printf '%s' "$ptu" | bash "$hook")" \
+    | grep -q "and v2.1 too" || fail "PostToolUse must report a message that arrives later"
+
+  # Registering is the moment the watcher is easiest to forget, so the
+  # instruction is injected next to that call's own result.
+  out=$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","session_id":"reader-sess","tool_input":{"command":"%s register scout"}}' \
+    "$up/reader" "$bridger" | bash "$hook")
+  jq -r '.hookSpecificOutput.additionalContext' <<<"$out" | grep -q "NOT yet listening" \
+    || fail "a register call must draw the arm-the-watcher instruction (got: $out)"
+
+  # A live watcher already delivers each message; a second copy is wasted context.
   (cd "$up/reader"; exec env BRIDGER_SESSION_ID=reader-sess "$bridger" wait --follow >/dev/null 2>&1) &
   w=$!
   sleep 3
-  [ -z "$(printf '%s' "$payload" | bash "$hook")" ] || fail "hook must stay silent while a watcher is listening"
+  [ -z "$(printf '%s' "$ups" | bash "$hook")" ] || fail "hook must stay silent while a watcher is listening"
+  [ -z "$(printf '%s' "$ptu" | bash "$hook")" ] || fail "PostToolUse must stay silent while a watcher is listening"
   kill "$w" 2>/dev/null || true
   wait "$w" 2>/dev/null || true
 
   # An unregistered session has no mailbox to report on.
-  [ -z "$(printf '{"cwd":"%s","session_id":"nobody"}' "$up" | bash "$hook")" ] \
+  [ -z "$(printf '{"hook_event_name":"UserPromptSubmit","cwd":"%s","session_id":"nobody"}' "$up" | bash "$hook")" ] \
     || fail "hook must stay silent for an unregistered session"
 
-  pass "UserPromptSubmit hook surfaces unread only when no watcher is running"
+  pass "delivery hooks surface unread mid-task and on turn, only when unwatched"
   rm -rf "$BRIDGER_ROOT" "$up"
+)
+
+# --- Stop hook: a registered session must not go idle deaf -------------------
+# End of turn is where the watcher stops being optional: nothing else reaches
+# an idle session. The hook cannot start it, so it blocks the turn once until
+# the agent does — once, never a nag.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  st=$(mktemp -d); mkdir -p "$st/solo"
+  hook="$here/hooks/stop.sh"
+  payload='{"cwd":"'"$st/solo"'","session_id":"solo-sess","stop_hook_active":false}'
+
+  [ -z "$(printf '%s' "$payload" | bash "$hook")" ] || fail "Stop must not block an unregistered session"
+
+  (cd "$st/solo" && BRIDGER_SESSION_ID=solo-sess "$bridger" register solo >/dev/null)
+  out=$(printf '%s' "$payload" | bash "$hook")
+  [ "$(jq -r .decision <<<"$out")" = "block" ] || fail "Stop must block a registered, unwatched session (got: $out)"
+  jq -r .reason <<<"$out" | grep -q "wait --follow" || fail "the block reason must name the command to run"
+
+  # Once per session: an agent that ignores it still gets its turn back, and
+  # falls through to the softer per-turn reminders instead of a hard loop.
+  [ -z "$(printf '%s' "$payload" | bash "$hook")" ] || fail "Stop must block at most once per session"
+
+  # A turn Claude Code is already continuing because of a stop hook.
+  rm -f "$BRIDGER_ROOT/armed-nudge-solo-sess"
+  [ -z "$(printf '{"cwd":"%s","session_id":"solo-sess","stop_hook_active":true}' "$st/solo" | bash "$hook")" ] \
+    || fail "Stop must respect stop_hook_active"
+
+  # Watcher armed: the session goes idle listening, nothing to enforce.
+  rm -f "$BRIDGER_ROOT/armed-nudge-solo-sess"
+  (cd "$st/solo"; exec env BRIDGER_SESSION_ID=solo-sess "$bridger" wait --follow >/dev/null 2>&1) &
+  w=$!
+  sleep 3
+  [ -z "$(printf '%s' "$payload" | bash "$hook")" ] || fail "Stop must not block once a watcher is listening"
+  kill "$w" 2>/dev/null || true
+  wait "$w" 2>/dev/null || true
+
+  pass "Stop hook blocks once until a registered session is actually listening"
+  rm -rf "$BRIDGER_ROOT" "$st"
 )
 
 echo "PASS: all bridger self-checks green"
