@@ -11,6 +11,5 @@ Nothing is scheduled. These are revisited only on real need:
   validation on receipt.
 - MCP server variant — expose send/poll/ask as MCP tools over the same files.
 - Cross-machine transport — pluggable mailbox backend plus an auth story.
-- Thread viewer — read-only HTML render of a thread for humans.
 - Native integration — adopt Claude Code's session-to-session APIs as a
   transport if one ships, keeping the file bus as the offline fallback.

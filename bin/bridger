@@ -811,6 +811,14 @@ cmd_offline() {
   rm -f "$(beat_file "$me")"
 }
 
+# Serve the read-only web view on loopback. It parses the state files directly
+# and never calls back into this script — a consuming `poll` would advance a
+# cursor and eat somebody's unread messages.
+cmd_monitor() {
+  command -v python3 >/dev/null 2>&1 || die "bridger monitor needs python3"
+  exec python3 "$ROOT/monitor/server.py" --root "$BRIDGER_ROOT" "$@"
+}
+
 cmd_status() {
   local me peer dir top n m
   me=$(resolve_identity) || true
@@ -887,6 +895,8 @@ usage:
                                       render selected types as committable markdown
                                       (deterministic; default types: stop,ruling)
   bridger status                       identity, peers, unread counts
+  bridger monitor [--port N]           read-only web view of peers, threads and
+                                      bus health, in a browser (needs python3)
 
 message types are free-form strings; conventions: chat, ask, answer.
 peer status: "listening" (its watcher is running) or "queued" (messages wait
@@ -1067,6 +1077,7 @@ case "$cmd" in
   log)      cmd_log "$@" ;;
   mirror)   cmd_mirror "$@" ;;
   status)   cmd_status "$@" ;;
+  monitor)  cmd_monitor "$@" ;;
   dormant)  cmd_dormant "$@" ;;
   statusline)        cmd_statusline "$@" ;;
   statusline-status) cmd_statusline_status "$@" ;;

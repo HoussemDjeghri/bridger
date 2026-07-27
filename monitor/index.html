@@ -1,0 +1,904 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>bridger monitor</title>
+<style>
+/* ------------------------------------------------------------------ tokens */
+:root {
+  /* Warm neutrals rather than blue-grey: the same terracotta-on-cream identity
+     the README artwork uses (docs/prompts.md), inverted for a dark room. */
+  --bg: #17130f;
+  --surface: #1f1a15;
+  --raised: #26201a;
+  --hover: #2e2620;
+  --border: #392f26;
+  --text: #f3ebe1;
+  --muted: #a8998a;
+  --ok: #6fcf97;
+  --warn: #e5b85c;
+  --danger: #f08a7a;
+  --accent: #e58c5c;
+  --brand: #e07a47;
+  --ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+  --shadow: 0 1px 2px rgb(0 0 0 / .38), 0 10px 28px rgb(0 0 0 / .28);
+
+  --p1: #e58c5c;
+  --p2: #c79bf0;
+  --p3: #6fcf97;
+  --p4: #f0a08a;
+  --p5: #e5b85c;
+  --p6: #6ecfd8;
+
+  --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
+  --s5: 24px; --s6: 32px; --s7: 48px;
+
+  --r-sm: 6px; --r-md: 10px; --r-lg: 16px; --r-full: 999px;
+
+  --t-xs: 11px; --t-sm: 13px; --t-md: 15px; --t-lg: 19px; --t-xl: 24px;
+
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+
+  --sidebar: 320px;
+  --motion: 150ms;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #faf6f0;            /* the README's cream — docs/prompts.md */
+    --surface: #ffffff;
+    --raised: #ffffff;
+    --hover: #f4ece2;
+    --border: #e8dccd;
+    --text: #2a2521;
+    --muted: #6f6358;
+    /* Warm semantics, still legible: the brand terracotta #e07a47 only reaches
+       ~2.6:1 on cream, so text and glyphs use a darkened tone and --brand keeps
+       the exact accent for fills that are seen rather than read. */
+    --ok: #2f7d52;
+    --warn: #a9660d;
+    --danger: #b23a2e;
+    --accent: #b3541a;
+    --brand: #e07a47;
+    --shadow: 0 1px 2px rgb(74 52 34 / .07), 0 10px 28px rgb(74 52 34 / .09);
+    --p1: #b3541a; --p2: #8a4fb8; --p3: #2f7d52;
+    --p4: #c2410c; --p5: #a9660d; --p6: #0f7a86;
+  }
+}
+
+/* ------------------------------------------------------------------- reset */
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: var(--t-md)/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100dvh;
+  overflow: hidden;
+}
+h1, h2, h3, p, ul, ol, figure { margin: 0; }
+ul, ol { list-style: none; padding: 0; }
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+a { color: var(--accent); }
+:focus-visible { outline: none; box-shadow: var(--ring); border-radius: var(--r-sm); }
+.sr {
+  position: absolute; width: 1px; height: 1px;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+}
+
+/* -------------------------------------------------------------- health bar */
+.health {
+  display: flex; align-items: center; gap: var(--s4);
+  padding: var(--s3) var(--s4);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  flex-wrap: wrap;
+}
+.brand { display: flex; align-items: center; gap: var(--s2); flex: none; }
+/* The plugin's own mark, served from assets/. If it is missing the alt text
+   would shove the wordmark sideways, so a broken load simply collapses. */
+.brand .mark { width: 28px; height: 28px; border-radius: var(--r-sm); flex: none; }
+.brand h1 { font-size: var(--t-lg); letter-spacing: -0.01em; }
+.brand .ver { font: var(--t-xs)/1 var(--mono); color: var(--muted); }
+.tiles { display: flex; flex-wrap: wrap; gap: var(--s2); flex: 1 1 auto; }
+.tile {
+  position: relative;
+  flex: none;
+  display: grid; gap: 2px;
+  padding: var(--s2) var(--s5) var(--s2) var(--s3);
+  min-width: 92px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  font-variant-numeric: tabular-nums;
+}
+.tile .k {
+  font-size: var(--t-xs); text-transform: uppercase; letter-spacing: .07em;
+  color: var(--muted);
+}
+.tile .v { font-size: var(--t-md); font-weight: 600; line-height: 1.2; }
+.tile .sub { font-size: var(--t-xs); color: var(--muted); }
+.tile[data-tone="ok"] .v { color: var(--ok); }
+.tile[data-tone="warn"] { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.tile[data-tone="warn"] .v { color: var(--warn); }
+.tile[data-tone="bad"] { border-color: color-mix(in srgb, var(--danger) 55%, var(--border)); }
+.tile[data-tone="bad"] .v { color: var(--danger); }
+
+.info {
+  position: absolute; top: var(--s1); right: var(--s1);
+  width: 18px; height: 18px; border-radius: var(--r-full);
+  display: grid; place-items: center;
+  font: 600 10px/1 var(--sans); color: var(--muted);
+  border: 1px solid var(--border); background: var(--surface);
+  cursor: help;
+  transition: color var(--motion) ease-out, border-color var(--motion) ease-out;
+}
+/* The glyph is 18px for the tile's sake; the target it answers to is 40px. */
+.info::before { content: ""; position: absolute; inset: -11px; }
+.info:hover, .info:focus-visible { color: var(--text); border-color: var(--muted); }
+.tip {
+  position: absolute; top: calc(100% + var(--s1)); right: 0; z-index: 20;
+  width: 250px; padding: var(--s2) var(--s3);
+  background: var(--raised); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  box-shadow: var(--shadow);
+  font: var(--t-xs)/1.45 var(--sans);
+  text-transform: none; letter-spacing: normal;
+  opacity: 0; visibility: hidden; transform: translateY(-4px);
+  pointer-events: none;  /* aria-hidden decoration — must not eat clicks on what it covers */
+  transition: opacity var(--motion) ease-out, transform var(--motion) ease-out,
+              visibility var(--motion);
+}
+.info:hover + .tip, .info:focus + .tip {
+  opacity: 1; visibility: visible; transform: none;
+}
+
+.conn { flex: none; display: flex; align-items: center; gap: var(--s2); font-size: var(--t-sm); color: var(--muted); }
+.conn::before {
+  content: ""; width: 8px; height: 8px; border-radius: var(--r-full);
+  background: var(--ok);
+}
+.conn[data-state="down"] { color: var(--danger); }
+.conn[data-state="down"]::before { background: var(--danger); }
+
+/* ----------------------------------------------------------------- shell */
+.app {
+  display: grid;
+  grid-template-columns: var(--sidebar) minmax(0, 1fr);
+  min-height: 0;
+}
+.sidebar {
+  min-height: 0; overflow-y: auto;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+}
+.sidebar section { padding: var(--s3) var(--s2) var(--s4); }
+.sidebar h2 {
+  font-size: var(--t-xs); text-transform: uppercase; letter-spacing: .08em;
+  color: var(--muted); padding: 0 var(--s2) var(--s2);
+}
+
+/* ---------------------------------------------------------------- avatars */
+.avatar {
+  flex: none;
+  display: grid; place-items: center;
+  width: 34px; height: 34px;
+  border-radius: var(--r-full);
+  background: color-mix(in srgb, var(--peer) 22%, var(--surface));
+  color: var(--peer);
+  border: 1px solid color-mix(in srgb, var(--peer) 40%, transparent);
+  font: 600 var(--t-xs)/1 var(--sans);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.avatar.sm { width: 26px; height: 26px; font-size: 10px; }
+.stack { display: flex; flex: none; }
+.stack .avatar + .avatar { margin-left: -12px; }
+
+.dot {
+  width: 8px; height: 8px; border-radius: var(--r-full);
+  background: var(--muted); flex: none;
+}
+.dot[data-status="listening"] { background: var(--ok); }
+
+/* ------------------------------------------------------------- peer rows */
+.peer {
+  display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s2) var(--s2);
+  border-radius: var(--r-md);
+  min-height: 44px;
+}
+/* Grid, not inline: text-overflow only clips a block box, so an inline span
+   would push the sidebar wide instead of truncating. */
+.peer .meta { min-width: 0; flex: 1; display: grid; }
+/* min-width:0 on every nested flex/grid item: the default is min-width:auto,
+   which refuses to shrink below the content and pushes the whole sidebar wide
+   instead of letting the ellipsis below do its job. Real peer names are long
+   ("executor-phase-5-composition"), so this is the common case, not the edge. */
+.peer .top { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.peer .name { font: 600 var(--t-sm)/1.3 var(--mono); }
+.peer .status { font-size: var(--t-xs); color: var(--muted); display: flex; align-items: center; gap: 5px; }
+.peer .sub {
+  font-size: var(--t-xs); color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* ----------------------------------------------------------- thread rows */
+.thread {
+  width: 100%;
+  display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s2) var(--s2);
+  border-radius: var(--r-md);
+  text-align: left;
+  min-height: 56px;
+  transition: background var(--motion) ease-out;
+}
+.thread:hover { background: var(--hover); }
+.thread:active { background: var(--border); }
+.thread[aria-current="true"] { background: color-mix(in srgb, var(--accent) 16%, var(--surface)); }
+.thread .meta { min-width: 0; flex: 1; display: grid; }
+.thread .top { display: flex; align-items: baseline; gap: var(--s2); min-width: 0; }
+.thread .title {
+  font: 600 var(--t-sm)/1.4 var(--sans);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  flex: 1; min-width: 0;
+}
+.thread .when { font-size: var(--t-xs); color: var(--muted); flex: none; font-variant-numeric: tabular-nums; }
+.thread .preview {
+  font-size: var(--t-sm); color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pill {
+  flex: none;
+  padding: 2px var(--s2);
+  border-radius: var(--r-full);
+  font: 600 var(--t-xs)/1.6 var(--sans);
+  font-variant-numeric: tabular-nums;
+  background: color-mix(in srgb, var(--warn) 20%, transparent);
+  color: var(--warn);
+  border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+}
+
+/* ---------------------------------------------------------------- pane */
+.pane {
+  min-height: 0; min-width: 0;
+  display: grid; grid-template-rows: auto minmax(0, 1fr);
+  background: var(--bg);
+}
+.pane-head {
+  display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s3) var(--s4);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.pane-head .who { min-width: 0; flex: 1; display: grid; }
+.pane-head .title { font-size: var(--t-md); font-weight: 600; }
+.pane-head .sub {
+  font-size: var(--t-xs); color: var(--muted);
+  display: flex; flex-wrap: wrap; gap: var(--s1) var(--s3);
+}
+.pane-head .sub span { display: flex; align-items: center; gap: 5px; }
+.back { display: none; padding: var(--s2); border-radius: var(--r-md); }
+.back:hover { background: var(--hover); }
+
+.log { min-height: 0; overflow-y: auto; padding: var(--s4) var(--s4) var(--s6); position: relative; }
+.log-inner { max-width: 900px; margin: 0 auto; display: grid; gap: var(--s1); }
+
+.daysep { display: grid; place-items: center; padding: var(--s4) 0 var(--s3); }
+.daysep span {
+  position: sticky; top: 0;
+  padding: var(--s1) var(--s3);
+  background: var(--raised); border: 1px solid var(--border);
+  border-radius: var(--r-full);
+  font-size: var(--t-xs); color: var(--muted);
+}
+
+.queuedsep {
+  display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s3) 0 var(--s2);
+  color: var(--warn); font-size: var(--t-xs);
+  text-transform: uppercase; letter-spacing: .07em;
+}
+.queuedsep::before, .queuedsep::after {
+  content: ""; height: 1px; flex: 1;
+  background: color-mix(in srgb, var(--warn) 45%, transparent);
+}
+
+/* -------------------------------------------------------------- messages */
+.msg { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: var(--s3); margin-top: 2px; }
+.msg.right { grid-template-columns: minmax(0, 1fr) 34px; }
+.msg.right .avatar { grid-column: 2; grid-row: 1 / span 2; }
+.msg .avatar { grid-row: 1 / span 2; align-self: end; visibility: hidden; }
+.msg.run-start { margin-top: var(--s4); }
+/* The avatar sits at the foot of a run, beside the last thing that sender said. */
+.msg.run-end .avatar { visibility: visible; }
+
+.sender {
+  grid-column: 2;
+  display: flex; align-items: baseline; gap: var(--s2);
+  font: 600 var(--t-xs)/1.4 var(--mono);
+  color: var(--peer);
+  padding-bottom: var(--s1);
+}
+.msg.right .sender { grid-column: 1; justify-content: flex-end; }
+
+.bubble {
+  grid-column: 2;
+  justify-self: start;
+  max-width: min(680px, 82%);
+  padding: var(--s2) var(--s3);
+  border-radius: var(--r-lg);
+  background: color-mix(in srgb, var(--peer) 13%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--peer) 26%, var(--border));
+}
+.msg.right .bubble { grid-column: 1; justify-self: end; }
+/* Only the last bubble of a run grows the tail corner, next to the avatar. */
+.msg.run-end .bubble { border-bottom-left-radius: var(--r-sm); }
+.msg.run-end.right .bubble {
+  border-bottom-left-radius: var(--r-lg);
+  border-bottom-right-radius: var(--r-sm);
+}
+.bubble[data-delivered="false"] {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--warn) 55%, var(--border));
+  background: var(--surface);
+}
+.bubble.flash { animation: flash 1.2s ease-out; }
+@keyframes flash { from { box-shadow: 0 0 0 3px var(--accent); } to { box-shadow: none; } }
+
+.body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--t-sm); }
+.body.clamped { max-height: 22em; overflow: hidden; mask-image: linear-gradient(#000 70%, transparent); }
+.more {
+  font-size: var(--t-xs); color: var(--accent); padding: var(--s1) 0;
+  text-decoration: underline; text-underline-offset: 2px;
+}
+
+.msgmeta {
+  display: flex; align-items: center; flex-wrap: wrap; gap: var(--s2);
+  padding-top: var(--s1);
+  font: var(--t-xs)/1.4 var(--mono);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.chip {
+  padding: 1px 7px; border-radius: var(--r-full);
+  font: 600 10px/1.6 var(--sans);
+  text-transform: uppercase; letter-spacing: .07em;
+  background: color-mix(in srgb, var(--chip) 18%, transparent);
+  color: var(--chip);
+  border: 1px solid color-mix(in srgb, var(--chip) 35%, transparent);
+}
+.tick { color: var(--ok); }
+.queuedtag { color: var(--warn); }
+
+.jump {
+  position: sticky; bottom: var(--s3);
+  justify-self: center;
+  padding: var(--s2) var(--s4);
+  border-radius: var(--r-full);
+  background: var(--accent); color: var(--bg);
+  font: 600 var(--t-sm)/1 var(--sans);
+  box-shadow: var(--shadow);
+}
+
+/* ----------------------------------------------------------------- empty */
+.empty {
+  display: grid; place-content: center; justify-items: center; gap: var(--s2);
+  height: 100%; padding: var(--s7);
+  color: var(--muted); text-align: center;
+}
+.empty strong { color: var(--text); font-size: var(--t-lg); font-weight: 600; }
+.empty p { max-width: 46ch; font-size: var(--t-sm); }
+.empty code { font-family: var(--mono); font-size: var(--t-sm); color: var(--text); }
+
+.warnings {
+  margin: var(--s3) var(--s2) 0;
+  padding: var(--s2) var(--s3);
+  border-radius: var(--r-md);
+  border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--border));
+  color: var(--warn); font-size: var(--t-xs);
+}
+
+/* ------------------------------------------------------------ responsive */
+@media (max-width: 720px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .sidebar { border-right: 0; }
+  .app[data-view="list"] .pane { display: none; }
+  .app[data-view="thread"] .sidebar { display: none; }
+  .back { display: block; }
+  .bubble { max-width: 88%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
+}
+</style>
+</head>
+<body>
+
+<header class="health">
+  <div class="brand">
+    <img class="mark" src="/logo.png" alt="" onerror="this.remove()">
+    <h1>bridger</h1>
+    <span class="ver" id="ver"></span>
+  </div>
+  <div class="tiles" id="tiles" aria-live="polite" aria-label="bus health"></div>
+  <span class="conn" id="conn" data-state="ok">live</span>
+</header>
+
+<div class="app" id="app" data-view="list">
+  <aside class="sidebar" aria-label="peers and conversations">
+    <div id="warnings"></div>
+    <section>
+      <h2 id="peers-h">Peers</h2>
+      <ul id="peers" aria-labelledby="peers-h"></ul>
+    </section>
+    <section>
+      <h2 id="threads-h">Conversations</h2>
+      <ul id="threads" aria-labelledby="threads-h"></ul>
+    </section>
+  </aside>
+
+  <main class="pane" aria-label="conversation">
+    <header class="pane-head" id="head" hidden></header>
+    <div class="log" id="log"></div>
+  </main>
+</div>
+
+<script>
+"use strict";
+
+const POLL_MS = 2000;
+const GROUP_WINDOW_S = 300;   // same sender within 5 min renders as one run
+const CLAMP_CHARS = 1400;     // longer bodies collapse behind "Show more"
+const PALETTE = ["--p1", "--p2", "--p3", "--p4", "--p5", "--p6"];
+/* Chip text sits on an 18% tint of its own role, so every role here has to be
+   readable at small caps — that rules out --brand (#e07a47 is ~2.6:1 on cream)
+   and it is why chat is teal rather than another orange next to ask. */
+const CHIP_ROLES = {
+  ask: "--accent", answer: "--ok", ruling: "--p2",
+  blocked: "--danger", chat: "--p6", stop: "--warn",
+};
+
+const $ = (id) => document.getElementById(id);
+let state = null;
+let selected = null;
+let renderedSig = null;
+let expanded = new Set();     // message ids the reader opened in full
+const painted = new Map();    // container id -> markup last written to it
+
+/* ---------------------------------------------------------------- helpers */
+
+/* Replacing a region that did not change costs the reader something real: the
+   focused tile or thread button is destroyed under them every two seconds, and
+   #tiles is aria-live, so a screen reader re-reads all seven tiles forever.
+   Build the nodes, compare the markup, swap only on a genuine difference. */
+function paint(id, nodes) {
+  const probe = document.createElement("div");
+  probe.append(...nodes.map((node) => node.cloneNode(true)));
+  if (painted.get(id) === probe.innerHTML) return;
+  painted.set(id, probe.innerHTML);
+  $(id).replaceChildren(...nodes);
+}
+
+function h(tag, props, ...kids) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props || {})) {
+    if (value === null || value === undefined || value === false) continue;
+    if (key === "class") node.className = value;
+    else if (key === "text") node.textContent = value;
+    else if (key === "style") node.setAttribute("style", value);
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else node.setAttribute(key, value === true ? "" : value);
+  }
+  for (const kid of kids.flat()) {
+    if (kid !== null && kid !== undefined && kid !== false) node.append(kid);
+  }
+  return node;
+}
+
+function ago(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.round(s / 60) + "m";
+  if (s < 86400) return Math.round(s / 3600) + "h";
+  return Math.round(s / 86400) + "d";
+}
+
+/** Epoch seconds, or null — a malformed ts must not leak NaN into the
+ *  comparisons that drive run grouping, sorting and the relative-time labels. */
+function stamp(ts) {
+  const parsed = ts ? Date.parse(ts) : NaN;
+  return Number.isNaN(parsed) ? null : parsed / 1000;
+}
+const ageOf = (ts) => (stamp(ts) === null ? null : Date.now() / 1000 - stamp(ts));
+
+function clockOf(ts) {
+  const at = stamp(ts);
+  if (at === null) return "";
+  return new Date(at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function dayLabel(ts) {
+  const at = stamp(ts);
+  if (at === null) return "unknown date";
+  const date = new Date(at * 1000);
+  const today = new Date();
+  const midnight = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((midnight(today) - midnight(date)) / 86400000);
+  if (days === 0) return "Today";
+  if (days === 1) return "Yesterday";
+  return date.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+}
+
+function monogram(name) {
+  const parts = name.split(/[-_]/).filter(Boolean);
+  return (parts.length > 1 ? parts[0][0] + parts[1][0] : name.slice(0, 2)) || "?";
+}
+
+/** One stable accent per peer, assigned by sorted name so it never shuffles. */
+function accents(snapshot) {
+  const names = new Set(snapshot.peers.map((p) => p.name));
+  for (const thread of snapshot.threads) { names.add(thread.a); names.add(thread.b); }
+  const map = new Map();
+  [...names].sort().forEach((name, i) => map.set(name, PALETTE[i % PALETTE.length]));
+  return map;
+}
+let accent = new Map();
+const peerVar = (name) => "--peer: var(" + (accent.get(name) || "--muted") + ")";
+
+function avatar(name, small) {
+  return h("span", {
+    class: "avatar" + (small ? " sm" : ""),
+    style: peerVar(name),
+    "aria-hidden": "true",
+    text: monogram(name),
+  });
+}
+
+/* ---------------------------------------------------------------- health */
+
+const TIPS = {
+  jq: "A small helper program that bridger needs in order to read and write messages. If it is missing, nothing works and nothing complains \u2014 messages just quietly go nowhere.",
+  plugin: "Whether bridger is switched on for your Claude Code sessions. If it is off, no session can send or receive anything.",
+  watchers: "Sessions that are awake and checking for new messages right now. A session that is not checking cannot be reached until it wakes up.",
+  queued: "Messages that were sent but nobody has read yet. Nothing is lost \u2014 they are picked up the next time that session does something.",
+  deaf: "Sessions that have messages waiting but are not checking for them, so they have not heard you yet. A session that is simply closed with nothing waiting does not count.",
+  flow: "How many messages moved in the last hour and the last day, and when the most recent one arrived. Quiet just means nobody is talking \u2014 it does not mean something is broken.",
+  "round trips": "How many questions got an answer back, and how long an answer usually takes. Stalled means a question has gone unanswered for more than 10 minutes.",
+};
+
+function tile(key, value, sub, tone) {
+  const tip = TIPS[key];
+  return h("div", { class: "tile", "data-tone": tone },
+    h("span", { class: "k", text: key }),
+    h("span", { class: "v", text: value }),
+    h("span", { class: "sub", text: sub || "" }),
+    // Focusable so the explanation is reachable without a pointer; the label
+    // carries the same text the tooltip shows.
+    h("span", { class: "info", tabindex: "0", role: "note",
+                "aria-label": key + ": " + tip, text: "i" }),
+    h("span", { class: "tip", "aria-hidden": "true", text: tip }));
+}
+
+function renderHealth(snapshot) {
+  const m = snapshot.metrics;
+  const w = snapshot.wiring;
+  const rt = m.round_trips;
+  $("ver").textContent = w.plugin_version ? "v" + w.plugin_version : "";
+
+  const pluginTone = w.plugin_enabled === null ? "warn" : w.plugin_enabled ? "ok" : "bad";
+  const pluginText = w.plugin_enabled === null ? "unknown" : w.plugin_enabled ? "enabled" : "disabled";
+  const staleAsks = rt.stale.length;
+
+  const tiles = [
+    tile("jq", w.jq ? "found" : "missing",
+      w.jq ? "messages can flow" : "nothing can be sent or received",
+      w.jq ? "ok" : "bad"),
+    tile("plugin", pluginText, w.plugin_key || "not switched on anywhere", pluginTone),
+    tile("watchers", m.listening + "/" + m.peers, "listening now",
+      m.peers === 0 ? null : m.listening === 0 ? "bad" : m.listening < m.peers ? "warn" : "ok"),
+    tile("queued", String(m.queued), "undelivered messages", m.queued > 0 ? "warn" : "ok"),
+    tile("deaf", String(m.deaf.length),
+      m.deaf.length
+        ? m.deaf.join(", ") + " cannot hear"
+        : (m.nudges ? m.nudges + " past stop-block" : "everyone hears their mail"),
+      m.deaf.length > 0 ? "bad" : m.nudges > 0 ? "warn" : "ok"),
+    tile("flow", m.last_hour + " / " + m.last_day, "last hour / day · " + ago(m.newest_age) + " ago",
+      m.messages === 0 ? "warn" : m.last_day === 0 ? "warn" : "ok"),
+    tile("round trips", rt.answered + "/" + rt.asks,
+      (rt.median_latency === null ? "no answers yet" : "median " + ago(rt.median_latency)) +
+        (staleAsks ? " · " + staleAsks + " stalled" : ""),
+      staleAsks > 0 ? "bad" : rt.asks === 0 ? null : "ok"),
+  ];
+  paint("tiles", tiles);
+
+  paint("warnings", snapshot.warnings.length
+    ? [h("p", { class: "warnings", text: snapshot.warnings.join(" · ") })]
+    : []);
+}
+
+/* --------------------------------------------------------------- sidebar */
+
+function renderPeers(snapshot) {
+  if (!snapshot.peers.length) {
+    paint("peers", [h("li", { class: "peer" },
+      h("span", { class: "sub", text: "no peers registered yet" }))]);
+    return;
+  }
+  paint("peers", snapshot.peers.map((peer) =>
+    h("li", { class: "peer" },
+      avatar(peer.name),
+      h("span", { class: "meta" },
+        h("span", { class: "top" },
+          h("span", { class: "name", style: peerVar(peer.name), text: peer.name }),
+          h("span", { class: "status" },
+            h("span", { class: "dot", "data-status": peer.status }),
+            peer.status,
+            peer.status === "listening" ? "" : " · seen " + ago(peer.last_seen_age))),
+        h("span", {
+          class: "sub",
+          title: peer.cwd || "",
+          text: [peer.branch && "@" + peer.branch, peer.summary || peer.cwd]
+            .filter(Boolean).join(" — "),
+        })))));
+}
+
+function renderThreads(snapshot) {
+  if (!snapshot.threads.length) {
+    paint("threads", [h("li", { class: "peer" },
+      h("span", { class: "sub", text: "no conversations yet" }))]);
+    return;
+  }
+  paint("threads", snapshot.threads.map((thread) => {
+    const last = thread.messages[thread.messages.length - 1];
+    return h("li", {},
+      h("button", {
+        class: "thread",
+        "aria-current": thread.id === selected ? "true" : "false",
+        onclick: () => select(thread.id),
+      },
+        h("span", { class: "stack" }, avatar(thread.a, true), avatar(thread.b, true)),
+        h("span", { class: "meta" },
+          h("span", { class: "top" },
+            h("span", { class: "title", text: thread.a + " ⇄ " + thread.b }),
+            h("span", { class: "when", text: last ? ago(ageOf(last.ts)) : "" })),
+          h("span", {
+            class: "preview",
+            text: last ? last.from + ": " + last.body.replace(/\s+/g, " ") : "no messages",
+          })),
+        thread.queued > 0 ? h("span", { class: "pill", text: String(thread.queued) }) : null));
+  }));
+}
+
+/* ------------------------------------------------------------ conversation */
+
+/** Split messages into runs the way a chat client does: same sender, close in
+ *  time, same day, same side of the queued divider. The first of a run carries
+ *  the sender label, the last carries the avatar and the tail corner. */
+function runs(messages) {
+  const rows = messages.map((message) => ({ message, day: dayLabel(message.ts) }));
+  const breaks = rows.map((row, i) => {
+    const previous = rows[i - 1];
+    if (!previous) return true;
+    const at = stamp(row.message.ts);
+    const before = stamp(previous.message.ts);
+    return previous.message.from !== row.message.from
+      || previous.day !== row.day
+      // Without both timestamps there is no way to judge closeness; start a new
+      // run rather than silently gluing unrelated messages together.
+      || at === null || before === null || at - before >= GROUP_WINDOW_S
+      || (!row.message.delivered && previous.message.delivered);
+  });
+  rows.forEach((row, i) => {
+    row.startsRun = breaks[i];
+    row.endsRun = i === rows.length - 1 || breaks[i + 1];
+  });
+  return rows;
+}
+
+function chip(type) {
+  return h("span", {
+    class: "chip",
+    style: "--chip: var(" + (CHIP_ROLES[type] || "--muted") + ")",
+    text: type,
+  });
+}
+
+function bubbleBody(message, id) {
+  const long = message.body.length > CLAMP_CHARS;
+  const open = expanded.has(id);
+  const body = h("div", {
+    class: "body" + (long && !open ? " clamped" : ""),
+    text: message.body,
+  });
+  if (!long) return [body];
+  return [body, h("button", {
+    class: "more",
+    text: open ? "Show less" : "Show more",
+    onclick: () => {
+      if (open) expanded.delete(id); else expanded.add(id);
+      renderedSig = null;
+      renderThread();
+    },
+  })];
+}
+
+function messageNode(row, thread) {
+  const message = row.message;
+  const id = thread.id + "#" + message.seq;
+  const right = message.from === thread.b;
+
+  const meta = h("div", { class: "msgmeta" },
+    chip(message.type),
+    h("span", { text: "#" + message.seq }),
+    h("span", { title: message.ts || "", text: clockOf(message.ts) }),
+    message.ref !== undefined
+      ? h("a", { href: "#msg-" + thread.id + "-" + message.ref, text: "re #" + message.ref,
+                 onclick: (event) => { event.preventDefault(); jumpTo(thread.id, message.ref); } })
+      : null,
+    message.delivered
+      ? h("span", { class: "tick", title: "consumed by " + message.to, text: "✓ read" })
+      : h("span", { class: "queuedtag", title: message.to + " has not polled this yet",
+                    text: "⏳ queued" }));
+
+  return h("li", {
+    class: "msg" + (right ? " right" : "") +
+      (row.startsRun ? " run-start" : "") + (row.endsRun ? " run-end" : ""),
+    id: "msg-" + thread.id + "-" + message.seq,
+    style: peerVar(message.from),
+  },
+    avatar(message.from),
+    row.startsRun ? h("span", { class: "sender" },
+      message.from, h("span", { style: "color: var(--muted)", text: "→ " + message.to })) : null,
+    h("div", { class: "bubble", "data-delivered": String(!!message.delivered) },
+      ...bubbleBody(message, id), meta));
+}
+
+function jumpTo(threadId, seq) {
+  const target = $("msg-" + threadId + "-" + seq);
+  if (!target) return;
+  target.scrollIntoView({ block: "center", behavior: "smooth" });
+  const bubble = target.querySelector(".bubble");
+  bubble.classList.remove("flash");
+  void bubble.offsetWidth;
+  bubble.classList.add("flash");
+}
+
+function emptyPane(title, detail) {
+  return h("div", { class: "empty" },
+    h("strong", { text: title }),
+    h("p", {}, detail));
+}
+
+/** Fingerprint of everything that changes the message list — peer status is
+ *  deliberately absent, since the header that shows it renders unconditionally.
+ *  Rebuilding the list every poll would drop scroll position and any selection
+ *  the reader has made, twice a second. */
+function threadSig(thread) {
+  return thread === null ? "none" : [
+    thread.id, thread.messages.length,
+    thread.cursors[thread.a], thread.cursors[thread.b],
+    [...expanded].join(","),
+  ].join("|");
+}
+
+function renderThread() {
+  const thread = state.threads.find((t) => t.id === selected) || null;
+  // The header carries live peer status, so it is rebuilt every poll — only the
+  // message list is gated, and only because rebuilding it drops scroll.
+  renderPaneHead(thread);
+  const sig = threadSig(thread);
+  if (sig === renderedSig) return;
+  renderedSig = sig;
+  renderLog(thread);
+}
+
+function renderPaneHead(thread) {
+  const head = $("head");
+  if (thread === null) {
+    head.hidden = true;
+    head.replaceChildren();
+    return;
+  }
+
+  const byName = Object.fromEntries(state.peers.map((peer) => [peer.name, peer]));
+  const side = (name) => h("span", {},
+    h("span", { class: "dot", "data-status": (byName[name] || {}).status || "queued" }),
+    name + " " + ((byName[name] || {}).status || "unregistered") +
+      (byName[name] && byName[name].branch ? " @" + byName[name].branch : "") +
+      " · " + thread.undelivered[name] + " unread");
+
+  head.hidden = false;
+  head.replaceChildren(
+    h("button", { class: "back", "aria-label": "back to conversations", text: "←",
+                  onclick: () => $("app").dataset.view = "list" }),
+    h("span", { class: "stack" }, avatar(thread.a, true), avatar(thread.b, true)),
+    h("span", { class: "who" },
+      h("span", { class: "title", text: thread.a + " ⇄ " + thread.b }),
+      h("span", { class: "sub" },
+        side(thread.a), side(thread.b),
+        h("span", { text: thread.messages.length + " messages" }))));
+}
+
+function renderLog(thread) {
+  const log = $("log");
+  if (thread === null) {
+    log.replaceChildren(state.threads.length
+      ? emptyPane("Pick a conversation", "Threads are listed on the left, newest first.")
+      : emptyPane("Nothing to show yet", [
+          "No thread directories under ",
+          h("code", { text: state.wiring.root }),
+          ". Register two peers and send a message to create one.",
+        ]));
+    return;
+  }
+
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  const items = [];
+  let previousDay = null;
+  let queuedDrawn = false;
+  for (const row of runs(thread.messages)) {
+    if (row.day !== previousDay) {
+      items.push(h("li", { class: "daysep" }, h("span", { text: row.day })));
+      previousDay = row.day;
+    }
+    if (!row.message.delivered && !queuedDrawn) {
+      items.push(h("li", { class: "queuedsep", text: thread.queued + " queued" }));
+      queuedDrawn = true;
+    }
+    items.push(messageNode(row, thread));
+  }
+
+  log.replaceChildren(h("ol", { class: "log-inner" }, items));
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+
+function select(id) {
+  selected = id;
+  renderedSig = null;
+  $("app").dataset.view = "thread";
+  renderThreads(state);
+  renderThread();
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+/* ------------------------------------------------------------------ poll */
+
+function apply(snapshot) {
+  state = snapshot;
+  accent = accents(snapshot);
+  if (selected !== null && !snapshot.threads.some((t) => t.id === selected)) selected = null;
+  renderHealth(snapshot);
+  renderPeers(snapshot);
+  renderThreads(snapshot);
+  renderThread();
+}
+
+async function poll() {
+  try {
+    const response = await fetch("/api/state", { cache: "no-store" });
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    apply(await response.json());
+    $("conn").dataset.state = "ok";
+    $("conn").textContent = "live";
+  } catch (err) {
+    // The server is gone or wedged; say so rather than showing stale data as live.
+    $("conn").dataset.state = "down";
+    $("conn").textContent = "reconnecting — " + err.message;
+  }
+}
+
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>

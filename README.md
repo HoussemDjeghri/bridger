@@ -130,6 +130,26 @@ Or skip the commands — tell your agent *"update our app to the new my-library 
 5. **Stored forever** — every message is saved, immutable, append-only.
 </details>
 
+## See every conversation at once
+
+```
+/bridger:monitor          # or: bridger monitor
+```
+
+<img src="assets/monitor.png" width="800">
+
+The CLI answers one question per invocation. The monitor answers the one you actually have — *is any of this working?* — in a browser on `127.0.0.1:8787`. Conversations on the left, the selected thread on the right, and a health bar across the top for the failures bridger cannot otherwise show you.
+
+**It makes silent failure visible.** Two things go wrong quietly. A session can be registered but have no watcher running, so it is addressable and still cannot hear you — the sender gets one stderr warning it may never read. And every hook opens with `command -v jq || exit 0`, so a missing `jq` turns the entire plugin into a no-op with no error anywhere. Both are a glance on the health bar: `DEAF`, `QUEUED`, `WATCHERS`, `JQ`, plus `ROUND TRIPS` for asks nobody ever answered.
+
+<img src="assets/monitor-queued.png" width="800">
+
+A queued message is drawn the way a chat app draws unread — dashed, greyed, under a `2 QUEUED` divider — so you can see exactly where the recipient's cursor stopped. Nothing is lost; it lands when that session next does anything.
+
+**Read-only by construction.** It parses the state files directly and never calls back into `bridger`, because a consuming `poll` would advance a cursor and eat somebody's unread messages. It never writes to `$BRIDGER_ROOT`. It binds loopback only — the page carries full message bodies, so it is not reachable off your machine, and it refuses any request whose `Host` is not one you could have typed.
+
+Needs `python3` (already on macOS and most Linux). No npm, no build step, no dependencies. Polls every 2 s; `--port N` moves it, `--root PATH` points it at another bus.
+
 ## Architecture
 
 <img src="assets/filesystem-architecture.png" width="800">
@@ -284,8 +304,11 @@ Message data under `~/.claude/bridger/` is yours; delete it separately if you wa
 | `/bridger:send <peer> <message>` | Fire-and-forget message |
 | `/bridger:status` | Identity, known peers, unread counts |
 | `/bridger:log <peer>` | Full conversation history with a peer |
+| `/bridger:monitor` | Read-only web view of every thread, plus bus health |
 
-The underlying CLI (`bin/bridger`) works standalone too — `bridger help` lists `peers`, `summary`, `register`, `join`, `leave`, `whoami`, `send`, `poll`, `wait`, `ask`, `log`, `mirror`, `status`. Scripts and CI can send messages to your sessions with it.
+The underlying CLI (`bin/bridger`) works standalone too — `bridger help` lists `peers`, `summary`, `register`, `join`, `leave`, `whoami`, `send`, `poll`, `wait`, `ask`, `log`, `mirror`, `status`, `monitor`. Scripts and CI can send messages to your sessions with it.
+
+`bridger monitor` serves the read-only browser view described in [See every conversation at once](#see-every-conversation-at-once) — `--port N` to move it, `--root PATH` to watch a different bus.
 
 `bridger mirror <peer>` renders selected message types (default `stop,ruling`) as deterministic markdown you can commit — regenerable from any checkout.
 

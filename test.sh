@@ -678,4 +678,27 @@ pass "watcher records how it died"
   rm -rf "$BRIDGER_ROOT" "$st"
 )
 
+# --- monitor: the web view reads what the CLI writes -------------------------
+# The reader reimplements cursor and heartbeat semantics in Python, so it has
+# its own self-check; this also points it at the root this suite just built, to
+# catch the two sides drifting apart on the stored shape.
+if command -v python3 >/dev/null 2>&1; then
+  python3 "$here/monitor/server.py" --selftest >/dev/null || fail "monitor self-check"
+  python3 - "$here/monitor" "$BRIDGER_ROOT" <<'PY' || fail "monitor cannot read a real BRIDGER_ROOT"
+import sys
+sys.path.insert(0, sys.argv[1])
+from server import snapshot
+
+state = snapshot(sys.argv[2])
+names = {peer["name"] for peer in state["peers"]}
+assert {"liba", "app"} <= names, names
+assert state["metrics"]["messages"] > 0, state["metrics"]
+assert state["threads"], "no threads parsed"
+assert not state["warnings"], state["warnings"]
+PY
+  pass "monitor reads a real BRIDGER_ROOT"
+else
+  pass "monitor (skipped: no python3)"
+fi
+
 echo "PASS: all bridger self-checks green"
