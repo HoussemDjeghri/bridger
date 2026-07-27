@@ -4,6 +4,11 @@ All notable changes to bridger are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and bridger uses
 [semantic versioning](https://semver.org/).
 
+## [0.12.0] — 2026-07-27
+
+- feat(monitor): see every conversation and the bus health in a browser
+- feat(watcher): make a deaf session visible
+
 ## [0.11.0] — 2026-07-25
 
 A send succeeds whether or not anything is reading at the other end, and it reported only the sequence number. From the sender's side, "hasn't replied yet" and "cannot hear me" looked identical — so a session could send five messages to a peer that never armed a watch and get no hint it was talking to itself.
@@ -117,6 +122,7 @@ Also updated: the bridger skill, `/bridger:peers`, the `SessionStart` guidance, 
   fresh heartbeat, a second session is refused that name; once the holder goes
   away, the name can be taken over — how a restarted session reclaims its role.
 
+[0.12.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.12.0
 [0.11.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.11.0
 [0.10.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.10.0
 [0.9.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.9.0
