@@ -161,6 +161,17 @@ grep -q "plain \[queued\]" <<<"$(cd "$disc/plain" && "$bridger" peers --dir)" ||
 : > "$BRIDGER_ROOT/peers/plain.beat"
 touch -t 202001010000 "$BRIDGER_ROOT/peers/plain.beat"
 grep -q "plain \[queued\]" <<<"$(cd "$disc/plain" && "$bridger" peers --dir)" || fail "stale heartbeat must read as queued"
+
+# SIGKILL leaves a beat file that is still fresh for up to BEAT_STALE_SECS. The
+# recorded pid is what makes that death visible now rather than 15s from now.
+( : ) & gone=$!; wait "$gone" 2>/dev/null || true   # a pid that is certainly dead
+echo "$gone" > "$BRIDGER_ROOT/peers/plain.beat"
+grep -q "plain \[queued\]" <<<"$(cd "$disc/plain" && "$bridger" peers --dir)" \
+  || fail "a fresh beat whose pid is dead must read as queued"
+# An empty beat is a pre-0.12 watcher with no pid recorded: fall back to mtime.
+: > "$BRIDGER_ROOT/peers/plain.beat"
+grep -q "plain \[listening\]" <<<"$(cd "$disc/plain" && "$bridger" peers --dir)" \
+  || fail "a pid-less beat must still read as listening while fresh"
 (cd "$disc/plain" && "$bridger" offline)
 [ ! -e "$BRIDGER_ROOT/peers/plain.beat" ] || fail "offline must clear the heartbeat"
 pass "heartbeat: listening while watched, queued when stopped or stale"
@@ -424,6 +435,15 @@ kill "$dw" 2>/dev/null || true
 wait "$dw" 2>/dev/null || true
 pass "send warns the sender when the target cannot hear it"
 
+# --- a watcher that stops says so in the log ---------------------------------
+# The watcher never exits on its own, so a death is always worth a line: one
+# died twice mid-session with exit 144 and left nothing to read.
+grep -q "deaf	signal=TERM" "$BRIDGER_ROOT/watcher.log" \
+  || fail "a signalled watcher must record the signal (got: $(cat "$BRIDGER_ROOT/watcher.log" 2>/dev/null))"
+grep -q "deaf	exit=" "$BRIDGER_ROOT/watcher.log" \
+  || fail "a watcher exit must record its status"
+pass "watcher records how it died"
+
 # --- statusline badge + drop-in wiring ---------------------------------------
 # Fully isolated: its own BRIDGER_ROOT (badge state) and CLAUDE_CONFIG_DIR
 # (settings.json + statusline.d), so it never touches the real ~/.claude.
@@ -459,8 +479,33 @@ pass "send warns the sender when the target cannot hear it"
   case "$out" in *$'\007'*) fail "badge leaked a BEL control char from a crafted name" ;; esac
   # Strip the badge's own colour codes; what remains must be only the safe charset.
   clean=$(printf '%s' "$out" | sed "s/$(printf '\033')\[[0-9;]*m//g")
-  [ "$clean" = "[⇄ BRIDGER:bad31mXY]" ] || fail "badge must strip to a safe charset (got: $(printf %q "$clean"))"
+  [ "$clean" = "[⇄ BRIDGER:bad31mXY ⚠ queued]" ] || fail "badge must strip to a safe charset (got: $(printf %q "$clean"))"
   pass "badge sanitizes crafted names (no ANSI/control-char injection)"
+
+  # Registered-but-deaf must be VISIBLE. The badge reads the same heartbeat
+  # `peers` does, so it flips on watcher liveness, not on registration: a
+  # watcher that was never armed, and one that died an hour ago leaving its
+  # beat file behind, must both render "queued".
+  (cd "$sw/proj" && CLAUDE_CODE_SESSION_ID=beat-sess "$bridger" register scribe >/dev/null)
+  out=$(render_badge beat-sess)
+  case "$out" in *"BRIDGER:scribe"*queued*) ;; *) fail "badge must read queued when no watcher was ever armed (got: $out)" ;; esac
+  : > "$BRIDGER_ROOT/peers/scribe.beat"   # what the watcher rewrites every cycle
+  out=$(render_badge beat-sess)
+  case "$out" in
+    *queued*) fail "badge must read listening while the heartbeat is fresh (got: $out)" ;;
+    *"BRIDGER:scribe"*) ;;
+    *) fail "badge must still show the name while listening (got: $out)" ;;
+  esac
+  touch -t 202001010000 "$BRIDGER_ROOT/peers/scribe.beat"   # watcher died, file left behind
+  out=$(render_badge beat-sess)
+  case "$out" in *queued*) ;; *) fail "a stale heartbeat (dead watcher) must render queued, not listening (got: $out)" ;; esac
+  # SIGKILL: the beat stays fresh for up to 15s, but its pid is already gone.
+  ( : ) & gone=$!; wait "$gone" 2>/dev/null || true
+  echo "$gone" > "$BRIDGER_ROOT/peers/scribe.beat"
+  out=$(render_badge beat-sess)
+  case "$out" in *queued*) ;; *) fail "a fresh beat from a dead pid must render queued (got: $out)" ;; esac
+  (cd "$sw/proj" && CLAUDE_CODE_SESSION_ID=beat-sess "$bridger" leave >/dev/null)
+  pass "badge renders listening vs queued from the watcher heartbeat"
 
   # Fresh wiring: no settings.json → installs dispatcher + fragment, points at it.
   "$bridger" statusline >/dev/null

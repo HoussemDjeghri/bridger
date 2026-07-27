@@ -2,8 +2,13 @@
 description: Wire the always-visible bridger peer-name statusline badge
 ---
 
-Wire the bridger statusline badge (`[⇄ BRIDGER:<name>]`, shows the name this
-session is registered as; nothing when unregistered).
+Wire the bridger statusline badge — the name this session is registered as, plus
+whether it can actually hear:
+
+- `[⇄ BRIDGER:<name>]` — registered, watcher live.
+- `[⇄ BRIDGER:<name> ⚠ queued]` — registered and deaf: messages land on disk and
+  nothing announces them. Arm `wait --follow` (re-run `/bridger:register`).
+- nothing at all — this session is not registered.
 
 Usually nothing to do: when a drop-in dispatcher already runs the statusline,
 `register` wires the badge itself (it only adds a fragment, so the badge lights

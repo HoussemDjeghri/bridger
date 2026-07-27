@@ -3,7 +3,8 @@
 #
 # Layout under $BRIDGER_ROOT (default ~/.claude/bridger):
 #   peers/<name>.json        peer registration: {name, cwd, repo, branch, ...}
-#   peers/<name>.beat        touched by the watcher; freshness = "listening"
+#   peers/<name>.beat        rewritten by the watcher each cycle, holds its pid;
+#                            fresh mtime + live pid = "listening"
 #   threads/<a>--<b>/        one directory per peer pair, names sorted
 #     00001.json ...         immutable messages, zero-padded sequence number
 #     cursor-<name>          highest seq <name> has consumed
@@ -97,21 +98,47 @@ optout_remove() { # dir
   mv "$f.tmp" "$f"
 }
 
-# A peer is "listening" while its watcher keeps the heartbeat fresh. Anything
-# staler than this is reported as "queued": messages still land, they are just
-# read when that session comes back.
+# A peer is "listening" while its watcher keeps the heartbeat fresh AND its
+# process is alive. Anything else is reported as "queued": messages still land,
+# they are just read when that session comes back.
 BEAT_STALE_SECS=15
 
 file_age_secs() { # path -> seconds since mtime, or a large number if absent
   local f="$1" mtime
   [ -e "$f" ] || { echo 999999; return; }
-  # BSD (macOS) and GNU stat disagree on flags; try both.
-  mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)
+  # BSD (macOS) and GNU stat disagree on flags; try both. GNU first: BSD stat
+  # rejects -c with nothing on stdout, while GNU stat reads `-f %m` as
+  # "filesystem status of a file named %m" and prints a block before failing.
+  mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
   echo $(( $(date +%s) - mtime ))
 }
 
+# The watcher has no self-termination path, so every death is external — and a
+# dead watcher looks exactly like a quiet channel. Record how it ended (one
+# tab-separated line: when, who, what) so the next one is diagnosable instead of
+# mysterious. Diagnostic only: an auto-restart here would hide the same class of
+# fault the "queued" badge exists to expose.
+watcher_log() { # name event
+  printf '%s\t%s\t%s\n' "$(now_utc)" "$1" "$2" >> "$BRIDGER_ROOT/watcher.log" 2>/dev/null || true
+}
+
+# The beat file holds the watcher's pid, so a death is seen the moment it
+# happens instead of at the end of the staleness window — and `kill -0` is the
+# only signal that separates "watcher is gone" from "machine was too busy to
+# beat for 15s". An empty beat is a pre-0.12 watcher: mtime is all it left.
+watcher_alive() { # beat path -> 0 when the recorded pid still runs
+  local pid=""
+  [ -f "$1" ] && { read -r pid < "$1" || true; }
+  case "$pid" in
+    ''|*[!0-9]*) return 0 ;;
+    *) kill -0 "$pid" 2>/dev/null ;;
+  esac
+}
+
 peer_status() { # name -> listening | queued
-  if [ "$(file_age_secs "$(beat_file "$1")")" -lt "$BEAT_STALE_SECS" ]; then
+  local b
+  b=$(beat_file "$1")
+  if [ "$(file_age_secs "$b")" -lt "$BEAT_STALE_SECS" ] && watcher_alive "$b"; then
     echo listening
   else
     echo queued
@@ -645,10 +672,24 @@ cmd_wait() {
     # One terse line per incoming message, forever. Feed this to a watcher.
     # Each cycle also refreshes the heartbeat that marks this peer "listening".
     # Signals must actually exit — a bare cleanup trap would resume the loop.
-    trap 'rm -f "$(beat_file "$me")"' EXIT
-    trap 'exit 0' INT TERM
+    # Every exit is logged, signalled or not: an observed exit 144 (128+16,
+    # SIGURG on macOS) killed a watcher twice with no trace, and $? plus the
+    # command that was running says which of the two paths it took — a signal
+    # this shell caught, or `set -e` on a failing command inside the loop.
+    # A trap must not change WHETHER the watcher survives a signal, only leave a
+    # record: INT/TERM keep their clean stop, SIGURG stays ignored (its default
+    # — swallowing it here would be a silent behaviour change), and the fatal
+    # ones re-raise themselves so the exit status stays honest.
+    local sig
+    trap 'watcher_log "$me" "exit=$? cmd=$BASH_COMMAND"; rm -f "$(beat_file "$me")"' EXIT
+    trap 'watcher_log "$me" signal=INT; exit 0' INT
+    trap 'watcher_log "$me" signal=TERM; exit 0' TERM
+    trap 'watcher_log "$me" signal=URG' URG
+    for sig in HUP QUIT PIPE USR1 USR2; do
+      trap "watcher_log \"\$me\" signal=$sig; trap - $sig; kill -s $sig \$\$" "$sig"
+    done
     while :; do
-      : > "$(beat_file "$me")"
+      echo $$ > "$(beat_file "$me")"   # pid + mtime: who is listening, and since when
       out=$(cmd_poll)
       [ -n "$out" ] && echo "$out"
       sleep 0.5
@@ -940,7 +981,13 @@ EOF
 # effect of `register`. Failure is silent: a badge is cosmetic and must never
 # break a registration.
 statusline_autowire() {
-  if [ -f "$STATUSLINE_FRAGMENT" ] && [ -f "$STATUSLINE_BADGE" ]; then return 0; fi
+  if [ -f "$STATUSLINE_FRAGMENT" ] && [ -f "$STATUSLINE_BADGE" ]; then
+    # Refresh the stable copy when the plugin ships a newer badge — otherwise an
+    # existing install renders the version it was first wired with, forever.
+    cmp -s "$ROOT/hooks/statusline.sh" "$STATUSLINE_BADGE" \
+      || cp "$ROOT/hooks/statusline.sh" "$STATUSLINE_BADGE" 2>/dev/null || true
+    return 0
+  fi
   statusline_dispatcher_active || return 0
   install_badge_fragment 2>/dev/null || true
 }
