@@ -4,6 +4,22 @@ All notable changes to bridger are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and bridger uses
 [semantic versioning](https://semver.org/).
 
+## [0.13.0] — 2026-07-29
+
+A deleted worktree used to leave its peer behind forever: `leave` resolves the peer from `$PWD`, which is impossible once that directory is gone, so the name sat in every listing with no way to remove it.
+
+**`bridger reap`** lists those registrations; `--force` drops them, keeping their threads on disk exactly as `leave` does. Dry run by default, printing how much unread mail each still holds — an unmounted volume looks identical to a deleted one, so the call is the operator's.
+
+`peers` grows a third status, **`missing`**: a queued peer whose registered directory is provably absent and for which no watcher is running.
+
+Nothing routes on it, deliberately. A process keeps its working directory when that directory is unlinked, so a session in a removed worktree goes on resolving its name, polling and sending. `@all` still reaches a `missing` peer, `ask` still waits for it, `send` still stores for it.
+
+- fix(peers): one malformed record no longer aborts the listing — it was hiding every peer sorting after it, and silencing unread reports for every session through `deliver.sh`/`stop.sh`
+- fix(poll): an empty cursor no longer reads as "everything delivered", which advanced to the top and lost the thread's mail silently
+- fix(poll): one unparseable message no longer wedges a thread forever; only a parse error skips a message, while a transiently unreadable one refuses to advance the cursor rather than consume it
+- fix(identity): resolution keys off the filename that is the actual address, and no longer carries a failed record's predecessor into scope
+- fix(peers): concurrent writers of one record can no longer commit interleaved garbage
+
 ## [0.12.0] — 2026-07-27
 
 - feat(monitor): see every conversation and the bus health in a browser
@@ -122,6 +138,7 @@ Also updated: the bridger skill, `/bridger:peers`, the `SessionStart` guidance, 
   fresh heartbeat, a second session is refused that name; once the holder goes
   away, the name can be taken over — how a restarted session reclaims its role.
 
+[0.13.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.13.0
 [0.12.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.12.0
 [0.11.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.11.0
 [0.10.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.10.0
