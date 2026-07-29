@@ -21,6 +21,24 @@ unset CLAUDE_CODE_SESSION_ID BRIDGER_SESSION_ID 2>/dev/null || true
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "ok - $*"; }
 
+# Block until <name> actually reads [listening], or give up after ~15s.
+#
+# `wait --follow` is a separate process that has to start bash, resolve its
+# identity and write its first heartbeat before any of that is observable. A
+# fixed `sleep 3` races that startup, so every assertion built on it becomes a
+# coin flip on a loaded machine — CI, or a release (scripts/release.sh gates the
+# tag on this suite), or simply several copies of this suite running at once. A
+# gate that flakes is worse than no gate: it either blocks a good release or
+# teaches everyone to re-run until green. Poll the real precondition instead.
+await_listening() { # name
+  local name="$1" i
+  for i in $(seq 1 150); do
+    grep -q "^$name \[listening\]" <<<"$("$bridger" peers 2>/dev/null)" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 mkdir -p "$work/liba/sub" "$work/app"
 
 # --- register + whoami ------------------------------------------------------
@@ -32,6 +50,23 @@ mkdir -p "$work/liba/sub" "$work/app"
 [ "$(cd "$work/app" && "$bridger" whoami)" = "app" ] || fail "whoami second peer"
 if (cd /tmp && "$bridger" whoami >/dev/null 2>&1); then fail "whoami matches unregistered dir"; fi
 if "$bridger" register "bad--name" "$work" >/dev/null 2>&1; then fail "register accepts '--' in name"; fi
+
+# A name is interpolated straight into peer_file()/beat_file() paths, so the
+# charset check is the only thing keeping records inside BRIDGER_ROOT. It used
+# to be a `grep -Eq`, and grep is LINE-oriented: -q succeeds when ANY line
+# matches, so a name carrying an embedded newline passed on one of its lines and
+# the rest of it became path. `register $'../../../x\ny'` then wrote a peer
+# record into any directory the user can write to.
+esc="$work/escape"; mkdir -p "$esc"
+for evil in "../../../../../../../../../../../..$esc/pwned
+x" "x
+../../../../../../../../../../../..$esc/pwned"; do
+  if "$bridger" register "$evil" "$work/app" >/dev/null 2>&1; then
+    fail "register accepted a name containing a newline"
+  fi
+done
+[ -z "$(ls -A "$esc")" ] || fail "a crafted name wrote outside BRIDGER_ROOT: $(ls -A "$esc")"
+if "$bridger" register "up/down" "$work/app" >/dev/null 2>&1; then fail "register accepts '/' in a name"; fi
 pass "register + whoami"
 
 # --- send + poll ------------------------------------------------------------
@@ -151,7 +186,7 @@ pass "peers listing, summaries, and --dir scope"
 # hook calls. exec so the PID is the watcher itself and the trap can fire.
 (cd "$disc/plain"; exec "$bridger" wait --follow >/dev/null 2>&1) &
 watcher=$!
-sleep 3
+await_listening plain || fail "watcher never came up for peer plain"
 grep -q "plain \[listening\]" <<<"$(cd "$disc/plain" && "$bridger" peers --dir)" || fail "watcher must mark peer listening"
 kill "$watcher" 2>/dev/null || true
 wait "$watcher" 2>/dev/null || true
@@ -244,7 +279,7 @@ mkdir -p "$disc/role"
 # A live holder (a running watcher keeps the heartbeat fresh) refuses a 2nd claim.
 (cd "$disc/role"; exec env CLAUDE_CODE_SESSION_ID=sess-1 "$bridger" wait --follow >/dev/null 2>&1) &
 watcher=$!
-sleep 3
+await_listening worker || fail "watcher never came up for peer worker"
 if (cd "$disc/role" && CLAUDE_CODE_SESSION_ID=sess-2 "$bridger" register worker >/dev/null 2>&1); then
   kill "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true
   fail "a name held by a live session must be refused"
@@ -428,7 +463,7 @@ grep -q "1 message(s) from you are unread" <<<"$warned" || fail "the warning mus
 
 (cd "$work/deaf"; exec "$bridger" wait --follow >/dev/null 2>&1) &
 dw=$!
-sleep 3
+await_listening deaf || fail "watcher never came up for peer deaf"
 [ -z "$( (cd "$work/app" && "$bridger" send deaf chat "now?" >/dev/null) 2>&1 )" ] \
   || fail "send must not warn when the target is listening"
 kill "$dw" 2>/dev/null || true
@@ -537,7 +572,7 @@ pass "a watcherless session in a removed directory stays addressable and reachab
   BRIDGER_SESSION_ID=wtsess "$bridger" register wt "$lw/wt" >/dev/null
   (cd "$lw/wt"; exec env BRIDGER_SESSION_ID=wtsess "$bridger" wait --follow >"$lw/out" 2>&1) &
   watcher=$!
-  sleep 3
+  await_listening wt || fail "watcher never came up for peer wt"
   rm -rf "$lw/wt"          # `git worktree remove` with the session still open
 
   [ "$("$bridger" peers | grep -c '^wt \[listening\]')" = "1" ] \
@@ -546,7 +581,12 @@ pass "a watcherless session in a removed directory stays addressable and reachab
   grep -q "^wt " <<<"$out" || fail "@all must not skip a peer whose watcher is running"
   grep -q "nothing to reap" <<<"$("$bridger" reap)" \
     || fail "reap must never offer to delete a peer whose watcher is running (got: $("$bridger" reap))"
-  sleep 2
+  # Same reasoning as await_listening: poll for the delivery, don't guess how
+  # long the watcher's poll cycle takes on a machine under load.
+  for _ in $(seq 1 150); do
+    grep -q "still here" "$lw/out" && break
+    sleep 0.1
+  done
   grep -q "still here" "$lw/out" \
     || fail "the live watcher must actually receive the broadcast (got: $(cat "$lw/out"))"
 
@@ -940,16 +980,44 @@ pass "an untraversable parent leaves a peer registered and unreaped"
     | grep -q "and v2.1 too" || fail "PostToolUse must report a message that arrives later"
 
   # Registering is the moment the watcher is easiest to forget, so the
-  # instruction is injected next to that call's own result.
-  out=$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","session_id":"reader-sess","tool_input":{"command":"%s register scout"}}' \
-    "$up/reader" "$bridger" | bash "$hook")
+  # instruction is injected next to that call's own result. With nothing waiting,
+  # that is the whole message.
+  (cd "$up/reader" && BRIDGER_SESSION_ID=reader-sess "$bridger" poll >/dev/null 2>&1)
+  regcall='{"hook_event_name":"PostToolUse","cwd":"'"$up/reader"'","session_id":"reader-sess","tool_input":{"command":"'"$bridger"' register scout"}}'
+  out=$(printf '%s' "$regcall" | bash "$hook")
   jq -r '.hookSpecificOutput.additionalContext' <<<"$out" | grep -q "NOT yet listening" \
     || fail "a register call must draw the arm-the-watcher instruction (got: $out)"
+
+  # But mail outranks the nag: a registration in a session that has unread
+  # messages must still DELIVER them, and the arm instruction rides along in the
+  # delivery text. The nag used to be emitted first and exit, dropping the mail.
+  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send reader ask "URGENT which api" >/dev/null 2>/dev/null)
+  rm -f "$BRIDGER_ROOT/reported-reader-sess"
+  out=$(printf '%s' "$regcall" | bash "$hook")
+  ctx=$(jq -r '.hookSpecificOutput.additionalContext' <<<"$out")
+  grep -q "URGENT which api" <<<"$ctx" || fail "a register call must not swallow unread mail (got: $out)"
+  grep -q "Arm the watcher NOW" <<<"$ctx" || fail "delivery must still carry the arm instruction (got: $out)"
+
+  # ...but that branch matched the command text as a SUBSTRING and then exited,
+  # so any command merely MENTIONING the phrase — a grep, a doc edit, a test —
+  # both injected a false "this session is now registered" and skipped delivery
+  # of real unread mail on that tool call.
+  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send reader ask "URGENT which db" >/dev/null 2>/dev/null)
+  rm -f "$BRIDGER_ROOT/reported-reader-sess"
+  mention=$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","session_id":"reader-sess","tool_input":{"command":"grep -n \\"bridger register\\" README.md"}}' "$up/reader" | bash "$hook")
+  jq -r '.hookSpecificOutput.additionalContext' <<<"$mention" | grep -q "URGENT which db" \
+    || fail "a command that merely mentions 'bridger register' must not suppress delivery (got: $mention)"
+
+  # And the claim must never be made for a session that is not registered at all.
+  mkdir -p "$up/stranger"
+  stranger=$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","session_id":"stranger-sess","tool_input":{"command":"grep -n \\"bridger register\\" README.md"}}' "$up/stranger" | bash "$hook")
+  [ -z "$stranger" ] \
+    || fail "the hook claimed registration for an unregistered session (got: $stranger)"
 
   # A live watcher already delivers each message; a second copy is wasted context.
   (cd "$up/reader"; exec env BRIDGER_SESSION_ID=reader-sess "$bridger" wait --follow >/dev/null 2>&1) &
   w=$!
-  sleep 3
+  await_listening reader || fail "watcher never came up for peer reader"
   [ -z "$(printf '%s' "$ups" | bash "$hook")" ] || fail "hook must stay silent while a watcher is listening"
   [ -z "$(printf '%s' "$ptu" | bash "$hook")" ] || fail "PostToolUse must stay silent while a watcher is listening"
   kill "$w" 2>/dev/null || true
@@ -993,13 +1061,276 @@ pass "an untraversable parent leaves a peer registered and unreaped"
   rm -f "$BRIDGER_ROOT/armed-nudge-solo-sess"
   (cd "$st/solo"; exec env BRIDGER_SESSION_ID=solo-sess "$bridger" wait --follow >/dev/null 2>&1) &
   w=$!
-  sleep 3
+  await_listening solo || fail "watcher never came up for peer solo"
   [ -z "$(printf '%s' "$payload" | bash "$hook")" ] || fail "Stop must not block once a watcher is listening"
   kill "$w" 2>/dev/null || true
   wait "$w" 2>/dev/null || true
 
   pass "Stop hook blocks once until a registered session is actually listening"
   rm -rf "$BRIDGER_ROOT" "$st"
+)
+
+# --- log/mirror survive a corrupt message, exactly as poll does --------------
+# poll was hardened to skip an unparseable message and keep going; log and
+# mirror read the same files and must not be the readers that still stop dead.
+# mirror's output is documented as a committable record, so a truncated one is
+# worse than a loud failure: nothing in the FILE says it is short.
+# Own root — these fixtures are deliberately corrupt and must not leak into the
+# suite's shared state (the monitor block below asserts no warnings).
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  cr="$work/corrupt"; mkdir -p "$cr/a" "$cr/b"
+  "$bridger" register ca "$cr/a" >/dev/null
+  "$bridger" register cb "$cr/b" >/dev/null
+  for i in 1 2 3; do (cd "$cr/a" && "$bridger" send cb ruling "d$i" >/dev/null); done
+  td="$BRIDGER_ROOT/threads/ca--cb"
+
+  # A genuine parse error: jq exits 5 and used to abort the whole read.
+  printf 'NOT JSON{' > "$td/00002.json"
+  out=$(cd "$cr/a" && "$bridger" log cb 2>/dev/null || true)
+  grep -q 'd3' <<<"$out" || fail "log stops at an unparseable message, hiding every later one"
+  out=$(cd "$cr/a" && "$bridger" mirror cb --types all 2>/dev/null || true)
+  grep -q 'd3' <<<"$out" || fail "mirror truncates the record at an unparseable message"
+
+  # jq exits 0 with NO output for a zero-byte/NUL/whitespace file, so the fields
+  # come back empty and mirror used to print a section with every field blank —
+  # exit 0, nothing on stderr, a phantom entry in a committed record.
+  : > "$td/00002.json"
+  out=$(cd "$cr/a" && "$bridger" mirror cb --types all 2>/dev/null || true)
+  ! grep -qE '^## #[[:space:]]*$|^## #[[:space:]]+—' <<<"$out" \
+    || fail "mirror emits a phantom empty section for a zero-byte message"
+  grep -q 'd3' <<<"$out" || fail "mirror drops later messages after a zero-byte one"
+
+  # The other half of the trade, and the one a "just skip bad files" rewrite
+  # breaks: a message that is INTACT but momentarily unreadable (EACCES here; a
+  # revoked mount or EIO in the wild) must stop the read, not be skipped. These
+  # readers render history someone keeps — skipping burns a permanent hole into a
+  # file that still looks complete. Root bypasses file permissions, so skip there.
+  printf '{"seq":2,"from":"ca","to":"cb","type":"ruling","body":"d2","ts":"x"}' > "$td/00002.json"
+  if [ "$(id -u)" -ne 0 ]; then
+    chmod 000 "$td/00002.json"
+    out=$(cd "$cr/a" && "$bridger" log cb 2>/dev/null) && fail "log skips an unreadable message instead of refusing"
+    ! grep -q 'd3' <<<"$out" || fail "log rendered past an unreadable message"
+    chmod 644 "$td/00002.json"
+  fi
+
+  # A flag whose value is missing must be a usage error, not `$2: unbound variable`.
+  err=$(cd "$cr/a" && "$bridger" mirror cb --types 2>&1 || true)
+  ! grep -q 'unbound variable' <<<"$err" || fail "mirror --types with no value dies on set -u"
+  grep -q 'usage:' <<<"$err" || fail "mirror --types with no value must print usage"
+
+  pass "log/mirror survive corrupt messages and report missing flag values"
+  rm -rf "$BRIDGER_ROOT"
+)
+
+# --- the watcher must never advance the cursor past mail it could not read ---
+# unread_in_thread refuses to advance past a transiently unreadable message, and
+# test.sh proves that through the CLI. The watcher reaches it by a different
+# route: `out=$(cmd_poll)`. On bash 3.2 — what /usr/bin/env bash is on stock
+# macOS — errexit is NOT inherited into a command substitution, so cmd_poll did
+# not abort on the die and fell through to advance_cursor on the next line. The
+# cursor jumped past the unreadable message AND everything behind it, while the
+# peer went on advertising [listening]. Silent permanent loss on the only path
+# that reaches an idle session, with the whole suite green.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  ww="$work/watchloss"; mkdir -p "$ww/a" "$ww/b"
+  "$bridger" register wsend "$ww/a" >/dev/null
+  "$bridger" register wrecv "$ww/b" >/dev/null
+  for m in one SECRET-two three; do
+    (cd "$ww/a" && "$bridger" send wrecv chat "$m" >/dev/null 2>&1)
+  done
+  wtd="$BRIDGER_ROOT/threads/wrecv--wsend"
+  [ -d "$wtd" ] || wtd="$BRIDGER_ROOT/threads/wsend--wrecv"
+  chmod 000 "$wtd/00002.json"
+
+  (cd "$ww/b"; exec "$bridger" wait --follow >/dev/null 2>&1) &
+  wl=$!
+  sleep 2
+  kill "$wl" 2>/dev/null || true
+  wait "$wl" 2>/dev/null || true
+  chmod 644 "$wtd/00002.json"
+
+  cur=$(cat "$wtd/cursor-wrecv" 2>/dev/null || echo 0)
+  case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+  [ "$cur" -lt 2 ] \
+    || fail "the watcher advanced the cursor to $cur past an unreadable message — messages 2 and 3 are gone"
+
+  # And once the fault clears, everything must still be deliverable.
+  got=$(cd "$ww/b" && "$bridger" poll 2>/dev/null || true)
+  grep -q "SECRET-two" <<<"$got" || fail "message 2 unrecoverable after the fault cleared (got: $got)"
+  grep -q "three" <<<"$got" || fail "message 3 unrecoverable after the fault cleared (got: $got)"
+  pass "the watcher wedges rather than destroying mail it could not read"
+  rm -rf "$BRIDGER_ROOT"
+)
+fi
+
+# --- an empty BRIDGER_ROOT must refuse, never fall back to the real bus ------
+# ${VAR:-default} treats set-but-empty as unset, so `BRIDGER_ROOT="" bridger
+# register x` silently writes into ~/.claude/bridger — someone else's live bus.
+# Unset is fine (that IS the default); explicitly empty is a caller bug.
+#
+# HOME is sandboxed for this block: on the UNFIXED code these commands really do
+# create the fallback root, and a test that only fails after polluting the
+# developer's own bus is not a test anyone can afford to run.
+(
+  fake_home=$(mktemp -d)
+  out=$(HOME="$fake_home" BRIDGER_ROOT="" "$bridger" whoami 2>&1 || true)
+  grep -q 'BRIDGER_ROOT' <<<"$out" \
+    || fail "empty BRIDGER_ROOT silently falls back to \$HOME/.claude/bridger"
+  if HOME="$fake_home" BRIDGER_ROOT="" "$bridger" register nope "$work/app" >/dev/null 2>&1; then
+    fail "empty BRIDGER_ROOT still registers (into the fallback root)"
+  fi
+  [ ! -e "$fake_home/.claude/bridger" ] \
+    || fail "empty BRIDGER_ROOT created the fallback root it should have refused"
+  rm -rf "$fake_home"
+)
+pass "an empty BRIDGER_ROOT is refused, not silently defaulted"
+
+# --- the watcher must never advance a cursor past a read it could not do -----
+# unread_in_thread refuses to advance past a transiently unreadable message, and
+# the block above proves it through the CLI. The WATCHER reaches the same code by
+# a different route — `out=$(cmd_poll)` — and on bash 3.2 (what /usr/bin/env bash
+# is on stock macOS) errexit is NOT inherited into a command substitution. So the
+# failed read fell straight through to advance_cursor, skipping the unreadable
+# message AND every message behind it, while the watcher kept beating and the
+# peer kept reading [listening]: silent permanent loss on the only path that
+# reaches an idle session. Exercised through `wait --follow`, because that is the
+# caller the CLI test cannot reach.
+if [ "$(id -u)" != "0" ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  ww="$work/watchloss"; mkdir -p "$ww/a" "$ww/b"
+  "$bridger" register wa "$ww/a" >/dev/null
+  "$bridger" register wb "$ww/b" >/dev/null
+  for m in one SECRET-two three; do (cd "$ww/a" && "$bridger" send wb chat "$m" >/dev/null); done
+  wt="$BRIDGER_ROOT/threads/wa--wb"
+  chmod 000 "$wt/00002.json"
+  (cd "$ww/b"; exec "$bridger" wait --follow >"$ww/out" 2>"$ww/err") &
+  wpid=$!
+  for _ in $(seq 1 150); do [ -s "$ww/err" ] && break; sleep 0.1; done
+  cur=$(cat "$wt/cursor-wb" 2>/dev/null || echo 0)
+  case "$cur" in ''|0|1) ;; *) kill "$wpid" 2>/dev/null; fail "watcher advanced the cursor to $cur past an unreadable message" ;; esac
+  chmod 644 "$wt/00002.json"
+  for _ in $(seq 1 150); do grep -q "SECRET-two" "$ww/out" && break; sleep 0.1; done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  grep -q "SECRET-two" "$ww/out" || fail "watcher never delivered the message once it became readable (got: $(cat "$ww/out"))"
+  grep -q "three" "$ww/out" || fail "watcher lost the message BEHIND the unreadable one (got: $(cat "$ww/out"))"
+  pass "the watcher wedges on an unreadable message and loses nothing"
+  rm -rf "$BRIDGER_ROOT"
+)
+fi
+
+# --- a stray non-numeric file must not wedge a thread in both directions -----
+# The `[0-9]*.json` glob only anchors the first character, so a Finder duplicate
+# ("00001 2.json"), an iCloud conflict copy or an editor artifact reaches the
+# `$((10#…))` arithmetic and aborts it under set -e. max_seq is on the read AND
+# the write path, so one such file killed poll and send together — silently,
+# because the delivery hooks do `peers || exit 0`.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  sw="$work/strayfile"; mkdir -p "$sw/a" "$sw/b"
+  "$bridger" register sa "$sw/a" >/dev/null
+  "$bridger" register sb "$sw/b" >/dev/null
+  (cd "$sw/a" && "$bridger" send sb chat one >/dev/null)
+  st="$BRIDGER_ROOT/threads/sa--sb"
+  cp "$st/00001.json" "$st/00001 2.json"; cp "$st/00001.json" "$st/00006x.json"; cp "$st/00001.json" "$st/0009-2.json"
+  got=$(cd "$sw/b" && "$bridger" poll 2>/dev/null) || fail "a stray non-numeric file wedged poll"
+  grep -q "one" <<<"$got" || fail "poll lost the real message next to a stray file (got: $got)"
+  (cd "$sw/a" && "$bridger" send sb chat after >/dev/null 2>&1) || fail "a stray non-numeric file wedged send"
+  pass "a stray non-numeric filename does not wedge poll or send"
+  rm -rf "$BRIDGER_ROOT"
+)
+
+# --- send: a name is a PATH, so it must be validated like one ----------------
+# valid_name gates `register`, but `send` only ran require_peer, which just tests
+# that some <name>.json exists — which "../../elsewhere/package" satisfies. And
+# the comma list was iterated unquoted, so it word-split AND globbed.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  nw="$work/sendname"; mkdir -p "$nw/a" "$nw/b" "$nw/victim"
+  "$bridger" register na "$nw/a" >/dev/null
+  "$bridger" register nb "$nw/b" >/dev/null
+  echo '{}' > "$nw/victim/pwn.json"
+  (cd "$nw/a" && "$bridger" send "../../../../../../../..$nw/victim/pwn" chat escaped >/dev/null 2>&1) \
+    && fail "send accepted a traversal recipient"
+  [ -z "$(find "$nw/victim" -name '*--*' 2>/dev/null)" ] || fail "send wrote a thread outside BRIDGER_ROOT"
+  (cd "$nw/a" && "$bridger" send "./nb" chat dotslash >/dev/null 2>&1) \
+    && fail "send accepted './nb', creating a second never-read thread"
+  # Glob injection: ordinary files named like peers must not become recipients.
+  (cd "$nw/a" && touch nb decoy && "$bridger" send "nosuch,*" chat globby >/dev/null 2>&1) \
+    && fail "send with a glob in the recipient list reported success"
+  [ -z "$(cd "$nw/b" && "$bridger" poll --peek 2>/dev/null)" ] \
+    || fail "a globbed recipient received a message it was never addressed"
+  # Partial and total fan-out failure must be visible in the exit status.
+  (cd "$nw/a" && "$bridger" send nb,nosuch chat hi >/dev/null 2>&1) && fail "partial fan-out failure exited 0"
+  (cd "$nw/a" && "$bridger" send nope1,nope2 chat hi >/dev/null 2>&1) && fail "total fan-out failure exited 0"
+  (cd "$nw/a" && "$bridger" send nb chat fine >/dev/null 2>&1) || fail "a good send must still exit 0"
+  # A bad --ref must be rejected before anything is written, not discovered by jq
+  # after mktemp — which on the fan-out path committed a ZERO-BYTE message at a
+  # real seq and still reported success.
+  (cd "$nw/a" && "$bridger" send nb,nb chat body --ref abc >/dev/null 2>&1) && fail "a non-numeric --ref was accepted"
+  [ -z "$(find "$BRIDGER_ROOT/threads" -name '[0-9]*.json' -size 0 2>/dev/null)" ] \
+    || fail "a zero-byte message was committed at a real seq"
+  for f in --ref --from; do
+    (cd "$nw/a" && "$bridger" send nb chat hi "$f" 2>&1 | grep -q 'unbound variable') \
+      && fail "send $f with no value leaks a raw bash error"
+  done
+  pass "send validates recipient names, never globs them, and reports fan-out failure"
+  rm -rf "$BRIDGER_ROOT"
+)
+
+# --- ask: correlate on sender too, and never abandon a consumed batch --------
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  kw="$work/askfix"; mkdir -p "$kw/a" "$kw/b" "$kw/c"
+  "$bridger" register ka "$kw/a" >/dev/null
+  "$bridger" register kb "$kw/b" >/dev/null
+  "$bridger" register kc "$kw/c" >/dev/null
+  # cmd_poll --json consumes the WHOLE batch and moves every cursor before the
+  # match is examined, so returning at the match dropped every later line in that
+  # batch — never printed, not even to stderr. "Answer, then add a note" is the
+  # ordinary pattern; the note vanished every time.
+  (cd "$kw/a" && "$bridger" ask kb "q?" --timeout 20 >"$kw/out" 2>"$kw/err") &
+  apid=$!
+  for _ in $(seq 1 150); do [ -n "$(cd "$kw/b" && "$bridger" poll --peek 2>/dev/null)" ] && break; sleep 0.1; done
+  (cd "$kw/b" && "$bridger" send ka answer "the-answer" --ref 1 >/dev/null 2>&1)
+  (cd "$kw/b" && "$bridger" send ka chat "FOLLOWUP-NOTE" >/dev/null 2>&1)
+  wait "$apid" 2>/dev/null || true
+  grep -q "the-answer" "$kw/out" || fail "ask did not return the answer (got: $(cat "$kw/out"))"
+  { grep -q "FOLLOWUP-NOTE" "$kw/err" || [ -n "$(cd "$kw/a" && "$bridger" poll --peek 2>/dev/null | grep FOLLOWUP-NOTE)" ]; } \
+    || fail "ask destroyed the message that followed the answer in the same batch"
+  # Seqs are per-thread, so a ref collision across threads is routine: a THIRD
+  # peer's reply must not satisfy this ask.
+  (cd "$kw/a" && "$bridger" poll >/dev/null 2>&1) || true
+  (cd "$kw/a" && "$bridger" ask kb "real q" --timeout 4 >"$kw/out2" 2>/dev/null) &
+  apid=$!
+  for _ in $(seq 1 100); do [ -n "$(cd "$kw/b" && "$bridger" poll --peek 2>/dev/null)" ] && break; sleep 0.1; done
+  (cd "$kw/c" && "$bridger" send ka answer "I-AM-KC" --ref 1 >/dev/null 2>&1)
+  wait "$apid" 2>/dev/null || true
+  ! grep -q "I-AM-KC" "$kw/out2" || fail "ask accepted a third peer's reply as the answer"
+  (cd "$kw/a" && "$bridger" ask kb q --timeout 2>&1 | grep -q 'unbound variable') \
+    && fail "ask --timeout with no value leaks a raw bash error"
+  pass "ask matches on sender+ref and never abandons a consumed batch"
+  rm -rf "$BRIDGER_ROOT"
+)
+
+# --- poll must not consume a zero-byte message as if it were nothing ---------
+# jq exits 0 with no output on an empty file, which is indistinguishable from a
+# good message addressed to somebody else — so poll swallowed it and advanced.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  zw="$work/zerobyte"; mkdir -p "$zw/a" "$zw/b"
+  "$bridger" register za "$zw/a" >/dev/null
+  "$bridger" register zb "$zw/b" >/dev/null
+  (cd "$zw/a" && "$bridger" send zb chat first >/dev/null)
+  : > "$BRIDGER_ROOT/threads/za--zb/00001.json"
+  (cd "$zw/a" && "$bridger" send zb chat real >/dev/null 2>&1)
+  err=$( (cd "$zw/b" && "$bridger" poll >/dev/null) 2>&1 )
+  grep -q "is empty" <<<"$err" || fail "poll consumed a zero-byte message silently (stderr: $err)"
+  pass "poll reports a zero-byte message instead of swallowing it"
+  rm -rf "$BRIDGER_ROOT"
 )
 
 # --- monitor: the web view reads what the CLI writes -------------------------

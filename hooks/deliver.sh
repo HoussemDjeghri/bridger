@@ -58,12 +58,16 @@ emit() { # text
 
 ARM='Arm the watcher NOW, before anything else: run CLI `wait --follow` as a persistent background task (Monitor tool if available, otherwise a background Bash task). It is what delivers messages to this session while it sits idle — nothing else does. Each line it emits is one message "#<seq> <from> <type>: <body>".'
 
-# The registration just happened, so there is nothing to deliver yet — the one
-# useful thing to say is the step that is easiest to skip.
+# Did this call look like a registration? Only a hint, never a verdict: the
+# command is matched as a SUBSTRING, so a grep, a doc edit or a test that merely
+# mentions the phrase looks identical to the real thing. This used to emit-and-
+# exit right here, which meant such a command both asserted "this session is now
+# registered" — of a session that might not be registered at all — and skipped
+# the unread delivery below it. So only remember it, and let the checks that read
+# actual state decide.
+registered_now=0
 case "${cmd:-}" in
-  *"bridger register"*|*"bridger join"*)
-    emit "bridger: this session is now registered, but NOT yet listening. Registering does not start the watcher. $ARM"
-    ;;
+  *"bridger register"*|*"bridger join"*) registered_now=1 ;;
 esac
 
 me=$(cd "$cwd" && "$bridger" whoami 2>/dev/null) || exit 0
@@ -78,14 +82,24 @@ fi
 # Mid-task, the report is per arrival, not per tool call. The marker is the
 # high-water mark of what has already been reported; a thread file newer than
 # it means something landed since. One find, no jq, stops at the first hit.
+# A registration skips this gate: it is a rare, explicit event, and the thing it
+# needs to say ("you are registered but deaf") is not about mail arriving, so the
+# high-water mark must not suppress it. Ordinary tool calls — the hot path this
+# gate exists for — are unaffected.
 marker="$BRIDGER_ROOT/reported-${sid:-nosession}"
-if [ "${event:-}" = "PostToolUse" ] && [ -f "$marker" ]; then
+if [ "${event:-}" = "PostToolUse" ] && [ "$registered_now" -eq 0 ] && [ -f "$marker" ]; then
   [ -n "$(find "$BRIDGER_ROOT/threads" -name '*.json' -newer "$marker" -print -quit 2>/dev/null)" ] \
     || exit 0
 fi
 
 unread=$(cd "$cwd" && "$bridger" poll --peek 2>/dev/null || true)
-[ -n "$unread" ] || exit 0
+# Nothing waiting. If this call really was a registration, the step easiest to
+# skip is the watcher — and by here `whoami` and `peers` have confirmed both
+# halves of the claim: this session IS registered, and it is NOT listening.
+if [ -z "$unread" ]; then
+  [ "$registered_now" -eq 1 ] || exit 0
+  emit "bridger: this session is now registered, but NOT yet listening. Registering does not start the watcher. $ARM"
+fi
 # The marker belongs to the PostToolUse cadence alone. UserPromptSubmit reports
 # unconditionally, so letting it advance the mark would suppress the first
 # mid-task report of a message the agent has only seen once, at turn start.

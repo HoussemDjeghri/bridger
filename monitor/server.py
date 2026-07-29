@@ -47,8 +47,20 @@ LOGO_PATH = os.path.join(PLUGIN_ROOT, "assets", "logo.png")
 
 
 def default_root():
-    """Where bridger keeps its state. Mirrors bin/bridger:33."""
-    return os.environ.get("BRIDGER_ROOT") or os.path.expanduser("~/.claude/bridger")
+    """Where bridger keeps its state. Mirrors bin/bridger.
+
+    `or` treats an empty string like an unset one, which for the variable that
+    picks WHICH BUS to read would silently point a caller at the user's real
+    ~/.claude/bridger. The CLI refuses that; refuse it identically here, or the
+    two sides disagree about which bus they are even looking at.
+    """
+    root = os.environ.get("BRIDGER_ROOT")
+    if root is not None and not root:
+        raise SystemExit(
+            "bridger: BRIDGER_ROOT is set but empty — refusing to fall back to "
+            "~/.claude/bridger (unset it to use the default)"
+        )
+    return root or os.path.expanduser("~/.claude/bridger")
 
 
 def claude_config_dir():

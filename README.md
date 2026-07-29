@@ -306,7 +306,7 @@ Message data under `~/.claude/bridger/` is yours; delete it separately if you wa
 | `/bridger:log <peer>` | Full conversation history with a peer |
 | `/bridger:monitor` | Read-only web view of every thread, plus bus health |
 
-The underlying CLI (`bin/bridger`) works standalone too — `bridger help` lists `peers`, `summary`, `register`, `join`, `leave`, `whoami`, `send`, `poll`, `wait`, `ask`, `log`, `mirror`, `status`, `monitor`. Scripts and CI can send messages to your sessions with it.
+The underlying CLI (`bin/bridger`) works standalone too — `bridger help` lists `peers`, `summary`, `register`, `join`, `leave`, `reap`, `whoami`, `send`, `poll`, `wait`, `ask`, `log`, `mirror`, `status`, `monitor`. Scripts and CI can send messages to your sessions with it.
 
 `bridger monitor` serves the read-only browser view described in [See every conversation at once](#see-every-conversation-at-once) — `--port N` to move it, `--root PATH` to watch a different bus.
 

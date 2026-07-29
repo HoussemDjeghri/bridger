@@ -31,8 +31,6 @@
 #     A name is held by one live session at a time.
 set -euo pipefail
 
-BRIDGER_ROOT="${BRIDGER_ROOT:-$HOME/.claude/bridger}"
-
 # The plugin's own directory, so the wiring command can copy the shipped badge
 # and dispatcher out to a stable location that survives plugin updates.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -50,6 +48,20 @@ STATUSLINE_DISPATCH="$CLAUDE_CFG_DIR/hooks/statusline-dispatch.sh"
 SETTINGS_FILE="$CLAUDE_CFG_DIR/settings.json"
 
 die() { echo "bridger: $*" >&2; exit 1; }
+
+# `${VAR:-default}` treats set-but-empty exactly like unset. For the one variable
+# that selects WHICH BUS we read and write, that is the wrong reading: a caller
+# who passed an explicit empty string gets silently pointed at the user's real
+# ~/.claude/bridger, where other live sessions keep their mail. A wrapper doing
+# `BRIDGER_ROOT="$SOMEVAR" bridger register x` with SOMEVAR empty then registers
+# a peer, and writes a statusline badge, into a bus it never meant to touch.
+# Unset is fine — that IS how you ask for the default. Empty is a caller bug.
+# Checked BEFORE the fallback below, which would otherwise have already turned
+# the empty string into the default and left nothing to detect.
+[ -z "${BRIDGER_ROOT+x}" ] || [ -n "$BRIDGER_ROOT" ] \
+  || die "BRIDGER_ROOT is set but empty — refusing to fall back to $HOME/.claude/bridger (unset it to use the default)"
+
+BRIDGER_ROOT="${BRIDGER_ROOT:-$HOME/.claude/bridger}"
 
 # Suggest the install command that fits the machine's package manager, so a
 # user missing jq gets a line they can paste rather than a bare URL.
@@ -70,6 +82,16 @@ now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 valid_name() {
   case "$1" in
     *--*) return 1 ;;
+    # A name goes straight into peer_file()/beat_file()/thread_dir() as PATH, so
+    # this check is the only thing keeping state inside BRIDGER_ROOT. `grep` alone
+    # could not carry that: it is LINE-oriented and -q succeeds when ANY line
+    # matches, so a name with an embedded newline passed on one of its lines and
+    # the rest became directory — `register $'../../../x\ny'` wrote a peer record
+    # into any directory the user can write to. Match the whole string here, in
+    # the shell, where there are no lines. grep still runs below as the
+    # authoritative charset/length check (its ranges are locale-correct); this arm
+    # only ever rejects, so it can never widen what is accepted.
+    ''|*[!a-z0-9-]*|[!a-z0-9]*) return 1 ;;
     *) printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9-]{0,31}$' ;;
   esac
 }
@@ -239,10 +261,19 @@ thread_dir() {
 }
 
 max_seq() {
-  local dir="$1" max=0 f s
+  local dir="$1" max=0 f s stem
   for f in "$dir"/[0-9]*.json; do
     [ -e "$f" ] || continue
-    s=$((10#$(basename "$f" .json)))
+    # The glob only anchors the FIRST character, so `00001 2.json` (a Finder
+    # duplicate), `0009-2.json` or `00006x.json` all reach here — and `$((10#…))`
+    # on those is a fatal bash arithmetic error under set -e. max_seq is on the
+    # read AND the write path, so one such file wedged the whole thread in both
+    # directions: poll and send both died, and because the delivery hooks do
+    # `peers || exit 0` the failure was silent. Skip what is not a number; a
+    # stray file is not a message.
+    stem=$(basename "$f" .json)
+    case "$stem" in ''|*[!0-9]*) continue ;; esac
+    s=$((10#$stem))
     [ "$s" -gt "$max" ] && max=$s
   done
   echo "$max"
@@ -254,7 +285,7 @@ max_seq() {
 # from two different instants would let a message that lands in between be
 # marked read without ever being delivered.
 unread_in_thread() {
-  local dir="$1" me="$2" top="$3" cur=0 f s rc
+  local dir="$1" me="$2" top="$3" cur=0 f s rc stem
   [ -f "$dir/cursor-$me" ] && cur=$(cat "$dir/cursor-$me")
   # A cursor read as empty or junk must mean "read nothing yet", never "read
   # everything": advance_cursor truncates before writing, so a concurrent reader
@@ -263,10 +294,23 @@ unread_in_thread() {
   case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
   for f in "$dir"/[0-9]*.json; do
     [ -e "$f" ] || continue
-    s=$((10#$(basename "$f" .json)))
+    stem=$(basename "$f" .json)
+    case "$stem" in ''|*[!0-9]*) continue ;; esac   # see max_seq: not a message
+    s=$((10#$stem))
     [ "$s" -gt "$cur" ] && [ "$s" -le "$top" ] || continue
+    # A zero-byte message reads as "no output, exit 0" — indistinguishable, to
+    # the select below, from a perfectly good message addressed to someone else.
+    # So poll consumed it as nothing and moved the cursor past it, silently.
+    # Size is free to check and catches the case that actually happens (a
+    # truncated write, a half-synced or restored bus).
+    if [ ! -s "$f" ]; then
+      echo "bridger: message $f is empty — skipped" >&2
+      continue
+    fi
     rc=0
-    jq -c --arg me "$me" 'select(.to == $me)' "$f" 2>/dev/null || rc=$?
+    # `error()` on a non-object makes jq exit 5, so a bare null/array/string
+    # lands in the same loud skip as a parse error instead of vanishing.
+    jq -c --arg me "$me" 'if type == "object" then select(.to == $me) else error("not a message object") end' "$f" 2>/dev/null || rc=$?
     if [ "$rc" -ne 0 ]; then
       # jq exits 5 ONLY for a parse error: bytes that will never improve, so
       # skipping is the one way past a message that would otherwise wedge this
@@ -286,6 +330,35 @@ unread_in_thread() {
 
 advance_cursor() { # thread_dir me top
   if [ "$3" -gt 0 ]; then echo "$3" > "$1/cursor-$2"; fi
+}
+
+# Is this message file safe to render? For the history readers (`log`, `mirror`)
+# — poll has its own variant above, because only poll also has a cursor to move.
+#
+# One `jq -e` separates every case that matters, by exit status:
+#   0  a JSON object                      -> render it
+#   1  parsed, but not an object          -> corrupt (a bare null/array/string)
+#   4  no output at all                   -> corrupt (zero-byte, NUL, whitespace)
+#   5  parse error                        -> corrupt
+#   2  cannot open: EACCES, revoked mount, EIO
+#
+# 4 is the case worth spelling out: jq exits 0 there, so every field reads back
+# as the empty string and a renderer that trusts it prints a section with a blank
+# seq, type and timestamp — a phantom entry, exit 0, nothing on stderr, inside a
+# record `mirror` invites you to commit.
+#
+# 2 is deliberately NOT skipped. It is transient: the message is intact and reads
+# fine next time. These readers render history someone keeps, so a wrong "corrupt"
+# verdict burns a permanent hole into a file that looks complete — the same trade
+# unread_in_thread makes, for the same reason.
+message_renderable() { # file
+  local rc=0
+  jq -e 'type == "object"' "$1" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1|4|5) echo "bridger: message $1 is unreadable — skipped" >&2; return 1 ;;
+    *) die "cannot read $1 — refusing to render a record that would look complete" ;;
+  esac
 }
 
 # List every peer name except $1 (candidates for threads involving $1).
@@ -723,8 +796,8 @@ cmd_send() {
   local from="" to="" type="" body="" ref=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --from) from="$2"; shift 2 ;;
-      --ref)  ref="$2";  shift 2 ;;
+      --from) [ $# -ge 2 ] || die "--from needs a value"; from="$2"; shift 2 ;;
+      --ref)  [ $# -ge 2 ] || die "--ref needs a value";  ref="$2";  shift 2 ;;
       *)
         if [ -z "$to" ]; then to="$1"
         elif [ -z "$type" ]; then type="$1"
@@ -735,6 +808,12 @@ cmd_send() {
     esac
   done
   [ -n "$to" ] && [ -n "$type" ] && [ -n "$body" ] || die "usage: bridger send <to>[,<to>...]|@all <type> <body> [--ref N] [--from <name>]"
+  # Validate here, not at the jq call: a bad --ref used to be discovered only
+  # while building the message, AFTER mktemp — which on the fan-out path (where
+  # errexit does not reach, see below) left a ZERO-BYTE file linked at a real
+  # seq and still reported success. Nothing can read that message, and the
+  # reader's cursor moves past it.
+  case "$ref" in ''|*[!0-9]*) [ -z "$ref" ] || die "--ref must be a message number, got: $ref" ;; esac
   [ -n "$from" ] || from=$(require_identity)
 
   # Routing: "@all" fans out to every other peer; "a,b" to exactly those.
@@ -754,12 +833,34 @@ cmd_send() {
     recipients=$(echo "$to" | tr ',' '\n')
   fi
   if [ -n "$recipients" ]; then
-    for r in $recipients; do
-      echo "$r $(cmd_send "$r" "$type" "$body" --from "$from" ${ref:+--ref "$ref"})"
-    done
-    return 0
+    # Read the list, never word-split it: `for r in $recipients` also GLOBS, so
+    # `send "x,*"` expanded against $PWD and delivered to whatever files happened
+    # to be named there — recipients the caller never addressed.
+    local seq_out rc_any=0
+    while IFS= read -r r; do
+      [ -n "$r" ] || continue
+      # Capture the status per recipient. `echo "$r $(cmd_send ...)"` discarded
+      # it — echo succeeds, so a partial (or total) fan-out failure exited 0 and
+      # no caller could tell. errexit does not propagate into $( ) on bash 3.2,
+      # so nothing else was catching it either.
+      if seq_out=$(cmd_send "$r" "$type" "$body" --from "$from" ${ref:+--ref "$ref"}); then
+        echo "$r $seq_out"
+      else
+        rc_any=1
+        echo "$r FAILED"
+      fi
+    done <<EOF
+$recipients
+EOF
+    return "$rc_any"
   fi
 
+  # A name becomes a PATH in thread_dir, and require_peer only tests that some
+  # <name>.json exists — which `../../elsewhere/package` satisfies. Without this,
+  # `send ../../victim/pwn` wrote a message file outside BRIDGER_ROOT entirely,
+  # and the quieter `send ./bob` created a second, never-read thread directory.
+  valid_name "$to" || die "invalid recipient name: $to"
+  valid_name "$from" || die "invalid sender name: $from"
   require_peer "$from"; require_peer "$to"
   [ "$from" != "$to" ] || die "cannot send to yourself"
 
@@ -807,25 +908,41 @@ cmd_poll() {
     shift
   done
   me=$(require_identity)
-  local top
+  local top rc failed=0
   for peer in $(other_peers "$me"); do
     dir=$(thread_dir "$me" "$peer")
     [ -d "$dir" ] || continue
     top=$(max_seq "$dir")
+    rc=0
     if [ "$json" -eq 1 ]; then
-      unread_in_thread "$dir" "$me" "$top"
+      unread_in_thread "$dir" "$me" "$top" || rc=$?
     else
-      unread_in_thread "$dir" "$me" "$top" | render_lines
+      unread_in_thread "$dir" "$me" "$top" | render_lines || rc=$?
     fi
+    # NEVER advance past a read that failed, and check it explicitly rather than
+    # leaning on errexit to abort us. `set -e` is not active inside a command
+    # substitution on bash 3.2 — the macOS system bash, and what
+    # `#!/usr/bin/env bash` resolves to here — so on the two paths that call this
+    # as `out=$(cmd_poll)` (the `wait --follow` watcher, and `ask`) a failed read
+    # fell straight through to advance_cursor. That moved the cursor past the
+    # message that could not be read AND every message behind it, while the
+    # watcher kept beating and the peer kept reading [listening]: silent,
+    # permanent loss on the one path that reaches an idle session. Deciding it
+    # here makes the guarantee hold in every caller and on every bash.
+    # Keep serving the other threads, but remember the failure: a caller that
+    # asked to consume must still learn that one thread could not be read, and
+    # the CLI's exit status is the only channel for that.
+    [ "$rc" -eq 0 ] || { failed=1; continue; }
     [ "$peek" -eq 1 ] || advance_cursor "$dir" "$me" "$top"
   done
+  return "$failed"
 }
 
 cmd_wait() {
   local timeout=300 follow=0 me out
   while [ $# -gt 0 ]; do
     case "$1" in
-      --timeout) timeout="$2"; shift 2 ;;
+      --timeout) [ $# -ge 2 ] || die "--timeout needs a value"; timeout="$2"; shift 2 ;;
       --follow)  follow=1; shift ;;
       *) die "usage: bridger wait [--timeout S] [--follow]" ;;
     esac
@@ -853,7 +970,26 @@ cmd_wait() {
     done
     while :; do
       echo $$ > "$(beat_file "$me")"   # pid + mtime: who is listening, and since when
-      out=$(cmd_poll)
+      # `|| return 1` is load-bearing, not defensive. unread_in_thread refuses to
+      # advance the cursor past a message it could not read (EACCES, a revoked
+      # mount, EIO) — but it reaches that refusal by dying, and on bash 3.2, which
+      # is what /usr/bin/env bash resolves to on stock macOS, errexit is NOT
+      # inherited into a command substitution. Without this, cmd_poll did not
+      # abort: it fell through to advance_cursor on its own next line and marked
+      # the unreadable message AND everything behind it delivered, while this loop
+      # kept beating and the peer kept reading [listening]. Silent permanent loss,
+      # on the one path that reaches an idle session.
+      #
+      # Stopping is the safe half of the trade, exactly as it is inside
+      # unread_in_thread: the EXIT trap drops the beat, the peer falls back to
+      # [queued], and every message is still on disk to be delivered once the
+      # fault clears.
+      # `|| true`: cmd_poll now returns nonzero when a thread could not be read,
+      # and a failing assignment would abort the watcher under set -e. A transient
+      # fault must not kill the only thing delivering to this session — loop, keep
+      # beating, and retry. The cursor is not advanced, so nothing is lost and it
+      # self-heals the moment the file is readable again.
+      out=$(cmd_poll) || true || return 1
       [ -n "$out" ] && echo "$out"
       sleep 0.5
     done
@@ -875,7 +1011,7 @@ cmd_ask() {
   local timeout="${BRIDGER_ASK_TIMEOUT:-300}"
   while [ $# -gt 0 ]; do
     case "$1" in
-      --timeout) timeout="$2"; shift 2 ;;
+      --timeout) [ $# -ge 2 ] || die "--timeout needs a value"; timeout="$2"; shift 2 ;;
       --json) json=1; shift ;;
       *) if [ -z "$to" ]; then to="$1"; elif [ -z "$body" ]; then body="$1"; else die "unexpected argument: $1"; fi; shift ;;
     esac
@@ -886,20 +1022,35 @@ cmd_ask() {
   case "$to" in *,*|@all) die "ask takes a single peer (use send for fan-out)" ;; esac
   me=$(require_identity)
   seq=$(cmd_send "$to" ask "$body" --from "$me")
-  local deadline=$((SECONDS + timeout))
+  local deadline=$((SECONDS + timeout)) answer="" sender
   while [ "$SECONDS" -lt "$deadline" ]; do
+    answer=""
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       ref=$(jq -r '.ref // empty' <<<"$line")
-      if [ "$ref" = "$seq" ]; then
-        if [ "$json" -eq 1 ]; then echo "$line"; else render_lines <<<"$line"; fi
-        return 0
+      sender=$(jq -r '.from // empty' <<<"$line")
+      # Match the sender too. Seqs are per-thread, so every thread has a #1 and a
+      # ref collision across threads is routine — matching on .ref alone let a
+      # THIRD peer's reply satisfy `ask bob`, returned as bob's answer, exit 0,
+      # with no way for the caller to tell.
+      if [ -z "$answer" ] && [ "$ref" = "$seq" ] && [ "$sender" = "$to" ]; then
+        answer="$line"
+        continue
       fi
       # Unrelated traffic consumed while waiting — surface it, don't drop it.
       render_lines <<<"$line" >&2
     done <<EOF
 $(cmd_poll --json)
 EOF
+    # Drain the WHOLE batch before returning. `cmd_poll --json` above already
+    # consumed it and moved every cursor, so returning the moment the match was
+    # seen abandoned every later line in that same batch — never printed, not
+    # even to stderr, and unreachable forever. "Peer answers, then adds a note"
+    # is the ordinary pattern, and it lost the note every time.
+    if [ -n "$answer" ]; then
+      if [ "$json" -eq 1 ]; then echo "$answer"; else render_lines <<<"$answer"; fi
+      return 0
+    fi
     sleep 0.5
   done
   echo "bridger: no reply to #$seq within ${timeout}s" >&2
@@ -923,6 +1074,7 @@ cmd_log() {
   [ -d "$dir" ] || { [ "$json" -eq 1 ] || echo "(no messages yet)"; return 0; }
   for f in "$dir"/[0-9]*.json; do
     [ -e "$f" ] || continue
+    message_renderable "$f" || continue
     if [ "$json" -eq 1 ]; then
       jq -c . "$f"
     else
@@ -940,7 +1092,8 @@ cmd_mirror() {
   local peer="" types="stop,ruling" me dir f t
   while [ $# -gt 0 ]; do
     case "$1" in
-      --types) types="$2"; shift 2 ;;
+      --types) [ $# -ge 2 ] || die "usage: bridger mirror <peer> [--types t1,t2|all]"
+               types="$2"; shift 2 ;;
       *) [ -z "$peer" ] && { peer="$1"; shift; } || die "usage: bridger mirror <peer> [--types t1,t2|all]" ;;
     esac
   done
@@ -955,6 +1108,7 @@ cmd_mirror() {
   [ -d "$dir" ] || return 0
   for f in "$dir"/[0-9]*.json; do
     [ -e "$f" ] || continue
+    message_renderable "$f" || continue
     t=$(jq -r .type "$f")
     case ",$types," in
       *",$t,"* | ",all,") ;;
