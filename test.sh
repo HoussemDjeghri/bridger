@@ -1135,6 +1135,68 @@ pass "an untraversable parent leaves a peer registered and unreaped"
   jq -r '.hookSpecificOutput.additionalContext' <<<"$mention" | grep -q "URGENT which db" \
     || fail "a command that merely mentions 'bridger register' must not suppress delivery (got: $mention)"
 
+  # `.tool_input.command` is not always a string: an MCP tool can pass an array,
+  # an object or a number, and `tool_input` itself need not be an object. `gsub`
+  # on a non-string made jq exit 5 with no output, `read` then hit EOF, and under
+  # set -e the hook died with exit 1 before it ever looked for mail — silently,
+  # on a session that had a message waiting.
+  (cd "$up/reader" && BRIDGER_SESSION_ID=reader-sess "$bridger" poll >/dev/null 2>&1)
+  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send reader ask "TYPED payload" >/dev/null 2>/dev/null)
+  for shape in '["ls"]' '42' '{"a":1}'; do
+    rm -f "$BRIDGER_ROOT/reported-reader-sess"
+    payload=$(jq -nc --arg cwd "$up/reader" --argjson c "$shape" \
+      '{hook_event_name:"PostToolUse",cwd:$cwd,session_id:"reader-sess",tool_input:{command:$c}}')
+    out=$(printf '%s' "$payload" | bash "$hook") \
+      || fail "a non-string tool_input.command ($shape) made the hook exit nonzero"
+    jq -r '.hookSpecificOutput.additionalContext' <<<"$out" | grep -q "TYPED payload" \
+      || fail "a non-string tool_input.command ($shape) suppressed a waiting message"
+  done
+  for bad in '' 'garbage' '[]'; do
+    printf '%s' "$bad" | bash "$hook" >/dev/null \
+      || fail "malformed hook stdin ('$bad') must be a no-op, not an error exit"
+  done
+
+  # The high-water marker has to be stamped even when nothing was waiting.
+  # Writing it only after mail arrived left a registered session that has never
+  # received a message with no marker at all, so the cheap `-newer` gate was
+  # skipped on every single tool call, forever — the hot path it exists for.
+  (cd "$up/reader" && BRIDGER_SESSION_ID=reader-sess "$bridger" poll >/dev/null 2>&1)
+  rm -f "$BRIDGER_ROOT/reported-reader-sess"
+  printf '%s' "$ptu" | bash "$hook" >/dev/null
+  [ -f "$BRIDGER_ROOT/reported-reader-sess" ] \
+    || fail "no marker was written on an empty inbox, so the fast path can never engage"
+
+  # And the marker must carry the time the scan STARTED, not the time it
+  # finished. Stamped afterwards, a message that landed while the poll was
+  # running got an mtime OLDER than the marker, so `find -newer` could never see
+  # it and every later tool call exited at the gate while it sat unread — a
+  # window seconds wide on a busy bus. No policy can recover a marker that is
+  # already ahead of a message, so the invariant itself is what gets asserted:
+  # with a slow poll, the marker must still be stamped from before it ran.
+  shimroot=$(mktemp -d); mkdir -p "$shimroot/bin"
+  cat > "$shimroot/bin/bridger" <<'SHIMEOF'
+#!/usr/bin/env bash
+case "$*" in
+  whoami)      echo shimreader ;;
+  peers)       echo "shimreader [queued] /tmp" ;;
+  "poll --peek") sleep 2 ;;
+  *)           exit 0 ;;
+esac
+SHIMEOF
+  chmod +x "$shimroot/bin/bridger"
+  rm -f "$BRIDGER_ROOT/reported-shim-sess"
+  shimcall='{"hook_event_name":"PostToolUse","cwd":"'"$up/reader"'","session_id":"shim-sess"}'
+  started=$(python3 -c 'import time; print(time.time())')
+  CLAUDE_PLUGIN_ROOT="$shimroot" bash "$hook" <<<"$shimcall" >/dev/null 2>&1 || true
+  [ -f "$BRIDGER_ROOT/reported-shim-sess" ] || fail "the slow-poll run wrote no marker at all"
+  python3 - "$BRIDGER_ROOT/reported-shim-sess" "$started" <<'PYEOF' \
+    || fail "the marker was stamped after the poll finished — anything that landed during it is suppressed forever"
+import os, sys
+age = os.stat(sys.argv[1]).st_mtime - float(sys.argv[2])
+sys.exit(0 if age < 1.0 else 1)
+PYEOF
+  rm -rf "$shimroot"
+
   # And the claim must never be made for a session that is not registered at all.
   mkdir -p "$up/stranger"
   stranger=$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","session_id":"stranger-sess","tool_input":{"command":"grep -n \\"bridger register\\" README.md"}}' "$up/stranger" | bash "$hook")
@@ -1506,11 +1568,89 @@ fi
   (cd "$nw/a" && "$bridger" send nb,nb chat body --ref abc >/dev/null 2>&1) && fail "a non-numeric --ref was accepted"
   [ -z "$(find "$BRIDGER_ROOT/threads" -name '[0-9]*.json' -size 0 2>/dev/null)" ] \
     || fail "a zero-byte message was committed at a real seq"
+  # Capture, then grep. Written as `cmd 2>&1 | grep -q …` inside `( … ) && fail`
+  # this assertion could never fire: under `set -o pipefail` (line 4) the
+  # pipeline takes the last NONZERO status, and a command that leaks `unbound
+  # variable` also exits nonzero — so the `&&` never ran, whatever grep found.
+  # Both arity guards were effectively untested.
   for f in --ref --from; do
-    (cd "$nw/a" && "$bridger" send nb chat hi "$f" 2>&1 | grep -q 'unbound variable') \
-      && fail "send $f with no value leaks a raw bash error"
+    err=$(cd "$nw/a" && "$bridger" send nb chat hi "$f" 2>&1 || true)
+    ! grep -q 'unbound variable' <<<"$err" \
+      || fail "send $f with no value leaks a raw bash error: $err"
+    grep -q 'needs a value' <<<"$err" \
+      || fail "send $f with no value must be a usage error (got: $err)"
   done
   pass "send validates recipient names, never globs them, and reports fan-out failure"
+  rm -rf "$BRIDGER_ROOT"
+)
+
+# --- the send guards that keep a message from being written into a void ------
+# A mutation sweep found every one of these deletable with the suite green, and
+# each one loses or corrupts a message rather than merely reporting badly:
+# `poll` iterates OTHER peers, so a thread whose name is not another registered
+# peer is never scanned by anyone. The message file exists, the sender is told it
+# succeeded, and nobody can ever read it.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  gw="$work/sendguards"; mkdir -p "$gw/a" "$gw/b"
+  "$bridger" register ga "$gw/a" >/dev/null
+  "$bridger" register gb "$gw/b" >/dev/null
+
+  (cd "$gw/a" && "$bridger" send ga chat to-myself >/dev/null 2>&1) \
+    && fail "a self-addressed send was accepted — poll never scans that thread, so it is lost"
+  (cd "$gw/a" && "$bridger" send gb chat ghost --from ghostpeer >/dev/null 2>&1) \
+    && fail "a send from an unregistered name was accepted — nobody ever scans that thread"
+  (cd "$gw/a" && "$bridger" send gb >/dev/null 2>&1) \
+    && fail "send with no type and no body wrote a message with both fields empty"
+  (cd "$gw/a" && "$bridger" send gb chat body --from 'BAD NAME' >/dev/null 2>&1) \
+    && fail "an invalid --from was accepted"
+  [ -z "$(find "$BRIDGER_ROOT/threads" -type d -name '*ghost*' 2>/dev/null)" ] \
+    || fail "a refused send still created a thread directory"
+
+  # A fan-out has to name the recipients it could not reach: the caller cannot
+  # act on "something failed", and the exit status alone does not say which.
+  out=$(cd "$gw/a" && "$bridger" send gb,gzz chat fanout 2>/dev/null || true)
+  grep -q '^gzz FAILED' <<<"$out" \
+    || fail "a fan-out failure did not name the recipient it could not reach (got: $out)"
+  pass "send refuses the addresses whose messages nothing would ever read"
+  rm -rf "$BRIDGER_ROOT"
+)
+
+# --- the cursor bound must be the snapshot, not a second max_seq -------------
+# unread_in_thread takes `top` from ONE max_seq call and advance_cursor reuses
+# it, because scanning and cursor-writing from two different instants lets a
+# message that lands in between be marked read without ever being delivered.
+# Recomputing max_seq at the cursor write keeps the suite green while destroying
+# roughly half of everything sent during a poll — the guard is documented, and
+# nothing exercised it, because no other test sends concurrently with a poll.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  cw="$work/cursorsnap"; mkdir -p "$cw/a" "$cw/b"
+  "$bridger" register ca "$cw/a" >/dev/null
+  "$bridger" register cb "$cw/b" >/dev/null
+  (
+    cd "$cw/a"
+    for i in $(seq 1 40); do "$bridger" send cb chat "m$i" >/dev/null 2>&1 || true; done
+  ) &
+  sender=$!
+  # Keep the newline between polls: command substitution strips the trailing one,
+  # so concatenating bare would glue the last line of one poll to the first of
+  # the next and lose a line boundary the assertion depends on.
+  got=""
+  while kill -0 "$sender" 2>/dev/null; do
+    got="$got
+$(cd "$cw/b" && "$bridger" poll 2>/dev/null || true)"
+  done
+  wait "$sender" 2>/dev/null || true
+  got="$got
+$(cd "$cw/b" && "$bridger" poll 2>/dev/null || true)"
+  missed=0
+  for i in $(seq 1 40); do
+    grep -q "chat: m$i\$" <<<"$got" || missed=$((missed + 1))
+  done
+  [ "$missed" -eq 0 ] \
+    || fail "$missed of 40 messages sent during a poll were marked read without being delivered"
+  pass "a message that lands mid-poll is never marked read without being delivered"
   rm -rf "$BRIDGER_ROOT"
 )
 
@@ -1535,16 +1675,31 @@ fi
   { grep -q "FOLLOWUP-NOTE" "$kw/err" || [ -n "$(cd "$kw/a" && "$bridger" poll --peek 2>/dev/null | grep FOLLOWUP-NOTE)" ]; } \
     || fail "ask destroyed the message that followed the answer in the same batch"
   # Seqs are per-thread, so a ref collision across threads is routine: a THIRD
-  # peer's reply must not satisfy this ask.
-  (cd "$kw/a" && "$bridger" poll >/dev/null 2>&1) || true
-  (cd "$kw/a" && "$bridger" ask kb "real q" --timeout 4 >"$kw/out2" 2>/dev/null) &
+  # peer's reply must not satisfy this ask. Fresh peers, so the ask is seq 1 and
+  # the impostor can use the same ref. The ask must still END on the real
+  # answer — asserting only "the impostor was not returned" passes for free
+  # whenever the ask simply times out, which is how this hole stayed open.
+  mkdir -p "$kw/d" "$kw/e" "$kw/f"
+  "$bridger" register kd "$kw/d" >/dev/null
+  "$bridger" register ke "$kw/e" >/dev/null
+  "$bridger" register kf "$kw/f" >/dev/null
+  (cd "$kw/d" && "$bridger" ask ke "real q" --timeout 20 >"$kw/out2" 2>/dev/null) &
   apid=$!
-  for _ in $(seq 1 100); do [ -n "$(cd "$kw/b" && "$bridger" poll --peek 2>/dev/null)" ] && break; sleep 0.1; done
-  (cd "$kw/c" && "$bridger" send ka answer "I-AM-KC" --ref 1 >/dev/null 2>&1)
+  for _ in $(seq 1 150); do [ -n "$(cd "$kw/e" && "$bridger" poll --peek 2>/dev/null)" ] && break; sleep 0.1; done
+  (cd "$kw/f" && "$bridger" send kd answer "I-AM-KF" --ref 1 >/dev/null 2>&1)
+  sleep 1
+  (cd "$kw/e" && "$bridger" send kd answer "I-AM-KE" --ref 1 >/dev/null 2>&1)
   wait "$apid" 2>/dev/null || true
-  ! grep -q "I-AM-KC" "$kw/out2" || fail "ask accepted a third peer's reply as the answer"
-  (cd "$kw/a" && "$bridger" ask kb q --timeout 2>&1 | grep -q 'unbound variable') \
-    && fail "ask --timeout with no value leaks a raw bash error"
+  grep -q "I-AM-KE" "$kw/out2" \
+    || fail "ask never returned the answer from the peer it asked (got: $(cat "$kw/out2"))"
+  ! grep -q "I-AM-KF" "$kw/out2" || fail "ask accepted a third peer's reply as the answer"
+  # Capture, then grep: `cmd 2>&1 | grep -q …` inside `( … ) && fail` can never
+  # fire under pipefail — see the same fix on the send flags above.
+  err=$(cd "$kw/a" && "$bridger" ask kb q --timeout 2>&1 || true)
+  ! grep -q 'unbound variable' <<<"$err" \
+    || fail "ask --timeout with no value leaks a raw bash error: $err"
+  grep -q 'needs a value' <<<"$err" \
+    || fail "ask --timeout with no value must be a usage error (got: $err)"
   pass "ask matches on sender+ref and never abandons a consumed batch"
   rm -rf "$BRIDGER_ROOT"
 )

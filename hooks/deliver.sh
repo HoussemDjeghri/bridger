@@ -35,11 +35,18 @@ command -v jq >/dev/null 2>&1 || exit 0
 # One jq pass for every field this hook can need: it runs after every tool
 # call, so the cost of the no-op path is the cost of the hook.
 payload=$(cat 2>/dev/null || true)
+# Every field is made total. `.tool_input.command` is not always a string — an
+# MCP tool can pass an array, an object or a number, and `tool_input` itself
+# need not be an object — and `gsub` on a non-string makes jq exit 5 with no
+# output. The `|| true` also has to sit OUTSIDE the redirection: there it fixed
+# the process substitution's status, but `read` then hit EOF and returned 1, and
+# under `set -e` that is what killed the hook. The result was a silent exit 1 for
+# any such tool call, and a session with mail waiting never heard about it.
 IFS=$'\t' read -r event cwd sid cmd < <(
   jq -r '[.hook_event_name // "", .cwd // "", .session_id // "",
-          (.tool_input.command // "" | gsub("\\s+"; " "))] | @tsv' \
-    <<<"$payload" 2>/dev/null || true
-)
+          ((.tool_input? | objects | .command? | strings) // "" | gsub("\\s+"; " "))] | @tsv' \
+    <<<"$payload" 2>/dev/null
+) || true
 [ -n "${cwd:-}" ] && [ -d "$cwd" ] || cwd="$PWD"
 BRIDGER_SESSION_ID="${sid:-}"
 export BRIDGER_SESSION_ID
@@ -70,6 +77,22 @@ case "${cmd:-}" in
   *"bridger register"*|*"bridger join"*) registered_now=1 ;;
 esac
 
+# Mid-task, the report is per arrival, not per tool call. The marker is the
+# high-water mark of what has already been reported; a thread file newer than
+# it means something landed since. One find, no jq, stops at the first hit.
+# A registration skips this gate: it is a rare, explicit event, and the thing it
+# needs to say ("you are registered but deaf") is not about mail arriving, so the
+# high-water mark must not suppress it.
+#
+# This runs BEFORE whoami and peers. It needs neither, and sitting below them it
+# had already spent most of the hook's cost — the cost this gate exists to avoid,
+# paid on every tool call of every session on the machine.
+marker="$BRIDGER_ROOT/reported-${sid:-nosession}"
+if [ "${event:-}" = "PostToolUse" ] && [ "$registered_now" -eq 0 ] && [ -f "$marker" ]; then
+  [ -n "$(find "$BRIDGER_ROOT/threads" -name '*.json' -newer "$marker" -print -quit 2>/dev/null)" ] \
+    || exit 0
+fi
+
 me=$(cd "$cwd" && "$bridger" whoami 2>/dev/null) || exit 0
 
 # Unscoped listing matched by name: --dir compares directories exactly, so a
@@ -79,20 +102,25 @@ if grep -q "^$me \[listening\]" <<<"$listed"; then
   exit 0
 fi
 
-# Mid-task, the report is per arrival, not per tool call. The marker is the
-# high-water mark of what has already been reported; a thread file newer than
-# it means something landed since. One find, no jq, stops at the first hit.
-# A registration skips this gate: it is a rare, explicit event, and the thing it
-# needs to say ("you are registered but deaf") is not about mail arriving, so the
-# high-water mark must not suppress it. Ordinary tool calls — the hot path this
-# gate exists for — are unaffected.
-marker="$BRIDGER_ROOT/reported-${sid:-nosession}"
-if [ "${event:-}" = "PostToolUse" ] && [ "$registered_now" -eq 0 ] && [ -f "$marker" ]; then
-  [ -n "$(find "$BRIDGER_ROOT/threads" -name '*.json' -newer "$marker" -print -quit 2>/dev/null)" ] \
-    || exit 0
-fi
+# Stamp the mark with the time the scan STARTS, not the time it finishes. The
+# marker was written after the poll returned, so a message that landed after its
+# own thread was scanned but before that write ended up with an mtime OLDER than
+# the marker: `find -newer` could never see it, and every later tool call exited
+# at the gate above while the message sat unread. The poll takes seconds on a
+# busy bus, so the window is wide. `mv` preserves the mtime.
+mkdir -p "$BRIDGER_ROOT"
+stamp=$(mktemp "$BRIDGER_ROOT/.mark.XXXXXX")
 
 unread=$(cd "$cwd" && "$bridger" poll --peek 2>/dev/null || true)
+# The marker belongs to the PostToolUse cadence alone. UserPromptSubmit reports
+# unconditionally, so letting it advance the mark would suppress the first
+# mid-task report of a message the agent has only seen once, at turn start.
+#
+# Written whether or not anything was waiting. Writing it only when mail had
+# arrived left a registered session that has never received a message with no
+# marker at all, so the gate above was skipped on every single tool call forever
+# — exactly the hot path it exists for.
+if [ "${event:-}" = "PostToolUse" ]; then mv "$stamp" "$marker"; else rm -f "$stamp"; fi
 # Nothing waiting. If this call really was a registration, the step easiest to
 # skip is the watcher — and by here `whoami` and `peers` have confirmed both
 # halves of the claim: this session IS registered, and it is NOT listening.
@@ -100,11 +128,6 @@ if [ -z "$unread" ]; then
   [ "$registered_now" -eq 1 ] || exit 0
   emit "bridger: this session is now registered, but NOT yet listening. Registering does not start the watcher. $ARM"
 fi
-# The marker belongs to the PostToolUse cadence alone. UserPromptSubmit reports
-# unconditionally, so letting it advance the mark would suppress the first
-# mid-task report of a message the agent has only seen once, at turn start.
-[ "${event:-}" = "PostToolUse" ] && { mkdir -p "$BRIDGER_ROOT"; : > "$marker"; }
-
 MAX_SHOWN=5
 n=$(grep -c . <<<"$unread" || true)
 shown=$(head -n "$MAX_SHOWN" <<<"$unread")
