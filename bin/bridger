@@ -989,8 +989,18 @@ EOF
 
 # Render message JSON as one terse line per message — the delivery format.
 # Newlines in bodies are escaped so "one line = one message" always holds.
+# One message renders as exactly ONE line — that is the delivered format, and
+# both the skill and the delivery hook document it as such. Only "\n" was ever
+# escaped, so every other C0 byte reached the terminal raw: a body carrying CR
+# (or CR plus an ANSI erase) overwrites the "#<seq> <from> <type>:" prefix that
+# has already been drawn and mints a second delivery line attributed to a peer
+# that never sent it. Escape CR and LF so they stay visible, and replace the rest
+# of C0 and DEL — nothing in that range has a legitimate place in a message body,
+# and TAB is deliberately left alone because it cannot forge a line.
+WIRE_ESCAPE='gsub("\r"; "\\r") | gsub("\n"; "\\n") | gsub("[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]"; "?")'
+
 render_lines() {
-  jq -r '"#\(.seq) \(.from) \(.type)\(if .ref then " re#\(.ref)" else "" end): \(.body | gsub("\n"; "\\n"))"'
+  jq -r "\"#\\(.seq) \\(.from) \\(.type)\\(if .ref then \" re#\\(.ref)\" else \"\" end): \\(.body | $WIRE_ESCAPE)\""
 }
 
 # Consume (or peek at) unread messages across every thread involving me.
@@ -1211,7 +1221,11 @@ cmd_log() {
     if [ "$json" -eq 1 ]; then
       jq -c . "$f"
     else
-      jq -r '"#\(.seq)  \(.ts)  \(.from) -> \(.to)  [\(.type)]\(if .ref then " re #\(.ref)" else "" end)  \(.body)"' "$f"
+      # Same one-record-one-line contract as the delivered format, and this one
+      # escaped nothing at all: a body with a newline produced a second line
+      # carrying its own seq, timestamp, arrow and type bracket — byte-identical
+      # to a genuine entry, in the command offered as the audit trail.
+      jq -r "\"#\\(.seq)  \\(.ts)  \\(.from) -> \\(.to)  [\\(.type)]\\(if .ref then \" re #\\(.ref)\" else \"\" end)  \\(.body | $WIRE_ESCAPE)\"" "$f"
     fi
   done
 }
@@ -1251,7 +1265,14 @@ cmd_mirror() {
       "$(jq -r .seq "$f")" \
       "$(jq -r '"\(.type)\(if .ref then " re #\(.ref)" else "" end)"' "$f")" \
       "$(jq -r '"\(.ts) \(.from) -> \(.to)"' "$f")"
-    jq -r .body "$f"
+    # `mirror` is documented as a governance record you commit, and it prints
+    # bodies as markdown, so a body is free to open its own "## " section — one
+    # `ruling` from any peer could plant an extra ruling attributed to somebody
+    # else inside the committed file. Escaping a leading `#` renders it as a
+    # literal `#` in markdown, so real prose is unchanged and only the forged
+    # heading loses its power. Multi-line bodies stay multi-line: here that is
+    # the intended format, not a contract being broken.
+    jq -r '.body | gsub("(?m)^#"; "\\#")' "$f"
   done
 }
 
