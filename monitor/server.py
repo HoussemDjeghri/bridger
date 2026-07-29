@@ -180,6 +180,21 @@ def read_int(path):
         return 0
 
 
+def _reject_constant(token):
+    """json.load accepts the non-standard NaN/Infinity/-Infinity literals, and
+    json.dumps re-emits them by default — so the server answered 200 with a body
+    no browser can parse, and the page died with no status code, no log line and
+    nothing to point at the file. jq maps the same value to null and carries on,
+    so the CLI read the peer fine while the monitor served garbage. Refuse at the
+    boundary instead, and let the existing one-file warning report it.
+    """
+    raise ValueError("%s is not valid JSON" % token)
+
+
+def _load_json(handle):
+    return json.load(handle, parse_constant=_reject_constant)
+
+
 def _load_object(path):
     """Read JSON that must be an object.
 
@@ -189,7 +204,7 @@ def _load_object(path):
     "unreadable file" path handles it.
     """
     with open(path) as handle:
-        record = json.load(handle)
+        record = _load_json(handle)
     if not isinstance(record, dict):
         raise ValueError("expected a JSON object, got %s" % type(record).__name__)
     return record
@@ -204,7 +219,7 @@ def read_peers(root, now, warnings):
         name = os.path.basename(path)[: -len(".json")]
         try:
             record = _load_object(path)
-        except (OSError, ValueError) as err:
+        except (OSError, ValueError, RecursionError) as err:
             # write_peer now lands atomically, so this is a hand-edited or
             # truncated record rather than a mid-write read. Either way it is one
             # peer: report it and keep serving the rest.
@@ -332,8 +347,12 @@ def _read_messages(directory, pair, warnings):
             continue
         try:
             with open(path) as handle:
-                record = json.load(handle)
-        except (OSError, ValueError) as err:
+                record = _load_json(handle)
+        # RecursionError is a RuntimeError, so deeply nested JSON slipped past
+        # the per-file handlers that exist precisely to degrade one bad file to a
+        # warning, and 500'd the whole request instead. jq has its own depth
+        # limit and fails per file, so the CLI already behaves correctly here.
+        except (OSError, ValueError, RecursionError) as err:
             warnings.append("message %s/%s unreadable: %s" % (pair, name, err))
             continue
         messages.append(_normalize(record, int(stem)))
@@ -357,12 +376,27 @@ def _normalize(record, seq):
     if not isinstance(record, dict):
         record = {}
     ref = record.get("ref")
+
+    def text(value):
+        """`x or ""` only replaces FALSY values, so a list or a dict went
+        straight through. A non-string `to` then reached `cursors.get(recipient)`
+        and raised TypeError on an unhashable key — which is neither OSError nor
+        ValueError, so it escaped every per-file handler and 500'd the entire
+        snapshot: one hand-edited message blanked peers, threads, metrics and the
+        health bar together. A non-string `body` or `from` instead reached the
+        browser, where `.replace` / `.split` threw inside the render and pinned
+        the page on "reconnecting" while it kept showing the last good snapshot.
+        "" is also the honest rendering: `jq 'select(.to == $me)'` never matches
+        a non-string `to`, so the CLI cannot deliver such a message either.
+        """
+        return value if isinstance(value, str) else ""
+
     message = {
         "seq": seq,
-        "from": record.get("from") or "",
-        "to": record.get("to") or "",
-        "type": record.get("type") or "",
-        "body": record.get("body") or "",
+        "from": text(record.get("from")),
+        "to": text(record.get("to")),
+        "type": text(record.get("type")),
+        "body": text(record.get("body")),
         "ts": record.get("ts") if isinstance(record.get("ts"), str) else None,
     }
     if isinstance(ref, int) and not isinstance(ref, bool):
@@ -528,9 +562,12 @@ ALLOWED_HOSTS = ("127.0.0.1", "localhost", "::1")
 def _host_of(header):
     """The name out of a Host header, without the port. IPv6 arrives bracketed
     as `[::1]:8787`, where splitting on the first colon would give `[`."""
+    # Lower-cased: a Host header is case-insensitive per RFC 9110, so a user who
+    # types LOCALHOST in the address bar is naming an allowed host. Folding case
+    # on an allowlist can only ever refuse the same set or fewer.
     if header.startswith("["):
-        return header[1:].split("]")[0]
-    return header.split(":")[0]
+        return header[1:].split("]")[0].lower()
+    return header.split(":")[0].lower()
 
 
 class MonitorHandler(BaseHTTPRequestHandler):
@@ -856,6 +893,44 @@ def selftest():
     assert _host_of("localhost") == "localhost"
     assert _host_of("[::1]:8787") == "::1"
     assert _host_of("bridger.evil.example:8787") not in ALLOWED_HOSTS
+    assert _host_of("LOCALHOST:8787") in ALLOWED_HOSTS, "Host is case-insensitive"
+    # Everything else a browser or an attacker can put there must be refused.
+    # This is the server's only access control and /api/state carries every
+    # message body, so the allowlist has to stay an allowlist.
+    for denied in ("", "localhost.", "127.0.0.1.", "0.0.0.0", "127.1",
+                   "attacker.example", "::ffff:127.0.0.1", "127.0.0.1.evil.example"):
+        assert _host_of(denied) not in ALLOWED_HOSTS, denied
+
+    # A message field that is not a string must be coerced HERE. A list `to`
+    # reached cursors.get() as an unhashable key and raised TypeError — neither
+    # OSError nor ValueError, so it escaped every per-file handler and 500'd the
+    # whole snapshot; a list `body` reached the browser and pinned the page on
+    # "reconnecting" while it kept displaying the last good state.
+    hostile = tempfile.mkdtemp(prefix="bridger-monitor-hostile.")
+    os.makedirs(os.path.join(hostile, "peers"))
+    hostile_thread = os.path.join(hostile, "threads", "alpha--beta")
+    os.makedirs(hostile_thread)
+    with open(os.path.join(hostile_thread, "00007.json"), "w") as handle:
+        json.dump({"to": ["beta"], "from": {"a": 1}, "type": 3, "body": ["x"],
+                   "ts": "2026-07-26T11:40:00Z"}, handle)
+    bad = snapshot(hostile, now=now)["threads"][0]["messages"][0]
+    assert bad == {"seq": 7, "from": "", "to": "", "type": "", "body": "",
+                   "ts": "2026-07-26T11:40:00Z", "delivered": False}, bad
+
+    # NaN/Infinity are accepted by json.load and re-emitted by json.dumps, so the
+    # server answered 200 with a body no browser can parse — and jq maps the same
+    # value to null, so the CLI read the file fine while the page died silently.
+    with open(os.path.join(hostile, "peers", "nanny.json"), "w") as handle:
+        handle.write('{"cwd": "/tmp", "drift": NaN}')
+    # RecursionError is a RuntimeError, so deeply nested JSON slipped past the
+    # per-file handlers and 500'd the request the same way.
+    with open(os.path.join(hostile, "peers", "deep.json"), "w") as handle:
+        handle.write("[" * 100000 + "]" * 100000)
+    degraded = snapshot(hostile, now=now)
+    json.dumps(degraded, allow_nan=False)
+    for name in ("nanny", "deep"):
+        assert any(name in warning for warning in degraded["warnings"]), degraded["warnings"]
+    shutil.rmtree(hostile)
 
     shutil.rmtree(root)
     print("PASS: bridger monitor self-check green")
