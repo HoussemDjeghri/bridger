@@ -275,23 +275,124 @@ pass "two sessions in one directory hold distinct identities and talk"
 
 # --- same name, two sessions: live holder refuses, dead holder is taken over --
 mkdir -p "$disc/role"
-(cd "$disc/role" && CLAUDE_CODE_SESSION_ID=sess-1 "$bridger" register worker >/dev/null)
+(cd "$disc/role" && CLAUDE_CODE_SESSION_ID=sess-1 "$bridger" register roleworker >/dev/null)
 # A live holder (a running watcher keeps the heartbeat fresh) refuses a 2nd claim.
 (cd "$disc/role"; exec env CLAUDE_CODE_SESSION_ID=sess-1 "$bridger" wait --follow >/dev/null 2>&1) &
 watcher=$!
-await_listening worker || fail "watcher never came up for peer worker"
-if (cd "$disc/role" && CLAUDE_CODE_SESSION_ID=sess-2 "$bridger" register worker >/dev/null 2>&1); then
+await_listening roleworker || fail "watcher never came up for peer roleworker"
+if (cd "$disc/role" && CLAUDE_CODE_SESSION_ID=sess-2 "$bridger" register roleworker >/dev/null 2>&1); then
   kill "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true
   fail "a name held by a live session must be refused"
 fi
 kill "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true
 # Holder gone (heartbeat forced stale): a second session reclaims the name.
-: > "$BRIDGER_ROOT/peers/worker.beat"; touch -t 202001010000 "$BRIDGER_ROOT/peers/worker.beat"
-(cd "$disc/role" && CLAUDE_CODE_SESSION_ID=sess-2 "$bridger" register worker >/dev/null) \
+: > "$BRIDGER_ROOT/peers/roleworker.beat"; touch -t 202001010000 "$BRIDGER_ROOT/peers/roleworker.beat"
+(cd "$disc/role" && CLAUDE_CODE_SESSION_ID=sess-2 "$bridger" register roleworker >/dev/null) \
   || fail "a dead holder's name must be reclaimable"
-[ "$(cd "$disc/role" && CLAUDE_CODE_SESSION_ID=sess-2 "$bridger" whoami)" = "worker" ] \
+[ "$(cd "$disc/role" && CLAUDE_CODE_SESSION_ID=sess-2 "$bridger" whoami)" = "roleworker" ] \
   || fail "takeover must bind the name to the reclaiming session"
 pass "same name: live holder refused, dead holder taken over"
+
+# --- a register that is REFUSED must not have destroyed anything first -------
+# The rename block ran before the refusal, so a register that was going to be
+# rejected had already `rm -f`'d the caller's own peer record: the session ended
+# up with no identity at all, its old name gone from the bus, and every peer that
+# knew it by that name got "unknown peer". Decide first, then mutate.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  rf="$work/refused"; mkdir -p "$rf/a" "$rf/b"
+  (cd "$rf/a" && CLAUDE_CODE_SESSION_ID=rs1 "$bridger" register keeper >/dev/null)
+  (cd "$rf/b" && CLAUDE_CODE_SESSION_ID=rs2 "$bridger" register taken >/dev/null)
+  (cd "$rf/b"; exec env CLAUDE_CODE_SESSION_ID=rs2 "$bridger" wait --follow >/dev/null 2>&1) &
+  rw=$!
+  await_listening taken || { kill "$rw" 2>/dev/null; fail "watcher never came up for peer taken"; }
+  if (cd "$rf/a" && CLAUDE_CODE_SESSION_ID=rs1 "$bridger" register taken >/dev/null 2>&1); then
+    kill "$rw" 2>/dev/null || true; wait "$rw" 2>/dev/null || true
+    fail "a name held by a live session must be refused"
+  fi
+  kill "$rw" 2>/dev/null || true; wait "$rw" 2>/dev/null || true
+  [ "$(cd "$rf/a" && CLAUDE_CODE_SESSION_ID=rs1 "$bridger" whoami 2>/dev/null)" = "keeper" ] \
+    || fail "a refused register deleted the caller's own registration"
+  pass "a refused register leaves the caller's own name intact"
+  rm -rf "$BRIDGER_ROOT"
+)
+
+# --- a name registered elsewhere is somebody's address, not a free string ----
+# `register` compared only the session id and the heartbeat, never the recorded
+# directory, so any session could rebind a name held by a peer that simply had no
+# watcher running — which the plugin's own docs call an ordinary state. That
+# silently redirected every queued message and every future send to the taker,
+# while the previous holder kept its $PWD, kept working, and never received
+# again. The inherited summary made the listing look unchanged.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  tk="$work/takeover"; mkdir -p "$tk/home" "$tk/elsewhere" "$tk/sender"
+  (cd "$tk/home" && CLAUDE_CODE_SESSION_ID=ts1 "$bridger" register holder >/dev/null)
+  (cd "$tk/sender" && CLAUDE_CODE_SESSION_ID=ts2 "$bridger" register sender >/dev/null)
+  (cd "$tk/sender" && CLAUDE_CODE_SESSION_ID=ts2 "$bridger" send holder chat "for the holder" >/dev/null 2>&1)
+
+  if (cd "$tk/elsewhere" && CLAUDE_CODE_SESSION_ID=ts3 "$bridger" register holder >/dev/null 2>&1); then
+    fail "a queued peer's name was taken over from another directory"
+  fi
+  [ "$(cd "$tk/home" && CLAUDE_CODE_SESSION_ID=ts1 "$bridger" whoami)" = "holder" ] \
+    || fail "the original holder lost its identity to a takeover"
+  grep -q "for the holder" <<<"$(cd "$tk/home" && CLAUDE_CODE_SESSION_ID=ts1 "$bridger" poll)" \
+    || fail "the original holder lost its queued mail to a takeover"
+
+  # A caller with NO session id skipped the live-holder refusal entirely, and
+  # write_peer then kept the victim's session id on a record pointing at the
+  # taker's directory — so the bus reported the name as live and held while its
+  # watcher, still running, delivered nothing to anyone ever again.
+  (cd "$tk/home"; exec env CLAUDE_CODE_SESSION_ID=ts1 "$bridger" wait --follow >/dev/null 2>&1) &
+  tw=$!
+  await_listening holder || { kill "$tw" 2>/dev/null; fail "watcher never came up for peer holder"; }
+  if (cd "$tk/elsewhere" && env -u CLAUDE_CODE_SESSION_ID -u BRIDGER_SESSION_ID \
+        "$bridger" register holder >/dev/null 2>&1); then
+    kill "$tw" 2>/dev/null || true; wait "$tw" 2>/dev/null || true
+    fail "a caller with no session id took a name held by a live watcher"
+  fi
+  # Same directory, same hole: two sessions sharing one folder is a documented
+  # arrangement, so the id-less claim has to be refused there too — and there the
+  # directory check above cannot help, because the directory matches.
+  if (cd "$tk/home" && env -u CLAUDE_CODE_SESSION_ID -u BRIDGER_SESSION_ID \
+        "$bridger" register holder >/dev/null 2>&1); then
+    kill "$tw" 2>/dev/null || true; wait "$tw" 2>/dev/null || true
+    fail "a caller with no session id took a listening name in its own directory"
+  fi
+  kill "$tw" 2>/dev/null || true; wait "$tw" 2>/dev/null || true
+
+  # And the documented reclaim must still work: `missing` is the one status that
+  # is evidence the holder is gone, so a deleted worktree can still be taken.
+  rm -rf "$tk/home"
+  (cd "$tk/elsewhere" && CLAUDE_CODE_SESSION_ID=ts3 "$bridger" register holder >/dev/null) \
+    || fail "a name whose directory is gone must still be reclaimable"
+  pass "a name registered to another directory cannot be silently taken"
+  rm -rf "$BRIDGER_ROOT"
+)
+
+# --- concurrent registration on a bus that has ever seen a `leave` -----------
+# optout_remove wrote a FIXED "<file>.tmp" shared by every concurrent writer: the
+# winner renamed it away and each loser's `mv` failed with ENOENT. That mv was
+# the last command of the function, which is the one shape where bash 3.2's
+# errexit fires in the CALLER — so `register` died before write_peer and the
+# session never joined the bus, reporting only an mv error that says nothing
+# about registration. Measured at 64% of registrations lost.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  cr="$work/concreg"; mkdir -p "$cr"
+  mkdir -p "$BRIDGER_ROOT/peers"
+  for i in 1 2 3 4; do mkdir -p "$cr/c$i"; echo "/opted-out/$i" >> "$BRIDGER_ROOT/optout"; done
+  for i in 1 2 3 4; do
+    (cd "$cr/c$i" && CLAUDE_CODE_SESSION_ID="cs$i" "$bridger" register "cz$i" >/dev/null 2>&1) &
+  done
+  wait
+  n=$(ls "$BRIDGER_ROOT/peers"/*.json 2>/dev/null | grep -c . || true)
+  [ "$n" -eq 4 ] || fail "concurrent registration lost $((4 - n)) of 4 registrations"
+  [ "$(grep -c . "$BRIDGER_ROOT/optout" || true)" -eq 4 ] \
+    || fail "concurrent registration destroyed entries in the opt-out list"
+  pass "concurrent registration does not lose registrations or the opt-out list"
+  rm -rf "$BRIDGER_ROOT"
+)
 
 # --- no cross-session name adoption (the "wrong role" bug) -------------------
 # A directory that accumulated peers from earlier sessions must not hand its

@@ -135,11 +135,23 @@ optout_add() { # dir
 }
 
 optout_remove() { # dir
-  local f
+  local f tmp
   f=$(optout_file)
   [ -f "$f" ] || return 0
-  grep -vxF "$1" "$f" > "$f.tmp" || true
-  mv "$f.tmp" "$f"
+  # Unique temp name, like write_peer and a message send — a FIXED "<file>.tmp"
+  # is shared by every concurrent writer. The winner renames it away and each
+  # loser's `mv` then fails with ENOENT; because that mv was the LAST command of
+  # this function, it is the one shape where bash 3.2's errexit fires in the
+  # CALLER, so `register` died here, before write_peer, and the session never
+  # joined the bus at all. Measured on a bus that had ever seen one `leave`
+  # (which is what creates this file): 8 concurrent registers, 64% lost.
+  tmp=$(mktemp "$f.XXXXXX") || return 0
+  grep -vxF "$1" "$f" > "$tmp" || true
+  # Failing to rewrite an advisory list must not abort a registration. Losing a
+  # removal is safe — the directory stays opted out and the next register or
+  # join takes it out again — where losing the registration is not.
+  mv "$tmp" "$f" || rm -f "$tmp"
+  return 0
 }
 
 # A peer is "listening" while its watcher keeps the heartbeat fresh AND its
@@ -526,7 +538,14 @@ write_peer() { # name dir
   if [ -f "$(peer_file "$name")" ]; then
     summary=$(jq -r '.summary // ""' "$(peer_file "$name")")
     created=$(jq -r '.created // empty' "$(peer_file "$name")")
-    [ -n "$session" ] || session=$(jq -r '.session // ""' "$(peer_file "$name")")
+    # Inherit the recorded session id ONLY while the directory is unchanged. A
+    # record whose cwd is being rewritten is being handed to a different
+    # session, and keeping the old id there made the new record claim to BE the
+    # previous holder — so the peer read as live and held, by a session that no
+    # longer had anything to do with it.
+    [ -n "$session" ] \
+      || [ "$(jq -r '.cwd // ""' "$(peer_file "$name")")" != "$dir" ] \
+      || session=$(jq -r '.session // ""' "$(peer_file "$name")")
     [ -n "$created" ] || created=$(now_utc)
   fi
   mkdir -p "$BRIDGER_ROOT/peers"
@@ -564,12 +583,47 @@ peer_has_history() { # name
 }
 
 cmd_register() {
-  local name="${1:-}" dir="${2:-$PWD}" sid mine existing holder
+  local name="${1:-}" dir="${2:-$PWD}" sid mine existing holder prev status
   [ -n "$name" ] || die "usage: bridger register <name> [dir]"
   valid_name "$name" || die "invalid name '$name' (lowercase letters, digits, single dashes; max 32 chars)"
   [ -d "$dir" ] || die "no such directory: $dir"
   dir=$(cd "$dir" && pwd)
   sid=$(session_id)
+
+  # DECIDE BEFORE DESTROYING. Both refusals below used to sit AFTER the two
+  # `rm -f` blocks, so a register that was about to be refused had already
+  # deleted the caller's own registration: the session was left with no identity
+  # at all, its old name gone from the bus, and everyone who knew it by that name
+  # got "unknown peer". Nothing here writes; it only decides.
+  if [ -f "$(peer_file "$name")" ]; then
+    holder=$(jq -r '.session // ""' "$(peer_file "$name")")
+    status=$(peer_status "$name")
+
+    # Same name, a DIFFERENT session, still live: refuse rather than let two
+    # sessions share one mailbox (they would race on the same read cursor). A
+    # dead holder (stale heartbeat) is taken over — how a restart reclaims a
+    # role. There is deliberately no `[ -n "$sid" ]` test: a caller with no
+    # session id — a plain shell, a script, a cron job, any wrapper that does not
+    # export one — is exactly the caller that must not be able to override a
+    # watcher that is demonstrably running.
+    if [ -n "$holder" ] && [ "$holder" != "$sid" ] && [ "$status" = "listening" ]; then
+      die "'$name' is held by a live session — stop it or pick another name"
+    fi
+
+    # A name registered to ANOTHER directory is somebody else's address. Taking
+    # it silently redirects every queued message and every future send to this
+    # session, while the previous holder keeps its own $PWD, keeps working, and
+    # simply never receives again — its summary is even inherited, so the
+    # listing looks unchanged. `missing` is the one status that is real evidence
+    # the old holder is gone (its directory is provably absent AND no watcher is
+    # running for the name), which is what keeps reclaiming a deleted worktree
+    # working; and a session may always rebind its own name.
+    prev=$(peer_cwd "$name" || true)
+    if [ -n "$prev" ] && [ "$prev" != "$dir" ] && [ "$status" != "missing" ] \
+       && ! { [ -n "$sid" ] && [ "$holder" = "$sid" ]; }; then
+      die "'$name' is registered to $prev — run 'bridger reap' there first, or pick another name"
+    fi
+  fi
 
   # A clean rename of MY OWN identity in this directory: drop the old name so a
   # session answers to exactly one. Refused when that name has a thread — its
@@ -592,17 +646,6 @@ cmd_register() {
      && [ -z "$(jq -r '.session // ""' "$(peer_file "$existing")")" ] \
      && ! peer_has_history "$existing"; then
     rm -f "$(peer_file "$existing")" "$(beat_file "$existing")"
-  fi
-
-  # Same name, a DIFFERENT session, still live: refuse rather than let two
-  # sessions share one mailbox (they would race on the same read cursor). A
-  # dead holder (stale heartbeat) is taken over — how a restart reclaims a role.
-  if [ -f "$(peer_file "$name")" ]; then
-    holder=$(jq -r '.session // ""' "$(peer_file "$name")")
-    if [ -n "$sid" ] && [ -n "$holder" ] && [ "$holder" != "$sid" ] \
-       && [ "$(peer_status "$name")" = "listening" ]; then
-      die "'$name' is held by a live session — stop it or pick another name"
-    fi
   fi
 
   optout_remove "$dir"   # naming a directory is an explicit opt-in
