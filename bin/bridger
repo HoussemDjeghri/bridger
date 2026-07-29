@@ -320,9 +320,20 @@ unread_in_thread() {
       # Every other failure (2 = cannot open: EACCES, a revoked mount, EIO) is
       # transient. The message is intact and reads fine next time, so we must
       # NOT skip it: advance_cursor would mark it delivered and destroy a
-      # perfectly good message. Wedging here is the safe half of the trade — it
-      # clears itself the moment the file is readable again.
-      [ "$rc" -eq 5 ] || die "cannot read $f — refusing to advance the cursor past it"
+      # perfectly good message. Stop the scan here instead — it clears itself the
+      # moment the file is readable again.
+      #
+      # Report the seq through a file rather than a variable or `die`. A variable
+      # cannot come back: the render path runs this in a pipeline, so it is a
+      # subshell. And `die` is `exit`, which on the ONE call shape that is not a
+      # pipeline (`poll --json`, what `ask` drains through) killed the whole
+      # process — every thread sorting after the faulty one was then never polled
+      # at all. The caller needs the seq to know how far it may still advance.
+      if [ "$rc" -ne 5 ]; then
+        echo "bridger: cannot read $f — not advancing the cursor past it" >&2
+        [ -z "${BRIDGER_WEDGE_FILE:-}" ] || echo "$s" > "$BRIDGER_WEDGE_FILE"
+        return 1
+      fi
       echo "bridger: message $f is unparseable — skipped" >&2
     fi
   done
@@ -908,12 +919,20 @@ cmd_poll() {
     shift
   done
   me=$(require_identity)
-  local top rc failed=0
+  # `local` is enough for unread_in_thread to see it: bash scopes dynamically,
+  # so a callee reads its caller's locals — and it keeps the name from leaking
+  # back into the watcher loop that calls this.
+  local top rc failed=0 wedge BRIDGER_WEDGE_FILE
+  # One scratch file for the whole call: unread_in_thread reports the seq it
+  # stopped at through it (see there for why it cannot be a variable).
+  BRIDGER_WEDGE_FILE=$(mktemp "${TMPDIR:-/tmp}/bridger-wedge.XXXXXX")
+  trap 'rm -f "$BRIDGER_WEDGE_FILE"' RETURN
   for peer in $(other_peers "$me"); do
     dir=$(thread_dir "$me" "$peer")
     [ -d "$dir" ] || continue
     top=$(max_seq "$dir")
     rc=0
+    : > "$BRIDGER_WEDGE_FILE"
     if [ "$json" -eq 1 ]; then
       unread_in_thread "$dir" "$me" "$top" || rc=$?
     else
@@ -932,8 +951,34 @@ cmd_poll() {
     # Keep serving the other threads, but remember the failure: a caller that
     # asked to consume must still learn that one thread could not be read, and
     # the CLI's exit status is the only channel for that.
-    [ "$rc" -eq 0 ] || { failed=1; continue; }
-    [ "$peek" -eq 1 ] || advance_cursor "$dir" "$me" "$top"
+    if [ "$rc" -ne 0 ]; then
+      failed=1
+      wedge=$(cat "$BRIDGER_WEDGE_FILE" 2>/dev/null || true)
+      case "$wedge" in ''|*[!0-9]*) continue ;; esac
+      # Advance to just BEFORE the message that could not be read. Refusing to
+      # advance at all was the first version of this fix, and it was its own
+      # bug: everything before the fault was re-delivered on every 0.5s watcher
+      # tick, forever, because the cursor never moved. Stopping one short keeps
+      # the guarantee that matters — nothing at or behind the fault is marked
+      # read — while delivering what came before it exactly once.
+      [ "$peek" -eq 1 ] || advance_cursor "$dir" "$me" "$((wedge - 1))"
+      # Say so where the agent will actually see it. stderr does not reach a
+      # session — only the watcher's stdout re-invokes one — and a permanent
+      # fault (a directory or a root-owned file at NNNNN.json) otherwise stops
+      # this thread forever with nothing said on the channel that could act on
+      # it. Keyed to the seq on disk so it is one line per fault, not one per
+      # tick. --json is exempt: `ask` parses that stream.
+      if [ "$peek" -eq 0 ] && [ "$json" -eq 0 ] \
+         && [ "$(cat "$dir/wedge-$me" 2>/dev/null || true)" != "$wedge" ]; then
+        echo "$wedge" > "$dir/wedge-$me"
+        echo "bridger: the thread with $peer is stuck at message $wedge and will deliver nothing past it until that message file in $dir is readable or removed."
+      fi
+      continue
+    fi
+    if [ "$peek" -eq 0 ]; then
+      [ -f "$dir/wedge-$me" ] && rm -f "$dir/wedge-$me"
+      advance_cursor "$dir" "$me" "$top"
+    fi
   done
   return "$failed"
 }

@@ -90,8 +90,10 @@ An `ask` that times out is the same signal in blocking form. Don't re-ask.
 ## Asking a peer
 
 `bridger ask <peer> "<question>" --timeout 120` blocks until the matching
-reply (ref == your ask's seq) and prints it. While waiting, unrelated
-consumed messages are echoed to stderr — handle them after the ask resolves.
+reply — from that peer, with ref == your ask's seq — and prints it. Both
+halves are required, so another peer answering with the same ref cannot
+satisfy your ask. While waiting, unrelated consumed messages are echoed to
+stderr — handle them after the ask resolves.
 
 ## Automate this — recognize the pattern, then act without being asked
 

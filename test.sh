@@ -1166,6 +1166,79 @@ if [ "$(id -u)" -ne 0 ]; then
 )
 fi
 
+# --- wedging must not become an infinite replay of everything before it ------
+# The first version of the fix above refused to advance the cursor AT ALL on a
+# failed read. For a transient fault that is fine, but a permanent one (a
+# DIRECTORY named NNNNN.json, a root-owned file — jq exits 2 and never stops
+# doing so) then re-delivered every message before the fault on every 0.5s
+# watcher tick, forever: measured at ~2 deliveries/second, and each line of
+# watcher stdout re-invokes the agent. Trading silent loss for an unbounded
+# replay storm is not a fix. The cursor must stop one short of the fault.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  rp="$work/replay"; mkdir -p "$rp/a" "$rp/b"
+  "$bridger" register rsend "$rp/a" >/dev/null
+  "$bridger" register rrecv "$rp/b" >/dev/null
+  (cd "$rp/a" && "$bridger" send rrecv chat before-the-fault >/dev/null 2>&1)
+  rtd="$BRIDGER_ROOT/threads/rrecv--rsend"
+  [ -d "$rtd" ] || rtd="$BRIDGER_ROOT/threads/rsend--rrecv"
+  mkdir "$rtd/00002.json"          # permanent: jq can never read a directory
+  (cd "$rp/a" && "$bridger" send rrecv chat behind-the-fault >/dev/null 2>&1)
+
+  first=$(cd "$rp/b" && "$bridger" poll 2>/dev/null || true)
+  grep -q "before-the-fault" <<<"$first" \
+    || fail "the message before a permanent fault was never delivered (got: $first)"
+  second=$(cd "$rp/b" && "$bridger" poll 2>/dev/null || true)
+  grep -q "before-the-fault" <<<"$second" \
+    && fail "a message before a permanent fault is re-delivered on every poll — replay storm"
+
+  # The agent only ever sees stdout; the watcher's stderr reaches nobody. A
+  # thread that will never deliver again has to say so on the channel that can
+  # act on it — once per fault, not once per tick.
+  grep -q "stuck at message 2" <<<"$first" \
+    || fail "a permanently wedged thread said nothing on stdout (got: $first)"
+  grep -q "stuck at message 2" <<<"$second" \
+    && fail "the wedge notice repeats on every poll instead of once per fault"
+
+  rmdir "$rtd/00002.json"
+  third=$(cd "$rp/b" && "$bridger" poll 2>/dev/null || true)
+  grep -q "behind-the-fault" <<<"$third" \
+    || fail "the message behind the fault was lost once the fault cleared (got: $third)"
+  pass "a permanent fault wedges once and replays nothing"
+  rm -rf "$BRIDGER_ROOT"
+)
+fi
+
+# --- one unreadable thread must not abort the whole --json poll --------------
+# `unread_in_thread` signalled refusal with `die`, i.e. exit. In the render path
+# it runs in a pipeline, so that only killed the subshell and the loop went on
+# to the next peer. `poll --json` calls it WITHOUT a pipeline, so the same exit
+# killed the entire process: every thread sorting after the faulty one was never
+# polled at all. `ask` drains through `poll --json`, so a single unreadable file
+# in one thread silently blinded it to every other peer.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  jp="$work/jsonpoll"; mkdir -p "$jp/a" "$jp/b" "$jp/c"
+  "$bridger" register jalice "$jp/a" >/dev/null
+  "$bridger" register jbob   "$jp/b" >/dev/null
+  "$bridger" register jcarol "$jp/c" >/dev/null
+  (cd "$jp/a" && "$bridger" send jbob chat from-alice >/dev/null 2>&1)
+  (cd "$jp/c" && "$bridger" send jbob chat from-carol >/dev/null 2>&1)
+  jtd="$BRIDGER_ROOT/threads/jalice--jbob"
+  chmod 000 "$jtd/00001.json"
+
+  got=$(cd "$jp/b" && "$bridger" poll --json 2>/dev/null) && \
+    fail "poll --json must report the unreadable thread with a nonzero exit"
+  grep -q "from-carol" <<<"$got" \
+    || fail "poll --json stopped at the unreadable thread and never served the others (got: $got)"
+  chmod 644 "$jtd/00001.json"
+  pass "poll --json serves every readable thread when one is unreadable"
+  rm -rf "$BRIDGER_ROOT"
+)
+fi
+
 # --- an empty BRIDGER_ROOT must refuse, never fall back to the real bus ------
 # ${VAR:-default} treats set-but-empty as unset, so `BRIDGER_ROOT="" bridger
 # register x` silently writes into ~/.claude/bridger — someone else's live bus.

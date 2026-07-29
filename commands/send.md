@@ -18,3 +18,8 @@ padding (see the bridger skill):
 Arguments: $ARGUMENTS
 
 If the send fails because this directory has no identity, register first (`/bridger:register`). Confirm to the user that the message landed (the command prints its sequence number).
+
+A fan-out (`@all` or a comma list) prints one line per recipient — `<peer> <seq>`
+on success, `<peer> FAILED` on failure — and exits nonzero if any recipient
+failed. Read those lines before reporting: some peers can land while others do
+not, so name the ones that failed rather than confirming the message went out.
