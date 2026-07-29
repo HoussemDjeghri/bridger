@@ -283,7 +283,11 @@ max_seq() {
     # directions: poll and send both died, and because the delivery hooks do
     # `peers || exit 0` the failure was silent. Skip what is not a number; a
     # stray file is not a message.
-    stem=$(basename "$f" .json)
+    # Parameter expansion, not `basename`: this loop runs over every file in the
+    # thread on every max_seq and every unread scan, and a fork per message is
+    # what made a send into a long thread cost seconds — the scan is O(thread),
+    # and `send` does three of them, so building a backlog was quadratic.
+    stem=${f##*/}; stem=${stem%.json}
     case "$stem" in ''|*[!0-9]*) continue ;; esac
     s=$((10#$stem))
     [ "$s" -gt "$max" ] && max=$s
@@ -306,7 +310,7 @@ unread_in_thread() {
   case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
   for f in "$dir"/[0-9]*.json; do
     [ -e "$f" ] || continue
-    stem=$(basename "$f" .json)
+    stem=${f##*/}; stem=${stem%.json}   # see max_seq: no fork per message
     case "$stem" in ''|*[!0-9]*) continue ;; esac   # see max_seq: not a message
     s=$((10#$stem))
     [ "$s" -gt "$cur" ] && [ "$s" -le "$top" ] || continue
@@ -389,7 +393,7 @@ other_peers() {
   local f n
   for f in "$BRIDGER_ROOT"/peers/*.json; do
     [ -e "$f" ] || continue
-    n=$(basename "$f" .json)
+    n=${f##*/}; n=${n%.json}
     [ "$n" = "$1" ] || echo "$n"
   done
 }
