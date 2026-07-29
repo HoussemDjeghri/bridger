@@ -295,6 +295,26 @@ max_seq() {
   echo "$max"
 }
 
+# Message seqs in thread $1, ascending NUMERIC order — not the glob's
+# lexicographic one, which stops matching it the moment a seq needs a sixth
+# digit: `100000.json` sorts BEFORE `99998.json`. Two things depend on the
+# difference. Delivery order, obviously. And, less obviously, poll's wedge: it
+# advances the cursor to `wedge - 1`, which is only sound while everything the
+# scan emitted sorts below the message it stopped at. Out of order, a scan that
+# met an unreadable 100000 first reported a wedge above 99998 and 99999, and
+# poll then marked both read without ever delivering them.
+# One `sort` per scan, not per message — 46e10c8 removed the per-message fork
+# because a send into a long thread was quadratic; keep it that way.
+sorted_stems() { # thread_dir
+  local f stem
+  for f in "$1"/[0-9]*.json; do
+    [ -e "$f" ] || continue
+    stem=${f##*/}; stem=${stem%.json}
+    case "$stem" in ''|*[!0-9]*) continue ;; esac   # see max_seq: not a message
+    echo "$stem"
+  done | sort -n
+}
+
 # Print unread messages addressed to $2 in thread $1, one compact JSON per
 # line, considering only seqs up to $3. The caller snapshots that bound with
 # max_seq ONCE and reuses it for advance_cursor: scanning and cursor-writing
@@ -308,10 +328,9 @@ unread_in_thread() {
   # can catch it empty, and `[ "$s" -gt "" ]` would then skip every message and
   # still move the cursor to the top — silent, permanent, unrecoverable loss.
   case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
-  for f in "$dir"/[0-9]*.json; do
-    [ -e "$f" ] || continue
-    stem=${f##*/}; stem=${stem%.json}   # see max_seq: no fork per message
-    case "$stem" in ''|*[!0-9]*) continue ;; esac   # see max_seq: not a message
+  # Digits only, so word splitting here is safe.
+  for stem in $(sorted_stems "$dir"); do
+    f="$dir/$stem.json"
     s=$((10#$stem))
     [ "$s" -gt "$cur" ] && [ "$s" -le "$top" ] || continue
     # A zero-byte message reads as "no output, exit 0" — indistinguishable, to
@@ -355,8 +374,35 @@ unread_in_thread() {
   done
 }
 
+# Record how far $2 has read in thread $1. Nonzero when the position could not
+# be written, which the caller must handle rather than leave to errexit: a
+# thread directory that is merely not writable (a read-only mount, a bus
+# restored without write bits, a root shared between two uids) used to abort
+# cmd_poll mid-loop on a bare redirection failure, so every peer sorting after
+# it was never polled at all — deterministically, on every call — and the
+# watcher, where errexit is laundered by `out=$(cmd_poll)`, instead re-delivered
+# the same messages ~2x/second forever. Both are the failure modes the
+# unreadable-MESSAGE hardening above already takes seriously; nothing guarded
+# the cursor WRITE.
 advance_cursor() { # thread_dir me top
-  if [ "$3" -gt 0 ]; then echo "$3" > "$1/cursor-$2"; fi
+  [ "$3" -gt 0 ] || return 0
+  # Group-redirect, because a failing `>` is reported by the shell BEFORE the
+  # command's own `2>` is applied: `echo … > file 2>/dev/null` still leaks a raw
+  # `bin/bridger: line N: …: Permission denied` at the user.
+  { echo "$3" > "$1/cursor-$2"; } 2>/dev/null && return 0
+  echo "bridger: cannot record the read position in $1 — its messages will repeat until it is writable" >&2
+  return 1
+}
+
+# Same reason the wedge notice exists: stderr reaches no session, so a permanent
+# fault has to be said on stdout or no agent can act on it. Unlike the wedge
+# notice this one cannot be de-duplicated — the marker that would do it lives in
+# the directory we just failed to write — so it repeats at the caller's poll
+# rate, as do the messages themselves, there being nowhere to record that they
+# were delivered.
+unwritable_thread_notice() { # peer thread_dir json
+  [ "$3" -eq 0 ] || return 0   # --json is a parsed stream: `ask` drains it
+  echo "bridger: the thread with $1 is not writable, so its messages will repeat on every poll until that is fixed: $2"
 }
 
 # Is this message file safe to render? For the history readers (`log`, `mirror`)
@@ -1047,7 +1093,11 @@ cmd_poll() {
   local top rc failed=0 wedge BRIDGER_WEDGE_FILE
   # One scratch file for the whole call: unread_in_thread reports the seq it
   # stopped at through it (see there for why it cannot be a variable).
-  BRIDGER_WEDGE_FILE=$(mktemp "${TMPDIR:-/tmp}/bridger-wedge.XXXXXX")
+  # In the bus root, not TMPDIR: the root has to be writable for the bus to work
+  # at all, whereas keying delivery to TMPDIR added a second dependency that
+  # stopped every poll with a bare `mktemp: mkstemp failed` and no hint that the
+  # bus was involved.
+  BRIDGER_WEDGE_FILE=$(mktemp "$BRIDGER_ROOT/.wedge.XXXXXX")
   trap 'rm -f "$BRIDGER_WEDGE_FILE"' RETURN
   for peer in $(other_peers "$me"); do
     dir=$(thread_dir "$me" "$peer")
@@ -1083,7 +1133,10 @@ cmd_poll() {
       # tick, forever, because the cursor never moved. Stopping one short keeps
       # the guarantee that matters — nothing at or behind the fault is marked
       # read — while delivering what came before it exactly once.
-      [ "$peek" -eq 1 ] || advance_cursor "$dir" "$me" "$((wedge - 1))"
+      if [ "$peek" -eq 0 ] && ! advance_cursor "$dir" "$me" "$((wedge - 1))"; then
+        unwritable_thread_notice "$peer" "$dir" "$json"
+        continue
+      fi
       # Say so where the agent will actually see it. stderr does not reach a
       # session — only the watcher's stdout re-invokes one — and a permanent
       # fault (a directory or a root-owned file at NNNNN.json) otherwise stops
@@ -1092,14 +1145,20 @@ cmd_poll() {
       # tick. --json is exempt: `ask` parses that stream.
       if [ "$peek" -eq 0 ] && [ "$json" -eq 0 ] \
          && [ "$(cat "$dir/wedge-$me" 2>/dev/null || true)" != "$wedge" ]; then
-        echo "$wedge" > "$dir/wedge-$me"
         echo "bridger: the thread with $peer is stuck at message $wedge and will deliver nothing past it until that message file in $dir is readable or removed."
+        # After the line, not before: if the marker cannot be written the notice
+        # simply repeats next tick, which is the harmless direction. Failing to
+        # write it must not cost the notice itself.
+        echo "$wedge" > "$dir/wedge-$me" 2>/dev/null || true
       fi
       continue
     fi
     if [ "$peek" -eq 0 ]; then
       [ -f "$dir/wedge-$me" ] && rm -f "$dir/wedge-$me"
-      advance_cursor "$dir" "$me" "$top"
+      if ! advance_cursor "$dir" "$me" "$top"; then
+        failed=1
+        unwritable_thread_notice "$peer" "$dir" "$json"
+      fi
     fi
   done
   return "$failed"

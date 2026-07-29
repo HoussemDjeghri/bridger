@@ -1423,6 +1423,103 @@ if [ "$(id -u)" -ne 0 ]; then
 )
 fi
 
+# --- a wedge may not consume a message it never delivered ---------------------
+# `advance_cursor "$((wedge - 1))"` is only sound while the scan runs in ASCENDING
+# NUMERIC order. The glob sorts lexicographically, and the two stop agreeing at
+# six digits: `100000.json` sorts before `99998.json`. The scan then met the
+# fault first, reported a wedge ABOVE two perfectly good messages, and poll
+# marked both read without ever emitting them — silent loss on any bus that has
+# simply been used long enough, no corruption required. Same fixture pins
+# delivery ORDER past 99999.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  op="$work/order"; mkdir -p "$op/a" "$op/b"
+  "$bridger" register osend "$op/a" >/dev/null
+  "$bridger" register orecv "$op/b" >/dev/null
+  otd="$BRIDGER_ROOT/threads/orecv--osend"   # thread_dir sorts the pair
+  mkdir -p "$otd"
+  for s in 99998 99999 100001; do
+    jq -n --argjson s "$s" \
+      '{seq:$s,from:"osend",to:"orecv",type:"chat",
+        body:("body-"+($s|tostring)),ts:"2026-01-01T00:00:00Z"}' > "$otd/$s.json"
+  done
+  mkdir "$otd/100000.json"          # permanent: jq can never read a directory
+
+  got=$(cd "$op/b" && "$bridger" poll 2>/dev/null || true)
+  grep -q "body-99998" <<<"$got" \
+    || fail "a wedge consumed message 99998 without delivering it (got: $got)"
+  grep -q "body-99999" <<<"$got" \
+    || fail "a wedge consumed message 99999 without delivering it (got: $got)"
+  grep -q "body-100001" <<<"$got" \
+    && fail "poll delivered a message from behind a wedge"
+
+  rmdir "$otd/100000.json"
+  jq -n '{seq:100000,from:"osend",to:"orecv",type:"chat",
+          body:"body-100000",ts:"2026-01-01T00:00:00Z"}' > "$otd/100000.json"
+  rest=$(cd "$op/b" && "$bridger" poll 2>/dev/null || true)
+  [ "$(grep -c 'body-' <<<"$rest")" -eq 2 ] \
+    || fail "clearing the fault did not deliver exactly the two remaining messages (got: $rest)"
+  grep -q 'body-100000' <<<"$(sed -n 1p <<<"$rest")" \
+    || fail "six-digit seqs deliver out of send order (got: $rest)"
+  pass "a six-digit seq breaks neither delivery order nor the wedge bound"
+  rm -rf "$BRIDGER_ROOT"
+)
+
+# --- an unwritable thread must not hide every peer behind it ------------------
+# All the hardening above is about a message that cannot be READ. Nothing
+# guarded the cursor WRITE: `advance_cursor` was a bare redirection, so a thread
+# directory that is merely not writable (a read-only mount, a bus restored
+# without write bits, a root shared between two uids) aborted cmd_poll mid-loop
+# under errexit. The CLI then never polled any peer sorting after it — on every
+# call, not once — while the watcher, where `out=$(cmd_poll)` launders errexit,
+# re-delivered the same messages forever. One directory permission reproduced
+# both of the failure modes this file already has tests for.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  up="$work/unwritable"; mkdir -p "$up/a" "$up/b" "$up/c"
+  "$bridger" register ua "$up/a" >/dev/null
+  "$bridger" register ub "$up/b" >/dev/null
+  "$bridger" register uc "$up/c" >/dev/null
+  (cd "$up/a" && "$bridger" send ub chat from-ua >/dev/null 2>&1)
+  (cd "$up/c" && "$bridger" send ub chat from-uc >/dev/null 2>&1)
+  chmod 555 "$BRIDGER_ROOT/threads/ua--ub"
+
+  err="$up/poll.err"
+  out=$(cd "$up/b" && "$bridger" poll 2>"$err" || true)
+  grep -q "from-uc" <<<"$out" \
+    || fail "an unwritable thread hid every peer sorting after it (got: $out)"
+  grep -q "not writable" <<<"$out" \
+    || fail "an unwritable thread said nothing an agent could act on (got: $out)"
+  grep -q "cannot record the read position" "$err" \
+    || fail "a cursor that could not be written was not reported (stderr: $(cat "$err"))"
+  # The raw shell diagnostic is not a diagnostic: it names a line number in
+  # bin/bridger and says nothing about the bus.
+  grep -q "Permission denied" "$err" \
+    && fail "poll leaked a raw shell redirection error at the user (stderr: $(cat "$err"))"
+
+  again=$(cd "$up/b" && "$bridger" poll 2>/dev/null || true)
+  grep -q "from-uc" <<<"$again" \
+    && fail "a healthy thread was re-delivered because another thread was unwritable"
+  pass "an unwritable thread neither blinds poll nor replays its healthy peers"
+
+  # Same directory, fault at seq 1: there advance_cursor writes nothing at all
+  # (`wedge - 1` is 0), so the only thing that can still abort the loop is the
+  # wedge notice's own marker — which lives in the directory we cannot write.
+  utd="$BRIDGER_ROOT/threads/ua--ub"
+  chmod 755 "$utd"
+  rm -f "$utd/00001.json"; mkdir "$utd/00001.json"
+  chmod 555 "$utd"
+  (cd "$up/c" && "$bridger" send ub chat second-from-uc >/dev/null 2>&1)
+  out2=$(cd "$up/b" && "$bridger" poll 2>/dev/null || true)
+  grep -q "second-from-uc" <<<"$out2" \
+    || fail "a thread wedged at seq 1 in an unwritable directory hid the peers behind it (got: $out2)"
+  chmod 755 "$utd"
+  pass "an unwritable directory cannot abort poll through the wedge notice either"
+  rm -rf "$BRIDGER_ROOT"
+)
+fi
+
 # --- one unreadable thread must not abort the whole --json poll --------------
 # `unread_in_thread` signalled refusal with `die`, i.e. exit. In the render path
 # it runs in a pipeline, so that only killed the subshell and the loop went on
