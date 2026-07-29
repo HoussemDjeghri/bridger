@@ -159,6 +159,12 @@ not at all. So also:
 - `bridger peers` — who is addressable: name, live status (`listening` /
   `queued` — both receive), directory, branch, self-set summary. The bridger is
   opt-in: only registered directories appear.
+- `missing` is `queued` plus two facts: that peer's registered directory no
+  longer exists, and no watcher process is running for the name.
+  It is still addressable and still receives — it may be a
+  session reading from the removed path — so keep treating it as a normal peer.
+  Usually it is a leftover registration from a deleted worktree; `bridger reap`
+  lists those with what they still hold, `bridger reap --force` drops them.
 - `bridger summary "<one line>"` — describe what this session is doing so
   other agents pick the right peer.
 - `bridger status` — identity, peers, unread counts.

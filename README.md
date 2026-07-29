@@ -417,6 +417,16 @@ No. The status column measures one thing: whether that peer's watcher process is
 </details>
 
 <details>
+<summary><strong>A peer shows <code>missing</code> — what happened?</strong></summary>
+<br>
+Its registered directory no longer exists, and no watcher process is running for the name — a worktree that was deleted, a checkout that was moved. That is all the status claims; a watcher still running keeps the peer <code>queued</code>, because someone is demonstrably there. The peer is still addressable and still receives — this is <code>queued</code> with those extra facts attached, not a verdict that anything is dead.
+<br><br>
+It deliberately isn't a reachability signal, because it can't be one. A process keeps its working directory when that directory is unlinked, so a session whose worktree was removed goes on resolving its name, polling, and sending perfectly well. If it armed a watcher it still reads as <code>listening</code>; if it never armed one — which this bus treats as ordinary — nothing distinguishes it from a session that closed for good. So nothing routes on <code>missing</code>: <code>@all</code> still reaches it and <code>ask</code> still waits for it.
+<br><br>
+In practice it is a leftover registration. <code>bridger reap</code> lists them with how much unread mail each still holds; <code>bridger reap --force</code> drops them, keeping their threads on disk as history exactly as <code>bridger leave</code> does. Removal is never automatic, and stays a judgement call on those unread counts: an unmounted volume looks identical to a deleted one, and a session still open in a removed directory can't be detected at all — dropping its registration strands its mail permanently, since <code>register</code> refuses a directory that isn't there.
+</details>
+
+<details>
 <summary><strong>Two sessions in the same repo — or the same branch, same folder?</strong></summary>
 <br>
 Fully supported. Each session registers its own name (<code>/bridger:register architect</code>, <code>/bridger:register executor</code>) and they talk directly — no subdirectory trick needed. Identity follows the Claude Code <em>session</em>, not the directory, so two sessions on one branch never collide. Running parallel pairs (two features at once)? Give each a distinct name, e.g. <code>role-feature</code> — <code>architect-auth</code>, <code>executor-auth</code>. A name is held by one live session at a time; a second session claiming a live name is refused, and reclaims it once the holder is gone.

@@ -74,6 +74,28 @@ def file_age(path, now):
         return None
 
 
+def dir_gone(path):
+    """Mirrors dir_gone (bin/bridger): is this path provably absent?
+
+    Not `not os.path.isdir(path)`, which is also False when a parent turned
+    untraversable and swallows the PermissionError that says so. A live session
+    may be reading inside, and `reap --force` would strand its mail. "I cannot
+    look" has to answer False, the way it does for a pid we may not signal.
+    """
+    # os.path.exists, not lexists: bash's `[ -e ]` follows symlinks, so a dangling
+    # link or a symlink loop has to answer the same on both sides. `or "."` for
+    # the same reason — dirname bottoms out at "" here and at "." in bash, and a
+    # relative cwd would otherwise disagree.
+    if not path:
+        return False
+    if os.path.exists(path):
+        return False
+    parent = os.path.dirname(path) or "."
+    while not os.path.exists(parent) and parent not in ("/", "."):
+        parent = os.path.dirname(parent) or "."
+    return os.access(parent, os.X_OK)
+
+
 def watcher_alive(beat_path):
     """Mirrors watcher_alive (bin/bridger): the beat holds the watcher's pid, so
     a death shows immediately instead of at the end of the staleness window.
@@ -83,19 +105,57 @@ def watcher_alive(beat_path):
     a session `bridger peers` calls listening.
     """
     try:
-        with open(beat_path) as handle:
-            pid = handle.readline().strip()
+        with open(beat_path, newline="") as handle:
+            pid = handle.readline().rstrip("\n")
     except OSError:
         return False
-    if not pid.isdigit():
+    # bash's `case $pid in ''|*[!0-9]*)` is the definition of numeric, matched
+    # literally. int() is looser than that in ways a beat file really hits: a
+    # sign, a `_` digit separator, or the stray \r from a bus directory synced
+    # through a Windows-aware tool all parse for int() and are rejected by the
+    # CLI. Disagreeing means claiming a watcher runs where `peers` says none
+    # does. A non-numeric beat is the pre-0.12 mtime-only case, not a fault.
+    if not re.fullmatch(r"[0-9]+", pid):
         return True
     try:
         os.kill(int(pid), 0)
-    except ProcessLookupError:
+    except (OverflowError, OSError):
+        # A pid too large for a C long raises OverflowError, and EPERM raises
+        # PermissionError. bash `kill -0` exits nonzero for both, so both are
+        # "not running" here — anything else 500s the endpoint or disagrees
+        # with bin/bridger.
         return False
+    return True
+
+
+def beat_pid_alive(beat_path):
+    """Mirrors beat_pid_alive (bin/bridger): is a watcher provably running?
+
+    Differs from watcher_alive in what it does with "cannot tell". watcher_alive
+    only refines a beat that is already fresh, so it assumes alive; this one
+    decides whether an address is DEAD, so a missing beat or a beat with no pid
+    answers False. Assuming a reader that is not there would keep a deleted
+    worktree's registration alive forever.
+    """
+    try:
+        with open(beat_path, newline="") as handle:
+            pid = handle.readline().rstrip("\n")
     except OSError:
-        # EPERM: the process exists, it just is not ours to signal.
-        return True
+        return False
+    # Same definition of numeric as watcher_alive and as bash — see there. Here
+    # a non-numeric beat answers False: this decides whether an address is dead.
+    if not re.fullmatch(r"[0-9]+", pid):
+        return False
+    # A pid too large for a C long raises OverflowError inside os.kill, which
+    # would escape and 500 the whole endpoint. Bash's `kill -0` treats it as
+    # "not a running process", so this must too.
+    try:
+        os.kill(int(pid), 0)
+    except (OverflowError, OSError):
+        # Includes EPERM. bash `kill -0` exits nonzero for a process it may not
+        # signal, so reporting True here would disagree with bin/bridger — and
+        # this answer decides what `reap` offers to delete.
+        return False
     return True
 
 
@@ -133,18 +193,37 @@ def read_peers(root, now, warnings):
         try:
             record = _load_object(path)
         except (OSError, ValueError) as err:
-            # write_peer redirects with `>` rather than tmp+mv (bin/bridger:313),
-            # so a read can land mid-write. Report it and keep serving the rest.
+            # write_peer now lands atomically, so this is a hand-edited or
+            # truncated record rather than a mid-write read. Either way it is one
+            # peer: report it and keep serving the rest.
             warnings.append("peer %s unreadable: %s" % (name, err))
             continue
         beat = os.path.join(root, "peers", name + ".beat")
         age = file_age(beat, now)
-        record["name"] = record.get("name") or name
+        # The filename is the address, matching bin/bridger's listing. Trusting
+        # .name would also carry a list or dict through to compute_metrics, whose
+        # set of names needs them hashable — one bad record, endpoint-wide 500.
+        record["name"] = name
         record["beat_age"] = age
-        # Both halves of peer_status (bin/bridger): a fresh beat AND a live pid.
-        # mtime alone would call a killed watcher "listening" for 15s more.
+        # Mirrors peer_status (bin/bridger), in its order. Liveness first: both
+        # halves of that check — a fresh beat AND a live pid, since mtime alone
+        # would call a killed watcher "listening" for 15s more. Only then
+        # "missing": the registered directory no longer exists AND no watcher
+        # process is running for the name. That is a housekeeping hint for
+        # `reap`, never a reachability verdict — such a peer may still be a live
+        # session reading from the removed path.
+        #
+        # isinstance: a hand-written record can carry a list or dict cwd, which
+        # os.path.* raises TypeError on. That escapes the _load_object except
+        # above and 500s the whole endpoint — one bad peer taking every peer,
+        # thread and metric dark. A non-string cwd is no path we can prove absent,
+        # so it stays queued, same as bin/bridger sees it.
+        cwd = record.get("cwd")
+        gone = isinstance(cwd, str) and dir_gone(cwd)
         record["status"] = ("listening"
                             if age is not None and age < BEAT_STALE_SECS and watcher_alive(beat)
+                            else "missing"
+                            if gone and not beat_pid_alive(beat)
                             else "queued")
         record["last_seen_age"] = _age_of(record.get("last_seen"), now)
         peers.append(record)
@@ -538,15 +617,30 @@ def selftest():
 
     # delta is a session that closed cleanly with nothing waiting for it: no
     # beat, no pending messages. It must not read as a fault.
+    #
+    # Every cwd here is a real directory: a peer whose directory is absent reads
+    # "missing", so pointing these at paths that happen not to exist would make
+    # the whole fixture unreachable and the status checks below vacuous.
+    worktrees = os.path.join(root, "wt")
     for name, last_seen in (("alpha", "2026-07-26T11:59:00Z"),
                             ("beta", "2026-07-26T11:58:00Z"),
                             ("delta", "2026-07-26T11:57:00Z"),
                             ("ab-", "2026-07-26T11:56:00Z"),
                             ("abc", "2026-07-26T11:56:00Z")):
+        cwd = os.path.join(worktrees, name)
+        os.makedirs(cwd)
         with open(os.path.join(peers_dir, name + ".json"), "w") as handle:
-            json.dump({"name": name, "cwd": "/tmp/" + name, "branch": "main",
+            json.dump({"name": name, "cwd": cwd, "branch": "main",
                        "summary": "", "session": name + "-sess",
                        "created": last_seen, "last_seen": last_seen}, handle)
+    # A deleted worktree: the record outlives its directory. `register` refuses a
+    # missing directory and identity resolves only from a real cwd, so this name
+    # can never be worn again — it must not read as a merely closed session.
+    with open(os.path.join(peers_dir, "vanished.json"), "w") as handle:
+        json.dump({"name": "vanished", "cwd": os.path.join(worktrees, "vanished"),
+                   "branch": "main", "summary": "", "session": "vanished-sess",
+                   "created": "2026-07-26T10:00:00Z",
+                   "last_seen": "2026-07-26T10:00:00Z"}, handle)
     # alpha's watcher is running; beta never armed one. The beat mtime is set
     # explicitly so the check does not depend on the wall clock.
     beat = os.path.join(peers_dir, "alpha.beat")
@@ -603,6 +697,70 @@ def selftest():
     assert by_name["alpha"]["status"] == "listening", by_name["alpha"]
     assert by_name["beta"]["status"] == "queued", by_name["beta"]
     assert by_name["delta"]["status"] == "queued", by_name["delta"]
+    assert by_name["vanished"]["status"] == "missing", by_name["vanished"]
+    # Deleting a worktree does not kill the session inside it, and that watcher
+    # keeps delivering. A stale beat naming a live pid is still a live reader, so
+    # the absent directory must NOT win: this is "queued", never "missing".
+    orphan_beat = os.path.join(peers_dir, "orphan.beat")
+    with open(os.path.join(peers_dir, "orphan.json"), "w") as handle:
+        json.dump({"name": "orphan", "cwd": os.path.join(worktrees, "orphan"),
+                   "branch": "main", "summary": "", "session": "orphan-sess",
+                   "created": "2026-07-26T10:00:00Z",
+                   "last_seen": "2026-07-26T10:00:00Z"}, handle)
+    with open(orphan_beat, "w") as handle:
+        handle.write(str(os.getpid()))
+    os.utime(orphan_beat, (now - BEAT_STALE_SECS - 60, now - BEAT_STALE_SECS - 60))
+    orphan = {p["name"]: p for p in snapshot(root, now=now)["peers"]}["orphan"]
+    assert orphan["status"] == "queued", orphan
+    os.remove(os.path.join(peers_dir, "orphan.json"))
+    os.remove(orphan_beat)
+
+    # A hand-written record can carry a non-string cwd. os.path.* raises
+    # TypeError on it, which escapes the unreadable-peer handler and 500s the
+    # whole endpoint — one bad record hiding every peer, thread and metric.
+    # "queued", not "missing": no path here is no proof a directory is gone, and
+    # that is what bin/bridger's peer_cwd answers for the same record.
+    with open(os.path.join(peers_dir, "weird.json"), "w") as handle:
+        json.dump({"name": "weird", "cwd": ["/tmp"], "session": ""}, handle)
+    weird = {p["name"]: p for p in snapshot(root, now=now)["peers"]}["weird"]
+    assert weird["status"] == "queued", weird
+    os.remove(os.path.join(peers_dir, "weird.json"))
+
+    # The name comes from the FILENAME. A list .name would reach compute_metrics'
+    # set of listening names, where it is unhashable — endpoint-wide 500.
+    with open(os.path.join(peers_dir, "listy.json"), "w") as handle:
+        json.dump({"name": ["a", "b"], "cwd": worktrees, "session": ""}, handle)
+    listy = {p["name"]: p for p in snapshot(root, now=now)["peers"]}["listy"]
+    assert listy["name"] == "listy", listy
+    os.remove(os.path.join(peers_dir, "listy.json"))
+
+    # Pid forms int() accepts and bash's `case $pid in *[!0-9]*)` rejects. The
+    # two implementations must classify them identically or the monitor points
+    # at `reap` for a peer the CLI refuses to list.
+    for junk in ("+424", "-424", "4_242", "424\r"):
+        with open(os.path.join(peers_dir, "pidjunk.beat"), "w") as handle:
+            handle.write(junk + "\n")
+        beat = os.path.join(peers_dir, "pidjunk.beat")
+        assert watcher_alive(beat) is True, junk
+        assert beat_pid_alive(beat) is False, junk
+    os.remove(os.path.join(peers_dir, "pidjunk.beat"))
+
+    # An untraversable parent is not proof of absence — see dir_gone. The
+    # symlink and relative cases are where this drifted from bash's `[ -e ]`.
+    locked = os.path.join(root, "locked")
+    os.makedirs(os.path.join(locked, "inner"), exist_ok=True)
+    assert dir_gone(os.path.join(locked, "nope")) is True
+    dangling = os.path.join(root, "dangling")
+    if not os.path.lexists(dangling):
+        os.symlink(os.path.join(root, "no-such-target"), dangling)
+    assert dir_gone(dangling) is True, "a dangling symlink follows through to absent, as `[ -e ]` does"
+    assert dir_gone("") is False and dir_gone("/") is False
+    os.chmod(locked, 0o000)
+    try:
+        assert dir_gone(os.path.join(locked, "inner")) is False
+        assert dir_gone(os.path.join(locked, "nope")) is False
+    finally:
+        os.chmod(locked, 0o755)
 
     thread = next(t for t in state["threads"] if t["id"] == "alpha--beta")
     assert len(thread["messages"]) == 5, thread["messages"]
@@ -625,7 +783,7 @@ def selftest():
     assert dashed_thread["queued"] == 0, dashed_thread
 
     metrics = state["metrics"]
-    assert metrics["listening"] == 1 and metrics["peers"] == 5, metrics
+    assert metrics["listening"] == 1 and metrics["peers"] == 6, metrics
     assert metrics["queued"] == 3, metrics
     # beta has no watcher AND messages waiting. alpha also has one waiting but
     # is listening; delta has no watcher and nothing waiting. Only beta is deaf.
@@ -642,7 +800,7 @@ def selftest():
         with open(os.path.join(peers_dir, "gamma.json"), "w") as handle:
             handle.write(broken)
         degraded = snapshot(root, now=now)
-        assert len(degraded["peers"]) == 5, (broken, degraded["peers"])
+        assert len(degraded["peers"]) == 6, (broken, degraded["peers"])
         assert any("gamma" in warn for warn in degraded["warnings"]), (broken, degraded["warnings"])
 
     # `bridger leave` removes peers/<name>.json but keeps the thread. Messages
@@ -657,7 +815,7 @@ def selftest():
     tricky = os.path.join(root, "br[1]")
     os.makedirs(os.path.join(tricky, "peers"))
     with open(os.path.join(tricky, "peers", "solo.json"), "w") as handle:
-        json.dump({"name": "solo"}, handle)
+        json.dump({"name": "solo", "cwd": tricky}, handle)
     assert [p["name"] for p in snapshot(tricky, now=now)["peers"]] == ["solo"]
 
     # peer_status needs a live pid as well as a fresh beat, or a killed watcher

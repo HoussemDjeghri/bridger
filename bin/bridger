@@ -77,6 +77,28 @@ valid_name() {
 peer_file() { echo "$BRIDGER_ROOT/peers/$1.json"; }
 beat_file() { echo "$BRIDGER_ROOT/peers/$1.beat"; }
 
+# The directory a peer registered. FAILS unless the record yields an actual
+# string path — unreadable, absent, null, or a hand-written list/number all
+# answer "no path here". None of those are evidence that a directory is GONE,
+# and `reap --force` deletes registrations on that answer.
+peer_cwd() { jq -er 'if (.cwd | type) == "string" then .cwd else empty end' "$(peer_file "$1")" 2>/dev/null; }
+
+# Absence is only evidence when we could actually look. `[ ! -d ]` is also false
+# when a parent turned untraversable (chmod, a revoked mount), and a session may
+# be alive and reading inside — `reap --force` would strand its mail on a
+# directory that is demonstrably there. Unlike `kill -0`, we CAN tell these
+# apart, so "I cannot tell" must answer no, exactly as beat_pid_alive does.
+dir_gone() { # path -> 0 only when its absence is provable
+  local p="$1" parent
+  [ -n "$p" ] || return 1
+  if [ -e "$p" ]; then return 1; fi
+  parent=$(dirname "$p")
+  while [ ! -e "$parent" ] && [ "$parent" != "/" ] && [ "$parent" != "." ]; do
+    parent=$(dirname "$parent")
+  done
+  [ -x "$parent" ]
+}
+
 # Directories that asked to stay out. One absolute path per line, so you can
 # read and edit the list with any tool. `bridger leave` adds, `join` removes.
 optout_file() { echo "$BRIDGER_ROOT/optout"; }
@@ -99,8 +121,10 @@ optout_remove() { # dir
 }
 
 # A peer is "listening" while its watcher keeps the heartbeat fresh AND its
-# process is alive. Anything else is reported as "queued": messages still land,
-# they are just read when that session comes back.
+# process is alive. A closed session is "queued": messages still land, they are
+# just read when it comes back. A peer whose registered directory no longer
+# exists is additionally flagged "missing" — a housekeeping hint, not a verdict;
+# see peer_status.
 BEAT_STALE_SECS=15
 
 file_age_secs() { # path -> seconds since mtime, or a large number if absent
@@ -135,14 +159,48 @@ watcher_alive() { # beat path -> 0 when the recorded pid still runs
   esac
 }
 
-peer_status() { # name -> listening | queued
-  local b
+# Is a watcher process provably running for this peer? Differs from
+# watcher_alive in what it does with "cannot tell": watcher_alive assumes alive
+# (it only refines a beat that is already fresh), while this answers NO, because
+# it decides whether an address is DEAD. Assuming a reader that isn't there
+# would keep a deleted worktree's registration alive forever.
+beat_pid_alive() { # beat path -> 0 only when it names a pid that still runs
+  local pid=""
+  [ -f "$1" ] || return 1
+  read -r pid < "$1" || true
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+    *) kill -0 "$pid" 2>/dev/null ;;
+  esac
+}
+
+peer_status() { # name -> listening | queued | missing
+  local b cwd
   b=$(beat_file "$1")
   if [ "$(file_age_secs "$b")" -lt "$BEAT_STALE_SECS" ] && watcher_alive "$b"; then
     echo listening
-  else
-    echo queued
+    return
   fi
+  # "missing" reports ONE fact: the registered directory no longer exists, and
+  # no watcher process is running for the name. It is a housekeeping hint for
+  # `reap`, never a reachability verdict, and nothing routes on it.
+  #
+  # It cannot be a verdict, because the peer may still be a live session. A
+  # process keeps its cwd — and $PWD, which is what resolve_identity actually
+  # compares — when its directory is unlinked, so a session whose worktree was
+  # removed goes on resolving its name and polling and sending normally. If it
+  # armed a watcher it reads as "listening" above; if it never armed one (which
+  # this bus treats as ordinary — see the note under `peers`) there is NO signal
+  # that separates it from a session that closed for good. Treating that guess
+  # as truth is how a broadcast silently skips a session that is reading it.
+  #
+  # An unreadable record is NOT "missing" — see peer_cwd. A crash between
+  # mktemp and mv leaves a 0-byte record for a peer whose directory is fine.
+  if cwd=$(peer_cwd "$1") && dir_gone "$cwd" && ! beat_pid_alive "$b"; then
+    echo missing
+    return
+  fi
+  echo queued
 }
 
 # Repo identity for scoping: the shared git dir groups worktrees of one repo
@@ -196,13 +254,33 @@ max_seq() {
 # from two different instants would let a message that lands in between be
 # marked read without ever being delivered.
 unread_in_thread() {
-  local dir="$1" me="$2" top="$3" cur=0 f s
+  local dir="$1" me="$2" top="$3" cur=0 f s rc
   [ -f "$dir/cursor-$me" ] && cur=$(cat "$dir/cursor-$me")
+  # A cursor read as empty or junk must mean "read nothing yet", never "read
+  # everything": advance_cursor truncates before writing, so a concurrent reader
+  # can catch it empty, and `[ "$s" -gt "" ]` would then skip every message and
+  # still move the cursor to the top — silent, permanent, unrecoverable loss.
+  case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
   for f in "$dir"/[0-9]*.json; do
     [ -e "$f" ] || continue
     s=$((10#$(basename "$f" .json)))
     [ "$s" -gt "$cur" ] && [ "$s" -le "$top" ] || continue
-    jq -c --arg me "$me" 'select(.to == $me)' "$f"
+    rc=0
+    jq -c --arg me "$me" 'select(.to == $me)' "$f" 2>/dev/null || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      # jq exits 5 ONLY for a parse error: bytes that will never improve, so
+      # skipping is the one way past a message that would otherwise wedge this
+      # thread forever — poll would die before advance_cursor and the reader
+      # would replay the same prefix for good.
+      #
+      # Every other failure (2 = cannot open: EACCES, a revoked mount, EIO) is
+      # transient. The message is intact and reads fine next time, so we must
+      # NOT skip it: advance_cursor would mark it delivered and destroy a
+      # perfectly good message. Wedging here is the safe half of the trade — it
+      # clears itself the moment the file is readable again.
+      [ "$rc" -eq 5 ] || die "cannot read $f — refusing to advance the cursor past it"
+      echo "bridger: message $f is unparseable — skipped" >&2
+    fi
   done
 }
 
@@ -218,6 +296,34 @@ other_peers() {
     n=$(basename "$f" .json)
     [ "$n" = "$1" ] || echo "$n"
   done
+}
+
+# The thread directories a name takes part in. Walks threads/, never the peer
+# registry: a thread outlives its partner's registration — `leave` and `reap`
+# both keep it — so enumerating threads through other_peers would miss exactly
+# the mail a departed correspondent stranded here.
+peer_threads() { # name -> one thread dir per line
+  local dir
+  for dir in "$BRIDGER_ROOT"/threads/*"$1"*; do
+    [ -d "$dir" ] || continue
+    case "$(basename "$dir")" in "$1--"*|*"--$1") ;; *) continue ;; esac
+    echo "$dir"
+  done
+}
+
+# How many messages are waiting for $1 across every thread it takes part in —
+# the backlog a name carries, whether or not anything is reading for it.
+# Suffixed "+" when a message could not be read, so the number is a floor rather
+# than a silent undercount. `reap` tells the operator to decide on this figure
+# before dropping a registration, and an unreadable message would otherwise make
+# a peer holding mail look emptier than it is.
+unread_total() { # name -> count, or "N+" when the count is incomplete
+  local name="$1" n=0 dir out partial=""
+  while IFS= read -r dir; do
+    out=$(unread_in_thread "$dir" "$name" "$(max_seq "$dir")" 2>/dev/null) || partial="+"
+    n=$(( n + $(printf '%s' "$out" | grep -c . || true) ))
+  done < <(peer_threads "$name")
+  printf '%s%s\n' "$n" "$partial"
 }
 
 # The Claude Code session id — present in every tool call and stable across a
@@ -276,9 +382,12 @@ resolve_identity() {
   sid=$(session_id)
   for f in "$BRIDGER_ROOT"/peers/*.json; do
     [ -e "$f" ] || continue
-    name=$(jq -r .name "$f")
-    cwd=$(jq -r .cwd "$f")
-    sess=$(jq -r '.session // ""' "$f")
+    # The filename is the address, and an unreadable record resolves to nothing
+    # — skip it quietly rather than leaking three raw jq errors per record on
+    # every single command.
+    name=$(basename "$f" .json)
+    cwd=$(jq -er 'if (.cwd | type) == "string" then .cwd else empty end' "$f" 2>/dev/null) || continue
+    sess=$(jq -r '.session // ""' "$f" 2>/dev/null || echo "")
     case "$PWD" in
       "$cwd"|"$cwd"/*)
         if [ "${#cwd}" -gt "$bestlen" ]; then best=$name; bestlen=${#cwd}; fi
@@ -303,10 +412,10 @@ resolve_my_identity() {
   [ -n "$sid" ] || return 0
   for f in "$BRIDGER_ROOT"/peers/*.json; do
     [ -e "$f" ] || continue
-    sess=$(jq -r '.session // ""' "$f")
+    sess=$(jq -r '.session // ""' "$f" 2>/dev/null || echo "")
     [ "$sess" = "$sid" ] || continue
-    name=$(jq -r .name "$f")
-    cwd=$(jq -r .cwd "$f")
+    name=$(basename "$f" .json)
+    cwd=$(jq -er 'if (.cwd | type) == "string" then .cwd else empty end' "$f" 2>/dev/null) || continue
     case "$PWD" in
       "$cwd"|"$cwd"/*)
         if [ "${#cwd}" -gt "$bestlen" ]; then best=$name; bestlen=${#cwd}; fi ;;
@@ -337,23 +446,36 @@ write_peer() { # name dir
     [ -n "$created" ] || created=$(now_utc)
   fi
   mkdir -p "$BRIDGER_ROOT/peers"
+  # Written to a temp file and moved into place. A plain `>` truncates first, so
+  # a concurrent reader can see an empty record — and an empty record has no
+  # cwd, which peer_status weighs when deciding "missing". A live peer must never
+  # drop out of a listing because someone else re-registered at that instant.
+  #
+  # The temp name is unique per writer, via mktemp, exactly as a send does for a
+  # message. A FIXED "<name>.json.tmp" would be shared by two concurrent writers
+  # of one peer (register racing register, or register racing summary): both
+  # truncate and interleave into the same inode, then one mv commits the
+  # resulting garbage permanently and the other fails outright. That is strictly
+  # worse than the `>` this replaced, whose corruption was at least transient.
+  # It cannot collide with the peers/*.json glob — the suffix comes after .json.
+  local tmp
+  tmp=$(mktemp "$(peer_file "$name").XXXXXX")
   jq -n --arg name "$name" --arg cwd "$dir" --arg created "$created" \
         --arg repo "$(repo_id "$dir")" --arg branch "$(git_branch "$dir")" \
         --arg summary "$summary" --arg seen "$(now_utc)" --arg session "$session" \
     '{name: $name, cwd: $cwd, repo: $repo, branch: $branch,
       summary: $summary, session: $session, created: $created, last_seen: $seen}' \
-    > "$(peer_file "$name")"
+    > "$tmp"
+  mv "$tmp" "$(peer_file "$name")"
 }
 
 # Does this peer have any message history? Renaming away from a name with a
 # thread would orphan that thread, so it is only safe when there is none.
 peer_has_history() { # name
   local dir f
-  for dir in "$BRIDGER_ROOT"/threads/*"$1"*; do
-    [ -d "$dir" ] || continue
-    case "$(basename "$dir")" in "$1--"*|*"--$1") ;; *) continue ;; esac
+  while IFS= read -r dir; do
     for f in "$dir"/[0-9]*.json; do [ -e "$f" ] && return 0; done
-  done
+  done < <(peer_threads "$1")
   return 1
 }
 
@@ -494,11 +616,15 @@ cmd_autoregister() {
 
 # Say what this session is working on, so other agents can pick the right peer.
 cmd_summary() {
-  local text="${*:-}" me
+  local text="${*:-}" me tmp
   [ -n "$text" ] || die "usage: bridger summary <text>"
   me=$(require_identity)
-  jq --arg s "$text" '.summary = $s' "$(peer_file "$me")" > "$(peer_file "$me").tmp"
-  mv "$(peer_file "$me").tmp" "$(peer_file "$me")"
+  # Unique temp name, for the same reason write_peer uses one: a fixed
+  # "<name>.json.tmp" is shared with a concurrent register of this peer, and the
+  # loser of that race commits an interleaved record.
+  tmp=$(mktemp "$(peer_file "$me").XXXXXX")
+  jq --arg s "$text" '.summary = $s' "$(peer_file "$me")" > "$tmp"
+  mv "$tmp" "$(peer_file "$me")"
   echo "summary set for '$me'"
 }
 
@@ -508,7 +634,7 @@ cmd_summary() {
 # help text) otherwise reads "queued" as "nobody home" and skips the ask.
 cmd_peers() {
   local scope=machine me my_repo f name cwd repo branch summary status mark
-  local queued_others=0
+  local queued_others=0 missing_any=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --machine|--repo|--dir) scope="${1#--}"; shift ;;
@@ -519,9 +645,28 @@ cmd_peers() {
   my_repo=$(repo_id "$PWD")
   for f in "$BRIDGER_ROOT"/peers/*.json; do
     [ -e "$f" ] || continue
-    name=$(jq -r .name "$f"); cwd=$(jq -r .cwd "$f")
-    repo=$(jq -r '.repo // ""' "$f"); branch=$(jq -r '.branch // ""' "$f")
-    summary=$(jq -r '.summary // ""' "$f")
+    # The FILENAME is the address, not the .name field: peer_file/beat_file are
+    # keyed by it, as other_peers and reap already are. A hand-edited record
+    # whose .name disagrees would otherwise send peer_status looking up a peer
+    # file that does not exist.
+    #
+    # An unreadable record is skipped, not fatal. jq exits 5 on one, which under
+    # errexit would abort this loop: every peer sorting after it disappears from
+    # the listing, and deliver.sh/stop.sh both do `peers || exit 0`, so one
+    # truncated file would silence unread reports for every session on the box.
+    name=$(basename "$f" .json)
+    # A record we cannot read a path out of still names an addressable peer, so
+    # it stays in the listing with an empty directory — hiding it would repeat
+    # the bug this guard fixes. The guard is only that jq's exit 5 must not abort
+    # the loop under errexit: that dropped every peer sorting after the bad file,
+    # and deliver.sh/stop.sh both do `peers || exit 0`, so one truncated record
+    # silenced unread reports for every session on the machine. The type check
+    # keeps a list/number cwd from printing across three lines.
+    cwd=$(jq -er 'if (.cwd | type) == "string" then .cwd else empty end' "$f" 2>/dev/null) \
+      || { echo "bridger: peer '$name' has no readable directory in its record" >&2; cwd=""; }
+    repo=$(jq -r '.repo // ""' "$f" 2>/dev/null || echo "")
+    branch=$(jq -r '.branch // ""' "$f" 2>/dev/null || echo "")
+    summary=$(jq -r '.summary // ""' "$f" 2>/dev/null || echo "")
     case "$scope" in
       repo) [ -n "$my_repo" ] && [ "$repo" = "$my_repo" ] || continue ;;
       dir)  [ "$cwd" = "$PWD" ] || continue ;;
@@ -529,12 +674,18 @@ cmd_peers() {
     status=$(peer_status "$name")
     mark=""; [ "$name" = "${me:-}" ] && mark=" (you)"
     [ "$status" = queued ] && [ -z "$mark" ] && queued_others=1
+    [ "$status" = missing ] && missing_any=1
     printf '%s [%s]%s %s%s%s\n' "$name" "$status" "$mark" "$cwd" \
       "$([ -n "$branch" ] && echo " @$branch")" \
       "$([ -n "$summary" ] && echo " — $summary")"
   done
   if [ "$queued_others" -eq 1 ]; then
     echo "note: [queued] means only that this peer's watcher is not running — it may be a live session that never armed one. It is still addressable and still receives. Reachability is proven by 'ask', never by this status."
+  fi
+  # Nothing points at reap otherwise, and "missing" reads as a harsher "queued"
+  # unless the one thing it does NOT mean is said out loud.
+  if [ "$missing_any" -eq 1 ]; then
+    echo "note: [missing] adds two facts to [queued]: that peer's registered directory no longer exists, and no watcher process is running for the name. It is still addressable and still receives — it may be a live session reading from the removed path. Usually it is a leftover registration: 'bridger reap' lists them with what they still hold, 'bridger reap --force' drops them (threads kept)."
   fi
 }
 
@@ -553,10 +704,18 @@ cmd_whoami() {
 # stderr, so stdout stays the bare seq that callers (including the multi-
 # recipient path below) parse.
 warn_if_unheard() { # to from
-  local to="$1" from="$2" dir n
-  [ "$(peer_status "$to")" = listening ] && return 0
+  local to="$1" from="$2" dir n status
+  status=$(peer_status "$to")
+  [ "$status" = listening ] && return 0
   dir=$(thread_dir "$from" "$to")
   n=$(unread_in_thread "$dir" "$to" "$(max_seq "$dir")" | grep -c . || true)
+  # Same promise as "queued" — it may well be read — plus the one extra fact a
+  # sender can act on: this registration looks abandoned, so if nobody answers,
+  # that is the likely reason. Deliberately not phrased as unreachable.
+  if [ "$status" = missing ]; then
+    echo "warning: '$to' is not listening, and its directory $(peer_cwd "$to") no longer exists — $n message(s) from you are unread. It may still be a live session reading from the removed path; if it is not, this is a leftover registration ('bridger reap' lists them)." >&2
+    return 0
+  fi
   echo "warning: '$to' is not listening — no watcher is running there, and $n message(s) from you are unread. It will read them on its next activity, not now. Sending more will not reach it any sooner." >&2
 }
 
@@ -584,6 +743,10 @@ cmd_send() {
   # recipient; single sends keep printing the bare seq (ask relies on it).
   local recipients="" r
   if [ "$to" = "@all" ]; then
+    # Every registered peer, with no liveness filtering. A peer whose directory
+    # is missing may still be a live session reading from the unlinked path, and
+    # nothing here can tell — skipping it would silently drop a recipient that
+    # is listening. A queued copy costs a file; a missed broadcast costs a peer.
     recipients=$(other_peers "$from")
     [ -n "$recipients" ] || die "no other peers to broadcast to"
   elif [ "${to#*,}" != "$to" ]; then
@@ -847,23 +1010,72 @@ cmd_status() {
 # One line each: "<name>\t<unread>". Skips a peer with a live watcher (someone
 # is using that name right now).
 cmd_dormant() {
-  local sid f name cwd sess n peer dir top
+  local sid f name cwd sess
   sid=$(session_id)
   for f in "$BRIDGER_ROOT"/peers/*.json; do
     [ -e "$f" ] || continue
-    name=$(jq -r .name "$f"); cwd=$(jq -r .cwd "$f"); sess=$(jq -r '.session // ""' "$f")
+    # The filename is the address — peer and beat files are keyed by it, so a
+    # record whose .name drifted would otherwise offer a name nothing can reach.
+    name=$(basename "$f" .json)
+    cwd=$(jq -er '.cwd // ""' "$f" 2>/dev/null) || continue   # unreadable: not reclaimable
+    sess=$(jq -r '.session // ""' "$f")
     case "$PWD" in "$cwd"|"$cwd"/*) ;; *) continue ;; esac
     [ -n "$sid" ] && [ "$sess" = "$sid" ] && continue        # already mine
     [ "$(peer_status "$name")" = "listening" ] && continue   # a live session holds it
-    n=0
-    for peer in $(other_peers "$name"); do
-      dir=$(thread_dir "$name" "$peer")
-      [ -d "$dir" ] || continue
-      top=$(max_seq "$dir")
-      n=$(( n + $(unread_in_thread "$dir" "$name" "$top" | grep -c . || true) ))
-    done
-    printf '%s\t%s\n' "$name" "$n"
+    printf '%s\t%s\n' "$name" "$(unread_total "$name")"
   done
+}
+
+# Registrations whose directory no longer exists — a deleted worktree, a removed
+# checkout. Without this there is no way to remove one: `leave` resolves the peer
+# from $PWD, which is impossible once that directory is gone. (A record with no
+# readable string cwd is unreachable by both, and stays for a human to `rm` — the
+# right trade against deleting a registration on "I cannot read it".)
+#
+# Dry run unless --force, and it stays that way, because "the directory is gone"
+# is NOT proof the peer is dead. A session open in a removed worktree keeps its
+# cwd and goes on polling and sending; if it never armed a watcher there is no
+# signal here that distinguishes it from a session that closed for good. An
+# unmounted volume reads the same. So --force can strand a live peer's mail, and
+# that has to be a human's call on the evidence: the dry run prints each
+# candidate with how much unread mail it is still holding.
+#
+# Threads always stay on disk, exactly as `leave` leaves them.
+cmd_reap() {
+  local force=0 f name found=0 reaped=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      *) die "usage: bridger reap [--force]" ;;
+    esac
+  done
+  for f in "$BRIDGER_ROOT"/peers/*.json; do
+    [ -e "$f" ] || continue
+    name=$(basename "$f" .json)
+    [ "$(peer_status "$name")" = missing ] || continue
+    found=1
+    printf '%s\t%s (missing)\t%s unread\n' "$name" "$(peer_cwd "$name")" "$(unread_total "$name")"
+    # Re-check immediately before deleting. unread_total walks every message in
+    # every thread this peer is in, so the gap since the check above grows with
+    # the backlog — seconds for a busy peer. A session that re-registered the
+    # name into a real directory inside that window must not be deleted.
+    if [ "$force" -eq 1 ] && [ "$(peer_status "$name")" = missing ]; then
+      rm -f "$(peer_file "$name")" "$(beat_file "$name")"
+      reaped=1
+    fi
+  done
+  if [ "$found" -eq 0 ]; then
+    # Not "every directory still exists": a candidate is also excluded by a
+    # watcher still running for the name, which is the more useful thing to say
+    # to someone who just deleted a worktree and is looking for it here.
+    echo "nothing to reap — every registration either still has its directory or still has a watcher process running for it"
+  elif [ "$reaped" -eq 1 ]; then
+    echo "reaped. Their threads stay on disk as history."
+  elif [ "$force" -eq 1 ]; then
+    echo "nothing was removed — every candidate stopped being missing between the listing and the delete (re-registered into a real directory, or its watcher came back)."
+  else
+    echo "note: nothing was removed. Run 'bridger reap --force' to drop these registrations (threads are kept). A session still open in a removed directory cannot be detected here — check the unread counts above before dropping one."
+  fi
 }
 
 cmd_help() {
@@ -877,6 +1089,8 @@ usage:
   bridger register <name> [dir]        make this (or given) directory addressable, by name
   bridger join                         register with a name derived from the directory
   bridger leave                        stop being addressable here (history kept)
+  bridger reap [--force]               list registrations whose directory no longer
+                                      exists; --force drops them (threads kept)
   bridger whoami                       print the peer name matching the current directory
   bridger send <to>[,<to>...]|@all <type> <body> [--ref N] [--from <name>]
                                       send a message; prints its seq. A comma list
@@ -899,8 +1113,12 @@ usage:
                                       bus health, in a browser (needs python3)
 
 message types are free-form strings; conventions: chat, ask, answer.
-peer status: "listening" (its watcher is running) or "queued" (messages wait
-on disk until that session starts again). Both are addressable.
+peer status: "listening" (its watcher is running) or "queued" (messages wait on
+disk until that session starts again). "missing" is a queued peer whose
+registered directory no longer exists AND for which no watcher process is
+running — still addressable and still receiving
+(it may be a session reading from the removed path), but usually a leftover
+registration, which `reap` lists and `reap --force` drops.
 OPT-IN by default: only directories you register or join are addressable.
 Two sessions in one directory each get their own name — identity follows the
 session, not just the directory — so sessions on the same branch can talk.
@@ -1065,6 +1283,7 @@ case "$cmd" in
   register) cmd_register "$@" ;;
   autoregister) cmd_autoregister "$@" ;;
   leave)    cmd_leave "$@" ;;
+  reap)     cmd_reap "$@" ;;
   join)     cmd_join "$@" ;;
   peers)    cmd_peers "$@" ;;
   summary)  cmd_summary "$@" ;;

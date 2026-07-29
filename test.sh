@@ -444,6 +444,330 @@ grep -q "deaf	exit=" "$BRIDGER_ROOT/watcher.log" \
   || fail "a watcher exit must record its status"
 pass "watcher records how it died"
 
+# --- a registration whose directory no longer exists -------------------------
+# A deleted worktree leaves a peer record that cannot be removed any other way:
+# `leave` resolves the peer from $PWD, which is impossible once that directory
+# is gone. It is flagged so `reap` can find it — but ONLY flagged. The peer stays
+# fully addressable, because "the directory is gone" is not proof the peer is.
+(
+  BRIDGER_ROOT=$(mktemp -d); gw=$(mktemp -d)
+  export BRIDGER_ROOT
+  mkdir -p "$gw/lead" "$gw/live" "$gw/dead"
+  for p in lead live dead; do "$bridger" register "$p" "$gw/$p" >/dev/null; done
+  (cd "$gw/lead" && "$bridger" send dead chat "before it went" >/dev/null) 2>/dev/null
+  rm -rf "$gw/dead"
+
+  # Capture before grepping: `grep -q` stops at the first match and SIGPIPEs the
+  # producer, which under pipefail fails the whole pipeline.
+  listed=$("$bridger" peers)
+  grep -q "^dead \[missing\]" <<<"$listed" \
+    || fail "a peer whose directory is deleted must read [missing] (got: $listed)"
+  grep -q "^live \[queued\]" <<<"$listed" \
+    || fail "a closed peer whose directory still exists must stay [queued]"
+  grep -q "reap" <<<"$listed" || fail "the listing must point at the command that clears these"
+
+  # Still a normal peer in every routing decision. It may be a live session
+  # reading from the removed path, and nothing here can tell.
+  [ "$( (cd "$gw/lead" && "$bridger" send dead chat "still queued") 2>/dev/null )" = "2" ] \
+    || fail "a targeted send must still be stored for a peer whose directory is gone"
+  out=$(cd "$gw/lead" && "$bridger" send @all chat "everyone" 2>/dev/null)
+  grep -q "^live " <<<"$out" || fail "@all must reach a peer whose directory exists"
+  grep -q "^dead " <<<"$out" \
+    || fail "@all must NOT skip a peer whose directory is gone — it may still be reading"
+
+  # Dry run by default: the operator decides, on the unread counts.
+  dry=$("$bridger" reap)
+  grep -q "^dead" <<<"$dry" || fail "reap must list a peer whose directory is gone (got: $dry)"
+  [ -f "$BRIDGER_ROOT/peers/dead.json" ] || fail "reap without --force must delete nothing"
+  "$bridger" reap --force >/dev/null
+  [ ! -f "$BRIDGER_ROOT/peers/dead.json" ] || fail "reap --force must drop the registration"
+  [ -f "$BRIDGER_ROOT/peers/live.json" ] || fail "reap must not touch a peer whose directory exists"
+  [ -d "$BRIDGER_ROOT/threads/dead--lead" ] || fail "reap must keep the thread on disk as history"
+  grep -q "nothing to reap" <<<"$("$bridger" reap)" \
+    || fail "reap must say so when there is nothing to reap"
+  rm -rf "$BRIDGER_ROOT" "$gw"
+)
+pass "a deleted directory is flagged for reap without changing how the peer is addressed"
+
+# --- a session in a deleted directory is still a real peer -------------------
+# THE regression this whole feature can cause. Deleting a worktree does not kill
+# the session inside it: a process keeps its cwd — and $PWD, which is what
+# resolve_identity compares — when the directory is unlinked. Such a session goes
+# on resolving its name, polling and sending, WITHOUT any watcher armed, which
+# this bus treats as ordinary. Anything that treats "directory gone" as "peer
+# dead" silently drops a session that is reading.
+(
+  BRIDGER_ROOT=$(mktemp -d); sw=$(mktemp -d)
+  export BRIDGER_ROOT
+  mkdir -p "$sw/lead" "$sw/open"
+  "$bridger" register lead "$sw/lead" >/dev/null
+  BRIDGER_SESSION_ID=sopen "$bridger" register open "$sw/open" >/dev/null
+  # The session keeps running with that directory as its cwd while it is removed.
+  (
+    cd "$sw/open"
+    rm -rf "$sw/open"
+    export BRIDGER_SESSION_ID=sopen
+    [ "$("$bridger" whoami)" = "open" ] || { echo "whoami" > "$sw/broke"; exit 0; }
+    "$bridger" send lead chat "I am alive and reading" >/dev/null 2>&1 \
+      || { echo "send" > "$sw/broke"; exit 0; }
+  )
+  [ ! -f "$sw/broke" ] \
+    || fail "a session in a removed directory must keep working (failed at: $(cat "$sw/broke"))"
+  [ -n "$(cd "$sw/lead" && "$bridger" poll)" ] \
+    || fail "a session in a removed directory must still be able to send"
+
+  out=$(cd "$sw/lead" && "$bridger" send @all chat "broadcast" 2>/dev/null)
+  grep -q "^open " <<<"$out" \
+    || fail "@all must reach a session whose directory was removed (got: $out)"
+  rm -rf "$BRIDGER_ROOT" "$sw"
+)
+pass "a watcherless session in a removed directory stays addressable and reachable by @all"
+
+# --- a deleted directory does NOT unreach a watcher that is already running ---
+# Deleting a worktree does not kill the session inside it. That watcher never
+# re-resolves its identity (resolve_identity compares $PWD as a string, and a
+# process keeps its cwd when the directory is unlinked) and the beat path is
+# absolute, so it keeps delivering. Liveness therefore outranks the directory:
+# flagging it as abandoned would let reap delete a live session's registration.
+(
+  BRIDGER_ROOT=$(mktemp -d); lw=$(mktemp -d)
+  export BRIDGER_ROOT
+  mkdir -p "$lw/lead" "$lw/wt"
+  "$bridger" register lead "$lw/lead" >/dev/null
+  BRIDGER_SESSION_ID=wtsess "$bridger" register wt "$lw/wt" >/dev/null
+  (cd "$lw/wt"; exec env BRIDGER_SESSION_ID=wtsess "$bridger" wait --follow >"$lw/out" 2>&1) &
+  watcher=$!
+  sleep 3
+  rm -rf "$lw/wt"          # `git worktree remove` with the session still open
+
+  [ "$("$bridger" peers | grep -c '^wt \[listening\]')" = "1" ] \
+    || fail "a live watcher must stay [listening] when its directory is deleted (got: $("$bridger" peers))"
+  out=$(cd "$lw/lead" && "$bridger" send @all chat "still here" 2>/dev/null)
+  grep -q "^wt " <<<"$out" || fail "@all must not skip a peer whose watcher is running"
+  grep -q "nothing to reap" <<<"$("$bridger" reap)" \
+    || fail "reap must never offer to delete a peer whose watcher is running (got: $("$bridger" reap))"
+  sleep 2
+  grep -q "still here" "$lw/out" \
+    || fail "the live watcher must actually receive the broadcast (got: $(cat "$lw/out"))"
+
+  # A watcher alive but too loaded to beat: no longer [listening], yet a reader
+  # IS there. Only the live-pid half of the check separates this from abandoned,
+  # and without this case that half can be deleted with the suite still green.
+  kill -STOP "$watcher"
+  touch -t 202001010000 "$BRIDGER_ROOT/peers/wt.beat"
+  [ "$("$bridger" peers | grep -c '^wt \[queued\]')" = "1" ] \
+    || fail "a live watcher whose beat went stale is [queued], never [missing] (got: $("$bridger" peers))"
+  grep -q "nothing to reap" <<<"$("$bridger" reap)" \
+    || fail "reap must not offer a peer whose watcher process is alive (got: $("$bridger" reap))"
+  kill -CONT "$watcher"
+
+  # Once that watcher dies the peer is flagged [missing] instead — the fact the
+  # directory is gone, now that no watcher process is running for the name.
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  [ "$(cd "$lw/lead" && "$bridger" peers | grep -c '^wt \[missing\]')" = "1" ] \
+    || fail "a dead watcher plus a deleted directory must read [missing] (got: $("$bridger" peers))"
+  rm -rf "$BRIDGER_ROOT" "$lw"
+)
+pass "a running watcher outranks its deleted directory; flagged missing only once it dies"
+
+# --- concurrent writers of one peer record must not corrupt it ---------------
+# register racing register (or register racing summary) on the same name: a
+# shared temp path would let both interleave into one inode, and the mv would
+# then commit that garbage permanently — worse than the truncating `>` it
+# replaced, because a listing that hits it dies with jq's exit 5 and shows
+# NOTHING, hiding every other peer too.
+(
+  BRIDGER_ROOT=$(mktemp -d); cw=$(mktemp -d)
+  export BRIDGER_ROOT
+  mkdir -p "$cw/hot"
+  "$bridger" register hot "$cw/hot" >/dev/null
+  # Failures are recorded in a file, not a variable: `cmd || rc=1 &` backgrounds
+  # the whole list, so the assignment would happen in a subshell and never reach
+  # this one.
+  fails="$cw/failures"
+  for _ in $(seq 1 15); do
+    ( "$bridger" register hot "$cw/hot" >/dev/null 2>&1 || echo x >> "$fails" ) &
+    ( cd "$cw/hot" && "$bridger" summary "racing" >/dev/null 2>&1 || echo x >> "$fails" ) &
+  done
+  wait
+  [ ! -s "$fails" ] \
+    || fail "a concurrent register/summary on one peer must not fail ($(grep -c . "$fails") of 30 did)"
+  jq -e . "$BRIDGER_ROOT/peers/hot.json" >/dev/null 2>&1 \
+    || fail "the peer record must stay valid JSON under concurrent writers (got: $(cat "$BRIDGER_ROOT/peers/hot.json"))"
+  [ "$("$bridger" peers | grep -c '^hot ')" = "1" ] \
+    || fail "the listing must survive concurrent writers"
+  rm -rf "$BRIDGER_ROOT" "$cw"
+)
+pass "concurrent register/summary on one peer leaves a valid record"
+
+# --- reap's evidence has to be right, because it is all the operator gets -----
+# The unread count is the whole basis for a destructive choice. Counting through
+# the peer registry undercounts: a thread outlives its partner's registration
+# (`leave` and `reap` both keep it), so mail from a departed correspondent — the
+# most stranded mail there is — would be invisible to the number.
+(
+  BRIDGER_ROOT=$(mktemp -d); ew=$(mktemp -d)
+  export BRIDGER_ROOT
+  mkdir -p "$ew/alice" "$ew/bob"
+  "$bridger" register alice "$ew/alice" >/dev/null
+  "$bridger" register bob "$ew/bob" >/dev/null
+  (cd "$ew/alice" && for i in 1 2 3; do "$bridger" send bob chat "m$i" >/dev/null 2>&1; done)
+  rm -rf "$ew/bob"
+  (cd "$ew/alice" && "$bridger" leave >/dev/null)     # record goes, thread stays
+  grep -q "3 unread" <<<"$("$bridger" reap)" \
+    || fail "reap must count mail from a correspondent that has left (got: $("$bridger" reap))"
+
+  # The operator is told to decide on this number, so an incomplete count must
+  # say so rather than making a peer that holds mail look emptier than it is.
+  if [ "$(id -u)" != "0" ]; then
+    bad=$(ls "$BRIDGER_ROOT"/threads/*bob*/[0-9]*.json | head -1)
+    chmod 000 "$bad"
+    grep -q "[0-9]+ unread" <<<"$("$bridger" reap 2>/dev/null)" \
+      || fail "an unreadable message must make reap's count a floor, not a silent undercount (got: $("$bridger" reap 2>/dev/null))"
+    chmod 644 "$bad"
+  fi
+
+  # An unreadable record is not evidence a directory is gone. write_peer does
+  # mktemp+mv without fsync, so a 0-byte record is the ordinary crash outcome —
+  # for a peer whose directory is perfectly fine and whose session is running.
+  mkdir -p "$ew/worker"
+  "$bridger" register worker "$ew/worker" >/dev/null
+  : > "$BRIDGER_ROOT/peers/worker.json"
+  "$bridger" reap --force >/dev/null
+  [ -f "$BRIDGER_ROOT/peers/worker.json" ] \
+    || fail "reap --force must not delete a peer whose record merely cannot be read"
+
+  # Nor one whose cwd is not a path at all. `jq -r` renders null as the STRING
+  # "null" — a relative path, which resolves against the caller's directory and
+  # reads as provably gone. Deleting on that is the same "I cannot tell" mistake.
+  printf '{"name":"nullcwd","cwd":null}'  > "$BRIDGER_ROOT/peers/nullcwd.json"
+  printf '{"name":"numcwd","cwd":12345}'  > "$BRIDGER_ROOT/peers/numcwd.json"
+  printf '{"name":"arrcwd","cwd":["/x"]}' > "$BRIDGER_ROOT/peers/arrcwd.json"
+  listed=$("$bridger" peers 2>/dev/null)
+  for weird in nullcwd numcwd arrcwd; do
+    grep -q "^$weird \[queued\]" <<<"$listed" \
+      || fail "a record with a non-string cwd is queued, never missing (got: $listed)"
+  done
+  [ "$(grep -c '^arrcwd ' <<<"$listed")" = "1" ] \
+    || fail "each peer must occupy exactly one line, whatever its record holds"
+  "$bridger" reap --force >/dev/null
+  for weird in nullcwd numcwd arrcwd; do
+    [ -f "$BRIDGER_ROOT/peers/$weird.json" ] \
+      || fail "reap --force must not delete a peer whose cwd is not a path ($weird)"
+  done
+  rm -rf "$BRIDGER_ROOT" "$ew"
+)
+pass "reap counts stranded mail and never reaps a peer it simply cannot read"
+
+# --- dormant offers a name that can actually be reclaimed --------------------
+# The filename is the address. session-start.sh renders this list as a reclaim
+# offer, so a record whose .name drifted would offer a name with no registration
+# and no mail, while the real backlog sits under the filename, never mentioned.
+(
+  BRIDGER_ROOT=$(mktemp -d); dw=$(mktemp -d)
+  export BRIDGER_ROOT
+  mkdir -p "$dw/proj" "$dw/other"
+  "$bridger" register arch "$dw/proj" >/dev/null
+  "$bridger" register mate "$dw/other" >/dev/null
+  (cd "$dw/other" && "$bridger" send arch chat "queued for arch" >/dev/null 2>&1)
+  tmp=$(mktemp)
+  jq '.name = "notarch"' "$BRIDGER_ROOT/peers/arch.json" > "$tmp" && mv "$tmp" "$BRIDGER_ROOT/peers/arch.json"
+  [ "$(cd "$dw/proj" && BRIDGER_SESSION_ID=fresh "$bridger" dormant)" = "$(printf 'arch\t1')" ] \
+    || fail "dormant must offer the reachable name and its real backlog (got: $(cd "$dw/proj" && BRIDGER_SESSION_ID=fresh "$bridger" dormant))"
+  listed=$("$bridger" peers)
+  grep -q "^arch " <<<"$listed" \
+    || fail "peers must list the name a message can be addressed to (got: $listed)"
+  # `!` not `&&`: a bare `grep … && fail` aborts the block under set -e on the
+  # no-match path, which is the passing one.
+  ! grep -q "^notarch " <<<"$listed" \
+    || fail "peers must not print an address nothing can reach (got: $listed)"
+  rm -rf "$BRIDGER_ROOT" "$dw"
+)
+pass "dormant offers the name a session can actually reclaim"
+
+# --- one bad file must never take the whole bus down ---------------------------
+# jq exits 5 on an unparseable record, and under errexit that aborted the listing
+# mid-loop: every peer sorting after it vanished, `peers` exited nonzero, and
+# deliver.sh/stop.sh both do `peers || exit 0` — so one truncated file silenced
+# unread reports for every session on the machine.
+(
+  BRIDGER_ROOT=$(mktemp -d); bw=$(mktemp -d)
+  export BRIDGER_ROOT
+  mkdir -p "$bw/alpha" "$bw/zulu"
+  "$bridger" register alpha "$bw/alpha" >/dev/null
+  "$bridger" register zulu "$bw/zulu" >/dev/null
+  printf '{"name":"gam' > "$BRIDGER_ROOT/peers/gamma.json"   # a crash-truncated record
+  listed=$("$bridger" peers 2>/dev/null) || fail "one unreadable record must not fail the listing"
+  grep -q "^zulu " <<<"$listed" \
+    || fail "a peer sorting after an unreadable record must still be listed (got: $listed)"
+  grep -q "^alpha " <<<"$listed" || fail "peers before the bad record must still be listed"
+
+  # The cursor is read back as an integer. Empty (advance_cursor truncates before
+  # writing, so a concurrent reader can catch it mid-write) must mean "nothing
+  # read yet" — reading it as "everything read" loses the mail permanently.
+  (cd "$bw/alpha" && "$bridger" send zulu chat "keepme" >/dev/null 2>&1)
+  thread=$(echo "$BRIDGER_ROOT"/threads/*zulu*)
+  : > "$thread/cursor-zulu"
+  [ -n "$(cd "$bw/zulu" && "$bridger" poll)" ] \
+    || fail "an empty cursor must not mark every message read"
+
+  # One unparseable message must not wedge the thread: jq's exit 5 used to kill
+  # poll before advance_cursor, so every LATER message became unreachable and the
+  # reader replayed the same prefix forever.
+  (cd "$bw/alpha" && for i in 1 2 3; do "$bridger" send zulu note "n$i" >/dev/null 2>&1; done)
+  thread=$(echo "$BRIDGER_ROOT"/threads/*zulu*)
+  corrupt=$(ls "$thread"/[0-9]*.json | sed -n 2p)
+  printf '{"to":"zulu"' > "$corrupt"                       # truncated mid-write
+  got=$(cd "$bw/zulu" && "$bridger" poll 2>/dev/null)
+  grep -q "n3" <<<"$got" \
+    || fail "a message after an unparseable one must still be delivered (got: $got)"
+
+  # ... but a message that is merely unreadable RIGHT NOW is a different case.
+  # Skipping it would let advance_cursor mark a perfectly good message delivered
+  # and destroy it. Wedging is the safe half: it clears itself on the next poll.
+  if [ "$(id -u)" != "0" ]; then
+    (cd "$bw/alpha" && for i in 1 2; do "$bridger" send zulu note "t$i" >/dev/null 2>&1; done)
+    locked=$(ls "$thread"/[0-9]*.json | tail -2 | head -1)
+    chmod 000 "$locked"
+    (cd "$bw/zulu" && "$bridger" poll >/dev/null 2>&1) \
+      && fail "a transiently unreadable message must not be passed over silently"
+    chmod 644 "$locked"
+    got=$(cd "$bw/zulu" && "$bridger" poll 2>/dev/null)
+    grep -q "t1" <<<"$got" \
+      || fail "a message unreadable on one poll must still arrive on the next (got: $got)"
+  fi
+  rm -rf "$BRIDGER_ROOT" "$bw"
+)
+pass "an unreadable record does not hide other peers, and an empty cursor loses no mail"
+
+# --- "I cannot look" is not "it is gone" --------------------------------------
+# [ ! -d ] is also false when a parent turned untraversable, and a live session
+# may be reading inside. reap --force would then unregister a healthy peer and
+# strand its mail on a directory that demonstrably exists.
+(
+  # root traverses a 0000 directory regardless, which would make this vacuous.
+  [ "$(id -u)" = "0" ] && exit 0
+  BRIDGER_ROOT=$(mktemp -d); pw=$(mktemp -d)
+  export BRIDGER_ROOT
+  mkdir -p "$pw/outer/inner" "$pw/other"
+  "$bridger" register victim "$pw/outer/inner" >/dev/null
+  "$bridger" register other "$pw/other" >/dev/null
+  (cd "$pw/other" && "$bridger" send victim chat "mine" >/dev/null 2>&1)
+  chmod 000 "$pw/outer"
+  # chmod back no matter how the assertions go, or the temp dir cannot be removed.
+  trap 'chmod 755 "$pw/outer" 2>/dev/null || true' EXIT
+  listed=$("$bridger" peers)
+  ! grep -q "^victim \[missing\]" <<<"$listed" \
+    || fail "an untraversable parent is not proof the directory is gone (got: $listed)"
+  "$bridger" reap --force >/dev/null
+  [ -f "$BRIDGER_ROOT/peers/victim.json" ] \
+    || fail "reap --force must not unregister a peer whose directory it merely cannot look at"
+  chmod 755 "$pw/outer"
+  rm -rf "$BRIDGER_ROOT" "$pw"
+)
+pass "an untraversable parent leaves a peer registered and unreaped"
+
 # --- statusline badge + drop-in wiring ---------------------------------------
 # Fully isolated: its own BRIDGER_ROOT (badge state) and CLAUDE_CONFIG_DIR
 # (settings.json + statusline.d), so it never touches the real ~/.claude.

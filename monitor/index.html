@@ -207,6 +207,9 @@ a { color: var(--accent); }
   background: var(--muted); flex: none;
 }
 .dot[data-status="listening"] { background: var(--ok); }
+/* Missing means the peer's registered directory is gone. It still receives, so
+   this is a warning to clean up, not a failure. */
+.dot[data-status="missing"] { background: var(--warn); }
 
 /* ------------------------------------------------------------- peer rows */
 .peer {
@@ -467,6 +470,15 @@ const CHIP_ROLES = {
   blocked: "--danger", chat: "--p6", stop: "--warn",
 };
 
+/* Both non-listening statuses mean "nothing is reading right now", never "this
+   peer is unreachable" — messages wait on disk and arrive on its next activity.
+   Only `ask` proves reachability. */
+const STATUS_HELP = {
+  listening: "Its watcher is running: messages arrive now.",
+  queued: "No watcher is running for this peer. It is still addressable and still receives — it reads on its next activity.",
+  missing: "The directory this peer registered no longer exists, and no watcher is running for it — usually a deleted worktree. It is still addressable and still receives, and may even be a live session reading from the removed path. Clear it with 'bridger reap'.",
+};
+
 const $ = (id) => document.getElementById(id);
 let state = null;
 let selected = null;
@@ -640,7 +652,11 @@ function renderPeers(snapshot) {
       h("span", { class: "meta" },
         h("span", { class: "top" },
           h("span", { class: "name", style: peerVar(peer.name), text: peer.name }),
-          h("span", { class: "status" },
+          // Every other surface pairs these words with what they do NOT mean.
+          // This one is aimed at people who never read --help, and an amber
+          // "missing" next to a red "cannot hear" tile reads as "peer is dead"
+          // — the one conclusion the status is not entitled to.
+          h("span", { class: "status", title: STATUS_HELP[peer.status] || "" },
             h("span", { class: "dot", "data-status": peer.status }),
             peer.status,
             peer.status === "listening" ? "" : " · seen " + ago(peer.last_seen_age))),
