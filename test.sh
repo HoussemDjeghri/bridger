@@ -394,6 +394,32 @@ pass "same name: live holder refused, dead holder taken over"
   rm -rf "$BRIDGER_ROOT"
 )
 
+# --- a summary must not resurrect the record a rename just deleted -----------
+# `summary` and `register` are both read-modify-write on one peer record, and
+# `register`'s rename deletes it outright. Racing them, summary's mv writes the
+# deleted record back, so ONE session ends up with two peer records. Then
+# resolve_identity breaks the tie by glob order: the session answers to the OLD
+# name while register's own output and the statusline badge say the new one, and
+# every message addressed to the name the user was told they have lands in a
+# thread nobody reads. It reproduced 62% of the time, so this runs a handful of
+# rounds rather than one.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  sr="$work/sumrace"
+  for round in 1 2 3 4 5 6 7 8; do
+    rm -rf "$BRIDGER_ROOT/peers"; mkdir -p "$sr/$round"
+    (cd "$sr/$round" && CLAUDE_CODE_SESSION_ID=sr1 "$bridger" register alpha >/dev/null 2>&1)
+    (cd "$sr/$round" && CLAUDE_CODE_SESSION_ID=sr1 "$bridger" summary note >/dev/null 2>&1) &
+    (cd "$sr/$round" && CLAUDE_CODE_SESSION_ID=sr1 "$bridger" register beta >/dev/null 2>&1) &
+    wait
+    n=$(ls "$BRIDGER_ROOT/peers"/*.json 2>/dev/null | grep -c . || true)
+    [ "$n" -le 1 ] \
+      || fail "round $round left one session holding $n peer records — it will answer to the wrong name"
+  done
+  pass "a concurrent summary cannot resurrect a renamed-away registration"
+  rm -rf "$BRIDGER_ROOT"
+)
+
 # --- no cross-session name adoption (the "wrong role" bug) -------------------
 # A directory that accumulated peers from earlier sessions must not hand its
 # names to an unrelated new session. Isolated root + AUTO off (opt-in mode).

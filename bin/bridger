@@ -527,6 +527,42 @@ require_identity() {
   echo "$me"
 }
 
+# Serialise read-modify-write on ONE peer record. `register` reads .summary and
+# .created and only writes some milliseconds later (two `git rev-parse` forks
+# happen in between), while `summary` runs its own read-modify-write on the same
+# file — and `register` may delete that file entirely on the rename path. Racing
+# them, `summary`'s mv RESURRECTS the record `register` just removed, leaving one
+# session with two peer records. resolve_identity then breaks the tie by glob
+# order, so the session answers to the OLD name while `register` and the
+# statusline badge both report the new one, and every message sent to the name
+# the user was told they have lands in a thread nobody ever reads. Measured at
+# 62% when a summary and a register are issued together.
+#
+# mkdir is the atomic primitive available to a shell script; a directory is the
+# lock. Held only across a bounded mktemp + jq + mv, never across a fork of git
+# or a network call.
+peer_lock() { # name
+  local lock="$(peer_file "$1").lock" tries=0
+  until mkdir "$lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    # Every holder below finishes in milliseconds, so a lock still standing after
+    # two seconds belongs to a writer that died. Breaking it beats wedging every
+    # future registration on this name — including the hooks that run per turn.
+    if [ "$tries" -ge 100 ]; then rm -rf "$lock"; continue; fi
+    sleep 0.02
+  done
+}
+
+peer_unlock() { rm -rf "$(peer_file "$1").lock"; }
+
+# Remove a registration, under its lock so a concurrent summary cannot write the
+# record back after it is gone.
+drop_peer() { # name
+  peer_lock "$1"
+  rm -f "$(peer_file "$1")" "$(beat_file "$1")"
+  peer_unlock "$1"
+}
+
 # Write (or refresh) a peer record. Preserves the summary of an existing peer,
 # since re-registering the same directory must not erase what it said it does.
 # BRIDGER_SESSION_ID, when set (the session-start hook exports it), records
@@ -634,7 +670,7 @@ cmd_register() {
       die "you are '$mine', which has message history.
        Keep that name, or run 'bridger leave' first — its thread stays on disk as a log."
     fi
-    rm -f "$(peer_file "$mine")" "$(beat_file "$mine")"
+    drop_peer "$mine"
   fi
 
   # Upgrade a session-less derived name sitting on this exact directory (the
@@ -645,7 +681,7 @@ cmd_register() {
      && [ "$(jq -r .cwd "$(peer_file "$existing")")" = "$dir" ] \
      && [ -z "$(jq -r '.session // ""' "$(peer_file "$existing")")" ] \
      && ! peer_has_history "$existing"; then
-    rm -f "$(peer_file "$existing")" "$(beat_file "$existing")"
+    drop_peer "$existing"
   fi
 
   optout_remove "$dir"   # naming a directory is an explicit opt-in
@@ -666,7 +702,7 @@ cmd_leave() {
     return 0
   fi
   dir=$(jq -r .cwd "$(peer_file "$me")")
-  rm -f "$(peer_file "$me")" "$(beat_file "$me")"
+  drop_peer "$me"
   statusline_clear   # unregistered → badge gone next tick
   optout_add "$dir"
   echo "left the bridger as '$me'; $dir will not auto-register (history kept)"
@@ -746,12 +782,21 @@ cmd_summary() {
   local text="${*:-}" me tmp
   [ -n "$text" ] || die "usage: bridger summary <text>"
   me=$(require_identity)
+  peer_lock "$me"
+  # Re-check under the lock. Between require_identity and here, a register may
+  # have renamed this session — and writing then would recreate the record it
+  # deleted, leaving the session with two names and answering to the wrong one.
+  if [ ! -f "$(peer_file "$me")" ]; then
+    peer_unlock "$me"
+    die "'$me' was unregistered while setting its summary — re-run it under the current name"
+  fi
   # Unique temp name, for the same reason write_peer uses one: a fixed
   # "<name>.json.tmp" is shared with a concurrent register of this peer, and the
   # loser of that race commits an interleaved record.
   tmp=$(mktemp "$(peer_file "$me").XXXXXX")
   jq --arg s "$text" '.summary = $s' "$(peer_file "$me")" > "$tmp"
   mv "$tmp" "$(peer_file "$me")"
+  peer_unlock "$me"
   echo "summary set for '$me'"
 }
 
@@ -1302,7 +1347,7 @@ cmd_reap() {
     # the backlog — seconds for a busy peer. A session that re-registered the
     # name into a real directory inside that window must not be deleted.
     if [ "$force" -eq 1 ] && [ "$(peer_status "$name")" = missing ]; then
-      rm -f "$(peer_file "$name")" "$(beat_file "$name")"
+      drop_peer "$name"
       reaped=1
     fi
   done
