@@ -420,6 +420,30 @@ pass "same name: live holder refused, dead holder taken over"
   rm -rf "$BRIDGER_ROOT"
 )
 
+# --- a refresh of a peer record must not overwrite a summary set beside it ---
+# write_peer is itself one long read-modify-write: it reads .summary here and
+# only commits at its mv, with a `git rev-parse` fork in between. Locking only
+# `summary` and the deletes left THIS side unserialised, so a summary committed
+# in the gap was still overwritten with the stale value it had read. The session
+# start hook runs `autoregister` while the agent may be running `summary`, which
+# is exactly this pairing.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  lw="$work/lostsummary"
+  for round in 1 2 3 4 5 6; do
+    rm -rf "$BRIDGER_ROOT/peers"
+    mkdir -p "$lw/$round"
+    (cd "$lw/$round" && CLAUDE_CODE_SESSION_ID=lw1 "$bridger" register alpha >/dev/null 2>&1)
+    (cd "$lw/$round" && CLAUDE_CODE_SESSION_ID=lw1 "$bridger" summary "THE-NOTE" >/dev/null 2>&1) &
+    (cd "$lw/$round" && CLAUDE_CODE_SESSION_ID=lw1 CLAUDE_BRIDGER_AUTO=1 "$bridger" autoregister >/dev/null 2>&1) &
+    wait
+    grep -q 'THE-NOTE' "$BRIDGER_ROOT"/peers/*.json 2>/dev/null \
+      || fail "round $round lost a summary to a concurrent record refresh"
+  done
+  pass "a summary survives a peer record refreshed beside it"
+  rm -rf "$BRIDGER_ROOT"
+)
+
 # --- no cross-session name adoption (the "wrong role" bug) -------------------
 # A directory that accumulated peers from earlier sessions must not hand its
 # names to an unrelated new session. Isolated root + AUTO off (opt-in mode).

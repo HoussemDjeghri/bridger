@@ -546,15 +546,29 @@ require_identity() {
 # lock. Held only across a bounded mktemp + jq + mv, never across a fork of git
 # or a network call.
 peer_lock() { # name
-  local lock="$(peer_file "$1").lock" tries=0
+  local lock="$(peer_file "$1").lock" tries=0 holder
   until mkdir "$lock" 2>/dev/null; do
     tries=$((tries + 1))
-    # Every holder below finishes in milliseconds, so a lock still standing after
-    # two seconds belongs to a writer that died. Breaking it beats wedging every
-    # future registration on this name — including the hooks that run per turn.
-    if [ "$tries" -ge 100 ]; then rm -rf "$lock"; continue; fi
+    # Break in only for a holder that is GONE, never one that is merely slow.
+    # Spinning a fixed number of times cannot tell those apart, and this machine
+    # does get loaded enough for a holder to overrun any such budget — at which
+    # point the waiter deletes a LIVE holder's lock and both are inside the same
+    # record, which is the exact thing the lock exists to prevent. Worse, the
+    # original holder then unlocks on its way out and frees the breaker's lock
+    # too. The pid makes the question answerable instead of guessed.
+    if [ "$tries" -ge 25 ]; then
+      holder=$(cat "$lock/pid" 2>/dev/null || true)
+      case "$holder" in
+        # No readable pid: either a holder that died between mkdir and the write
+        # below, or a stale directory from an older version. Give it a long
+        # backstop rather than wedging every future write to this name.
+        ''|*[!0-9]*) [ "$tries" -lt 250 ] || rm -rf "$lock" ;;
+        *) kill -0 "$holder" 2>/dev/null || rm -rf "$lock" ;;
+      esac
+    fi
     sleep 0.02
   done
+  echo $$ > "$lock/pid"
 }
 
 peer_unlock() { rm -rf "$(peer_file "$1").lock"; }
@@ -575,6 +589,12 @@ drop_peer() { # name
 write_peer() { # name dir
   local name="$1" dir="$2" summary="" created session="${BRIDGER_SESSION_ID:-}"
   created=$(now_utc)
+  mkdir -p "$BRIDGER_ROOT/peers"
+  # This whole function is one read-modify-write on a peer record: it reads
+  # .summary/.created/.cwd/.session here and only commits at the mv below. Adding
+  # the lock to `summary` and the deletes alone left THIS side unserialised, so a
+  # summary committed in between was still overwritten with the stale value.
+  peer_lock "$name"
   if [ -f "$(peer_file "$name")" ]; then
     summary=$(jq -r '.summary // ""' "$(peer_file "$name")")
     created=$(jq -r '.created // empty' "$(peer_file "$name")")
@@ -588,7 +608,6 @@ write_peer() { # name dir
       || session=$(jq -r '.session // ""' "$(peer_file "$name")")
     [ -n "$created" ] || created=$(now_utc)
   fi
-  mkdir -p "$BRIDGER_ROOT/peers"
   # Written to a temp file and moved into place. A plain `>` truncates first, so
   # a concurrent reader can see an empty record — and an empty record has no
   # cwd, which peer_status weighs when deciding "missing". A live peer must never
@@ -610,6 +629,7 @@ write_peer() { # name dir
       summary: $summary, session: $session, created: $created, last_seen: $seen}' \
     > "$tmp"
   mv "$tmp" "$(peer_file "$name")"
+  peer_unlock "$name"
 }
 
 # Does this peer have any message history? Renaming away from a name with a
