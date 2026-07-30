@@ -842,6 +842,21 @@ def selftest():
         beat = os.path.join(peers_dir, "pidjunk.beat")
         assert watcher_alive(beat) is True, junk
         assert beat_pid_alive(beat) is False, junk
+    # Decorated forms of a pid that IS alive and IS ours. Only here does the
+    # numeric check decide beat_pid_alive's answer: with the pids above os.kill
+    # fails anyway, so a looser check would return False for the right reason by
+    # accident and nothing would notice.
+    beat = os.path.join(peers_dir, "pidjunk.beat")
+    for junk in ("+%d" % os.getpid(), "%d\r" % os.getpid()):
+        with open(beat, "w") as handle:
+            handle.write(junk + "\n")
+        assert beat_pid_alive(beat) is False, junk
+    # A pid too long for a C long raises OverflowError inside os.kill. bash's
+    # `kill -0` calls that "not running"; anything else 500s the endpoint.
+    with open(beat, "w") as handle:
+        handle.write("9" * 30 + "\n")
+    assert beat_pid_alive(beat) is False
+    assert watcher_alive(beat) is False
     os.remove(os.path.join(peers_dir, "pidjunk.beat"))
 
     # An untraversable parent is not proof of absence — see dir_gone. The
@@ -874,6 +889,16 @@ def selftest():
     assert thread["undelivered"] == {"alpha": 1, "beta": 2}, thread["undelivered"]
     assert thread["queued"] == 3
     assert [m["delivered"] for m in thread["messages"]] == [True, True, False, False, False]
+
+    # A name may end in a single dash but may never CONTAIN a doubled one
+    # (bin/bridger valid_name), which is what makes at most one split legal. A
+    # directory with two "--" satisfies none of them and must be warned and
+    # skipped — not resolved to the first split, which puts a name `register` can
+    # never issue on one side, whose cursor lookup therefore always misses and
+    # whose every message reads as permanently queued.
+    ambiguous = []
+    assert _split_pair("a--b--c", ambiguous) is None, ambiguous
+    assert any("not a <a>--<b> pair" in w for w in ambiguous), ambiguous
 
     dashed_thread = next(t for t in state["threads"] if t["id"] == "ab---abc")
     assert (dashed_thread["a"], dashed_thread["b"]) == ("ab-", "abc"), dashed_thread

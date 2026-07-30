@@ -33,9 +33,6 @@ audit reports under
   the whole unread run. Design is worked out and sound (`cycle6-delivery.md`), but
   0.14.0 removed both reasons it was urgent — the fork-per-message cost and the
   `ARG_MAX` cliff.
-- **The monitor 500s on an over-long pid in a beat file.** `monitor/server.py`
-  raises `OverflowError` past `int` range. The web view is read-only and advisory;
-  the bus is unaffected. Spec: `cycle6-mutation.md` `## P10`.
 - **`session-start.sh`'s "this session is *now* registered" is unbounded and can be
   wrong.** It fires on registrations that are not this session's. Noise, not
   misdelivery. Cycle-3 F5.
