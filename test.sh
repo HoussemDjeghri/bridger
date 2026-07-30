@@ -1953,6 +1953,46 @@ if [ "$(id -u)" -ne 0 ]; then
 )
 fi
 
+# --- the unread scan must not read past the bound its cursor will be set to ----
+# cmd_poll snapshots max_seq ONCE and hands the same value to the scan and to
+# advance_cursor. Drop the upper half of the scan's range check and the scan reads
+# whatever is on disk when sorted_stems globs — later than the snapshot — so a
+# message landing in that window is DELIVERED while the cursor stops below it, and
+# the next poll delivers it again. Timing-based, but only in the safe direction: a
+# duplicate is positive proof, and missing the window costs the assertion's value,
+# never a false red. Do not "fix" this into a flaky gate on the window being hit.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  rw="$work/racewin"; mkdir -p "$rw/a" "$rw/b"
+  "$bridger" register zsend "$rw/a" >/dev/null
+  "$bridger" register zrecv "$rw/b" >/dev/null
+  rtd="$BRIDGER_ROOT/threads/zrecv--zsend"; mkdir -p "$rtd"
+  # Wide enough that max_seq's glob and sorted_stems' glob are milliseconds apart.
+  for i in $(seq 1 4000); do
+    printf '{"seq":%d,"from":"zsend","to":"zrecv","type":"chat","body":"b%d","ts":"2026-01-01T00:00:00Z"}\n' \
+      "$i" "$i" > "$rtd/$(printf '%05d' "$i").json"
+  done
+  rf="$rw/first"; rs="$rw/second"
+  (cd "$rw/b" && "$bridger" poll >"$rf" 2>/dev/null) &
+  rpid=$!
+  perl -e 'select(undef,undef,undef,0.05)'
+  printf '{"seq":4001,"from":"zsend","to":"zrecv","type":"chat","body":"LATE","ts":"2026-01-01T00:00:00Z"}\n' \
+    > "$rtd/04001.json"
+  wait "$rpid" 2>/dev/null || true
+  (cd "$rw/b" && "$bridger" poll >"$rs" 2>/dev/null) || true
+  rfirst=$(grep -c LATE "$rf" || true); rsecond=$(grep -c LATE "$rs" || true)
+  [ "$(( rfirst + rsecond ))" -le 1 ] \
+    || fail "a message that landed during the scan was delivered twice (first=$rfirst second=$rsecond)"
+  # Held back and then delivered once is the window being exercised; delivered in
+  # the first poll means the write beat the snapshot and nothing was tested.
+  if [ "$rsecond" -eq 1 ]; then
+    pass "the unread scan never reads past the bound the cursor will be set to"
+  else
+    pass "the unread scan never reads past its bound (window missed — not exercised this run)"
+  fi
+  rm -rf "$BRIDGER_ROOT"
+)
+
 # --- a read-only bus ROOT must not silently reinstate the storm ---------------
 # Making the wedge scratch file optional (so a read-only root stays readable) also
 # turned "I could not learn the wedge seq" into "there was no wedge" on a
