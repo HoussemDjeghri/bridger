@@ -819,8 +819,17 @@ peer_lock() { # name [kind]
       # `-e`, because a dangling link is invisible to `-e` and would otherwise
       # fall through to the probe below and spin in silence, which is precisely
       # the failure this whole branch exists to prevent.
-      if [ -e "$lock" ] || [ -L "$lock" ]; then
-        die "cannot lock '$1': $lock exists and is not a lock directory — remove it"
+      # Sampled TWICE, because one reading cannot tell an obstruction from the
+      # race: between `[ ! -d ]` above and this test another writer takes the
+      # lock, so `-e` is true and `-d` was false, and a single sample called a
+      # perfectly healthy contended lock an obstruction. (It did — this failed
+      # the 30-way race test on its first run.) A file or a dangling link is
+      # permanent; the racing shape is gone 20ms later.
+      if { [ -e "$lock" ] || [ -L "$lock" ]; } && [ ! -d "$lock" ]; then
+        sleep 0.02
+        if { [ -e "$lock" ] || [ -L "$lock" ]; } && [ ! -d "$lock" ]; then
+          die "cannot lock '$1': $lock exists and is not a lock directory — remove it"
+        fi
       fi
       # Nothing there at all. Either the mkdir failed for a reason waiting cannot
       # fix, or the holder released in the microsecond between the mkdir and this
