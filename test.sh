@@ -113,6 +113,47 @@ wait "$responder" || fail "responder never saw the ask"
 [ "$(jq -r .type <<<"$reply")" = "answer" ] || fail "reply type"
 pass "ask/answer roundtrip with ref matching"
 
+# --- ask must drain only its own thread ---------------------------------------
+# `ask` waited by calling `cmd_poll --json`, which polls EVERY thread. A third
+# peer's mail that happened to land during the wait was consumed — cursor moved,
+# gone from the inbox for good — and re-emitted on ask's stderr. stderr is not a
+# delivery channel here: the delivery hook discards it (2>/dev/null), so does any
+# agent that redirects, and the message is then unrecoverable. "Ask bob a
+# question" must not consume carol's private ask.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  aw=$(mktemp -d); mkdir -p "$aw/a" "$aw/b" "$aw/c"
+  (cd "$aw/a" && BRIDGER_SESSION_ID=aw-a "$bridger" register awalice >/dev/null)
+  (cd "$aw/b" && BRIDGER_SESSION_ID=aw-b "$bridger" register awbob   >/dev/null)
+  (cd "$aw/c" && BRIDGER_SESSION_ID=aw-c "$bridger" register awcarol >/dev/null)
+  # Carol's traffic is already waiting when alice asks bob.
+  (cd "$aw/c" && BRIDGER_SESSION_ID=aw-c "$bridger" send awalice ask "CAROL-NEEDS-A-DECISION" >/dev/null)
+  (cd "$aw/c" && BRIDGER_SESSION_ID=aw-c "$bridger" send awalice chat "CAROL-CONTEXT" >/dev/null)
+  (
+    cd "$aw/b"; export BRIDGER_SESSION_ID=aw-b
+    for _ in $(seq 1 30); do
+      msg=$("$bridger" poll --json); msg=$(head -n 1 <<<"$msg")
+      if [ -n "$msg" ]; then
+        "$bridger" send awalice answer "yes" --ref "$(jq -r .seq <<<"$msg")" >/dev/null
+        exit 0
+      fi
+      sleep 1
+    done
+    exit 1
+  ) &
+  aresp=$!
+  (cd "$aw/a" && BRIDGER_SESSION_ID=aw-a "$bridger" ask awbob "go?" --timeout 40) >/dev/null 2>&1 \
+    || fail "ask never got its answer"
+  wait "$aresp" || fail "responder never saw the ask"
+  left=$( (cd "$aw/a" && BRIDGER_SESSION_ID=aw-a "$bridger" poll --peek) 2>/dev/null )
+  grep -q 'CAROL-NEEDS-A-DECISION' <<<"$left" \
+    || fail "ask consumed a third peer's ask (inbox afterwards: $left)"
+  grep -q 'CAROL-CONTEXT' <<<"$left" \
+    || fail "ask consumed a third peer's chat (inbox afterwards: $left)"
+  pass "ask drains only the thread it is waiting on"
+  rm -rf "$BRIDGER_ROOT" "$aw"
+)
+
 # --- timeouts ---------------------------------------------------------------
 if (cd "$work/app" && "$bridger" ask liba "void" --timeout 3 >/dev/null 2>&1); then
   fail "ask without responder must time out with nonzero exit"

@@ -1344,12 +1344,17 @@ render_lines() {
 # Default output is the terse line format (token-cheap for agents); --json
 # emits the full stored objects for scripting.
 cmd_poll() {
-  local peek=0 json=0 me peer dir
+  local peek=0 json=0 only="" me peer dir scan
   while [ $# -gt 0 ]; do
     case "$1" in
       --peek) peek=1 ;;
       --json) json=1 ;;
-      *) die "usage: bridger poll [--peek] [--json]" ;;
+      # One thread only. Exists for `ask`, which waits by polling and so
+      # CONSUMES whatever it scans — draining every thread meant a question to
+      # one peer swallowed another peer's mail. Not a display filter: what is
+      # not scanned is not consumed, and stays waiting for a real poll.
+      --peer) [ $# -ge 2 ] || die "--peer needs a peer name"; only="$2"; shift ;;
+      *) die "usage: bridger poll [--peek] [--json] [--peer <name>]" ;;
     esac
     shift
   done
@@ -1394,7 +1399,14 @@ cmd_poll() {
   local beat beat_owner=""
   beat=$(beat_file "$me")
   [ ! -r "$beat" ] || read -r beat_owner < "$beat" || true
-  for peer in $(other_peers "$me"); do
+  if [ -n "$only" ]; then
+    [ "$only" != "$me" ] || die "cannot poll your own thread with yourself"
+    require_peer "$only"
+    scan="$only"
+  else
+    scan=$(other_peers "$me")
+  fi
+  for peer in $scan; do
     [ "$beat_owner" != "$$" ] || echo $$ > "$beat"
     dir=$(thread_dir "$me" "$peer")
     [ -d "$dir" ] || continue
@@ -1567,10 +1579,14 @@ cmd_ask() {
         answer="$line"
         continue
       fi
-      # Unrelated traffic consumed while waiting — surface it, don't drop it.
+      # Other traffic from the SAME peer, consumed while waiting — surface it,
+      # don't drop it. Scoped to this thread now (see --peer), so a third peer's
+      # mail is no longer consumed here at all: it was moved past the cursor and
+      # re-emitted on stderr, which the delivery hook discards and any redirect
+      # loses, so asking bob a question destroyed carol's private ask.
       render_lines <<<"$line" >&2
     done <<EOF
-$(cmd_poll --json)
+$(cmd_poll --json --peer "$to")
 EOF
     # Drain the WHOLE batch before returning. `cmd_poll --json` above already
     # consumed it and moved every cursor, so returning the moment the match was
