@@ -860,8 +860,12 @@ drop_peer() { # name
 # BRIDGER_SESSION_ID, when set (the session-start hook exports it), records
 # which Claude Code session currently answers to this name — the session id is
 # also the transcript filename, so a peer can be traced back to its session.
-write_peer() { # name dir
-  local name="$1" dir="$2" summary="" created session="${BRIDGER_SESSION_ID:-}"
+# $3/$4 carry a summary and a created stamp forward from a record this caller is
+# about to destroy — the rename path, which writes a name that has no record of
+# its own, so the preserve branch below cannot see the fields it exists to keep.
+# A record already at $name always wins over them: it is the more recent truth.
+write_peer() { # name dir [summary] [created]
+  local name="$1" dir="$2" summary="${3:-}" created="${4:-}" session="${BRIDGER_SESSION_ID:-}"
   # The sink refuses too, because every caller that lost its directory produced
   # the same record: identity matches on `case "$PWD" in "$cwd"|"$cwd"/*)`, so an
   # empty cwd is a peer that answers to every directory on the machine.
@@ -871,7 +875,6 @@ write_peer() { # name dir
   # so a path with a newline in it shifts every field after it — in identity
   # resolution that decides who a session IS.
   case "$dir" in *$'\n'*) die "refusing to register '$name': its directory path contains a newline" ;; esac
-  created=$(now_utc)
   mkdir -p "$BRIDGER_ROOT/peers"
   # This whole function is one read-modify-write on a peer record: it reads
   # .summary/.created/.cwd/.session here and only commits at the mv below. Adding
@@ -889,8 +892,10 @@ write_peer() { # name dir
     [ -n "$session" ] \
       || [ "$(jq -r '.cwd // ""' "$(peer_file "$name")")" != "$dir" ] \
       || session=$(jq -r '.session // ""' "$(peer_file "$name")")
-    [ -n "$created" ] || created=$(now_utc)
   fi
+  # Last, so it covers both a record that had no stamp and a fresh name with
+  # nothing carried in.
+  [ -n "$created" ] || created=$(now_utc)
   # Written to a temp file and moved into place. A plain `>` truncates first, so
   # a concurrent reader can see an empty record — and an empty record has no
   # cwd, which peer_status weighs when deciding "missing". A live peer must never
@@ -927,6 +932,7 @@ peer_has_history() { # name
 
 cmd_register() {
   local name="${1:-}" dir="${2:-$PWD}" sid mine existing holder prev status
+  local keep_summary="" keep_created=""
   [ -n "$name" ] || die "usage: bridger register <name> [dir]"
   valid_name "$name" || die "invalid name '$name' (lowercase letters, digits, single dashes; max 32 chars)"
   [ -d "$dir" ] || die "no such directory: $dir"
@@ -1004,6 +1010,15 @@ cmd_register() {
       die "you are '$mine', which has message history.
        Keep that name, or run 'bridger leave' first — its thread stays on disk as a log."
     fi
+    # Carry the description across. write_peer keeps a summary by reading the
+    # record it is about to overwrite, and a rename writes a name that has no
+    # record — so this, the one path that calls itself "a clean rename", was the
+    # one path that silently discarded the field. The summary is what other
+    # agents read to choose a peer, and nothing tells a renamed session to set it
+    # again: it went from "owns the API schema" to a blank column. `created`
+    # resetting made the peer look brand new on top of that.
+    keep_summary=$(jq -r '.summary // ""' "$(peer_file "$mine")" 2>/dev/null || true)
+    keep_created=$(jq -r '.created // empty' "$(peer_file "$mine")" 2>/dev/null || true)
     drop_peer "$mine"
   fi
 
@@ -1022,7 +1037,7 @@ cmd_register() {
   # that cannot be written, a full disk), and cancelling the opt-out first left a
   # directory opted back IN to autoregistration with no registration to show for
   # it. Nothing between the two depends on the order.
-  BRIDGER_SESSION_ID="$sid" write_peer "$name" "$dir"   # claim it for this session
+  BRIDGER_SESSION_ID="$sid" write_peer "$name" "$dir" "$keep_summary" "$keep_created"   # claim it for this session
   trap - EXIT; peer_unlock "$name" claim   # the record exists: the name is taken
   optout_remove "$dir"   # naming a directory is an explicit opt-in
   statusline_write "$name"   # light the badge this tick, no statusLine rewrite

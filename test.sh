@@ -816,6 +816,42 @@ pass "dormant name reclaimed by a new session; queued messages delivered"
   rm -rf "$BRIDGER_ROOT" "$gh"
 )
 
+# --- a rename keeps the identity, including what it says about itself ---------
+# `register <newname>` is documented as "a clean rename of MY OWN identity", and
+# write_peer's header promises it "preserves the summary of an existing peer".
+# The rename drops the old record and then writes a name that has none, so the
+# preserving branch never ran: the summary — the field other agents read to
+# choose a peer, and which nothing prompts a renamed session to set again — went
+# blank, and `created` reset so the peer looked brand new. Deterministic, not a
+# race: 40/40 in the concurrent harness too.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  rn=$(mktemp -d); mkdir -p "$rn/d"
+  (cd "$rn/d" && BRIDGER_SESSION_ID=rn-s "$bridger" register rnalpha >/dev/null)
+  (cd "$rn/d" && BRIDGER_SESSION_ID=rn-s "$bridger" summary "owns the API schema" >/dev/null)
+  # A stamp far enough back that "preserved" cannot be confused with "rewritten
+  # in the same second".
+  jq '.created = "2020-01-01T00:00:00Z"' "$BRIDGER_ROOT/peers/rnalpha.json" > "$rn/tmp.json"
+  mv "$rn/tmp.json" "$BRIDGER_ROOT/peers/rnalpha.json"
+  (cd "$rn/d" && BRIDGER_SESSION_ID=rn-s "$bridger" register rnbeta >/dev/null)
+  [ ! -f "$BRIDGER_ROOT/peers/rnalpha.json" ] || fail "the rename left the old record behind"
+  [ "$(jq -r .summary "$BRIDGER_ROOT/peers/rnbeta.json")" = "owns the API schema" ] \
+    || fail "the rename discarded the peer's summary"
+  [ "$(jq -r .created "$BRIDGER_ROOT/peers/rnbeta.json")" = "2020-01-01T00:00:00Z" ] \
+    || fail "the rename reset created, so the peer looks brand new"
+  # A name that already exists is the more recent truth and must win over what
+  # the rename carries in.
+  (cd "$rn/d" && BRIDGER_SESSION_ID=rn-s "$bridger" summary "now owns the parser" >/dev/null)
+  mkdir -p "$rn/other"
+  (cd "$rn/other" && BRIDGER_SESSION_ID=rn-o "$bridger" register rngamma >/dev/null)
+  (cd "$rn/other" && BRIDGER_SESSION_ID=rn-o "$bridger" summary "owns the loader" >/dev/null)
+  (cd "$rn/other" && BRIDGER_SESSION_ID=rn-o "$bridger" register rngamma >/dev/null)
+  [ "$(jq -r .summary "$BRIDGER_ROOT/peers/rngamma.json")" = "owns the loader" ] \
+    || fail "re-registering an existing name lost its own summary"
+  pass "a rename carries the summary and the created stamp to the new name"
+  rm -rf "$BRIDGER_ROOT" "$rn"
+)
+
 unset CLAUDE_BRIDGER_AUTO
 rm -rf "$disc"
 
