@@ -1776,7 +1776,16 @@ cmd_dormant() {
     # The filename is the address — peer and beat files are keyed by it, so a
     # record whose .name drifted would otherwise offer a name nothing can reach.
     name=$(basename "$f" .json)
-    cwd=$(jq -er '.cwd // ""' "$f" 2>/dev/null) || continue   # unreadable: not reclaimable
+    # CWD_FILTER, not `.cwd // ""`: the default converts null, absent and false
+    # into the STRING "", which `jq -e` reports as success, so the `|| continue`
+    # this line relies on could never fire for the shapes it was written for. An
+    # empty cwd then matched `case "$PWD" in ""|""/*)` nowhere — but a record with
+    # a non-string cwd (an array, a number) printed one, and every such record was
+    # offered as reclaimable from EVERY directory on the machine. Reclaiming takes
+    # the name and the mail queued to it, so a record belonging to another project
+    # was reachable from an unrelated one. Same rule as everywhere else here: a
+    # record without a usable address addresses nothing.
+    cwd=$(jq -er "$CWD_FILTER" "$f" 2>/dev/null) || continue   # unreadable or address-less
     sess=$(jq -r '.session // ""' "$f")
     case "$PWD" in "$cwd"|"$cwd"/*) ;; *) continue ;; esac
     [ -n "$sid" ] && [ "$sess" = "$sid" ] && continue        # already mine

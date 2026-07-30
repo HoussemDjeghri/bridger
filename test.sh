@@ -789,6 +789,33 @@ pass "no cross-session name adoption; join binds; owning session still resolves"
 )
 pass "dormant name reclaimed by a new session; queued messages delivered"
 
+# --- a record with no usable address is reclaimable from nowhere --------------
+# `.cwd // ""` turns null, absent, false and a non-string into a value jq -e
+# calls SUCCESS, so the `|| continue` guarding this could never fire for the
+# shapes it was written for. The offer is scoped by `case "$PWD" in "$cwd"...`,
+# and a record whose cwd is an array rendered as a pattern that matched
+# everywhere: it was offered as reclaimable in every directory on the machine,
+# and reclaiming takes the name AND the mail queued to it — another project's
+# peer, one `register` away from an unrelated session.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  gh=$(mktemp -d); mkdir -p "$gh/real" "$gh/unrelated" "$BRIDGER_ROOT/peers"
+  (cd "$gh/real" && BRIDGER_SESSION_ID=gh-r "$bridger" register ghreal >/dev/null)
+  for shape in 'null' 'false' '["/tmp","/x"]' '17' '{}'; do
+    jq -n --argjson c "$shape" \
+      '{name:"ghost", repo:"", branch:"", summary:"", session:"long-gone",
+        created:"2026-01-01T00:00:00Z", last_seen:"2026-01-01T00:00:00Z"} + (if $c == {} then {} else {cwd:$c} end)' \
+      > "$BRIDGER_ROOT/peers/ghost.json"
+    for d in "$gh/real" "$gh/unrelated" /tmp; do
+      out=$( (cd "$d" && BRIDGER_SESSION_ID=gh-x "$bridger" dormant) 2>/dev/null || true )
+      ! grep -q '^ghost' <<<"$out" \
+        || fail "a record with cwd=$shape was offered as reclaimable in $d (got: $out)"
+    done
+  done
+  pass "an address-less peer record is offered for reclaim in no directory at all"
+  rm -rf "$BRIDGER_ROOT" "$gh"
+)
+
 unset CLAUDE_BRIDGER_AUTO
 rm -rf "$disc"
 
