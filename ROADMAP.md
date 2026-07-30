@@ -25,18 +25,21 @@ audit reports under
 - **The delivery hooks' marker gate is unscoped.** `find "$BRIDGER_ROOT/threads"
   -name '*.json' -newer "$marker"` matches traffic between *any* two peers, so one
   unrelated message in flight puts every session on the machine back on the full
-  path. Measured at 51 peers: 0.129s idle vs 3.31s with one unrelated message.
-  Was a delivery-failure risk while the full path cost ~204 forks; at 9 forks
-  (0.14.0) it is a cost. Scoping it to `threads/*$me*` needs `$me`, which
-  0.14.0's registry read made cheap. Spec: `cycle5-hooks.md` `## C6`.
+  path. It was filed at 0.129s idle vs **3.31s** busy, at 51 peers — a
+  delivery-failure risk against the 5s hook timeout. **Re-measured at 0.15.0 on the
+  same fixture: 0.239s idle, 0.543s busy, 0.509s on the first call of a session,
+  0.262s for a session that is not a peer at all.** The registry read and the
+  by-name `peers` lookup took the full path apart, so the timeout is no longer
+  reachable at any plausible peer count and the scoping is not worth its risk.
+  Spec: `cycle5-hooks.md` `## C6`.
 - **`poll --peek` has no `--limit`.** `deliver.sh` shows at most 5 lines but scans
   the whole unread run. Design is worked out and sound (`cycle6-delivery.md`), but
   0.14.0 removed both reasons it was urgent — the fork-per-message cost and the
-  `ARG_MAX` cliff.
-- **`session-start.sh`'s "this session is *now* registered" is unbounded and can be
-  wrong.** It fires on registrations that are not this session's. Noise, not
-  misdelivery. Cycle-3 F5.
+  `ARG_MAX` cliff. Building it now would add a flag with two ways to lose mail
+  (a limit on a consuming poll, a limit counted in files rather than selections)
+  to bound a scan that costs 0.35s at 51 peers.
 
-Not yet triaged against this bar: identity C1/C5/C6/C7, hooks C7/C8, delivery
-C5-2/5/6/9/10/11/12, monitor F8/F10. Read each before filing it here — the point
-of the bar is that it is applied, not assumed.
+Everything else the audit found has now been read first-hand and either fixed or
+listed above — there is no untriaged tail. What was fixed is in the CHANGELOG;
+the reproduction for each is in the audit reports. The bar stays "can it lose or
+misroute a message", and it is applied by reading the finding, not by assuming.
