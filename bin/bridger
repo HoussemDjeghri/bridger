@@ -383,8 +383,17 @@ unread_in_thread() {
   # argv past ARG_MAX) discards the capture and falls through to the per-file
   # walk, which is where the wedge/skip semantics live and where they stay. The
   # fork-per-message cost is then paid only by a thread that actually has a fault.
+  # `halt_error`, not `error`: on a MULTI-FILE argv jq treats `error()` as a
+  # per-input fault — it reports it on stderr (which goes to /dev/null here) and
+  # exits 0 anyway, so a bare null/array/string produced no signal at all and the
+  # batch returned as if the run were clean. The cursor then advanced past a
+  # message nobody was ever told about. `halt_error` aborts the whole run with the
+  # code it is given, and 5 is deliberate: it is the code the per-file walk below
+  # already reads as "bytes that will never improve, skip loudly", so the fallback
+  # emits the existing diagnostic unchanged. Its partial stdout is discarded with
+  # the rest of the capture.
   if [ "$batch_ok" -eq 1 ] && out=$(jq -c --arg me "$me" \
-       'if type == "object" then select(.to == $me) else error("not a message object") end' \
+       'if type == "object" then select(.to == $me) else halt_error(5) end' \
        "${batch[@]}" 2>/dev/null); then
     # A run addressed entirely to the other peer selects nothing; printf would
     # then emit a blank line, which render_lines counts as a message.

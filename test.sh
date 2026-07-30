@@ -2266,6 +2266,30 @@ $(cd "$cw/b" && "$bridger" poll 2>/dev/null || true)"
   rm -rf "$BRIDGER_ROOT"
 )
 
+# --- a non-object message must be reported, not silently swallowed ------------
+# jq exits 0 on a runtime error() in a MULTI-FILE argv — only 5 for a single file
+# — so the batched scan's `else error(…)` produced no signal at all once the run
+# held 2+ messages: the corrupt file was skipped, the cursor advanced past it,
+# and nothing anywhere said a message had been destroyed. Every other corruption
+# fixture in this suite is a parse error, a zero-byte file or chmod 000, so a bare
+# non-object was the one shape nothing exercised.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  nb=$(mktemp -d); mkdir -p "$nb/a" "$nb/b"
+  (cd "$nb/a" && BRIDGER_SESSION_ID=nb-a "$bridger" register nbsend >/dev/null)
+  (cd "$nb/b" && BRIDGER_SESSION_ID=nb-b "$bridger" register nbrecv >/dev/null)
+  for i in 1 2 3; do
+    (cd "$nb/a" && BRIDGER_SESSION_ID=nb-a "$bridger" send nbrecv chat "n$i" >/dev/null 2>&1)
+  done
+  td="$BRIDGER_ROOT/threads/nbrecv--nbsend"
+  printf 'null\n' > "$td/00002.json"        # a bare non-object, not a parse error
+  err=$( (cd "$nb/b" && BRIDGER_SESSION_ID=nb-b "$bridger" poll >/dev/null) 2>&1 )
+  grep -q 'is unparseable' <<<"$err" \
+    || fail "a non-object message was consumed silently in a multi-message run (stderr: $err)"
+  pass "a non-object message is reported even when the whole run is batched"
+  rm -rf "$BRIDGER_ROOT" "$nb"
+)
+
 # --- monitor: the web view reads what the CLI writes -------------------------
 # The reader reimplements cursor and heartbeat semantics in Python, so it has
 # its own self-check; this also points it at the root this suite just built, to
