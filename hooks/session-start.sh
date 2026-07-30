@@ -57,13 +57,27 @@ find "$BRIDGER_ROOT/statusline" -type f -mtime +30 -delete 2>/dev/null || true
 # No identity for this session (opt-in and this directory was never registered
 # by THIS session). Identity is per session and never inherited, so a session
 # reopened where it — or another session — once had a name does not silently
-# resume it. If names WERE registered here and no live session wears them,
-# surface them: the user may want to reclaim one (with its queued messages) or
-# pick a fresh name. This lands in the session's context; the user still acts.
+# resume it. If names WERE registered here, surface them: the user may want to
+# reclaim one (with its queued messages) or pick a fresh name. This lands in the
+# session's context; the user still acts.
+#
+# What this may NOT say is that the names are free. `cmd_dormant`'s only
+# liveness filter is a heartbeat, and every other place in this codebase refuses
+# to read a missing heartbeat as death — `cmd_reap` ("'the directory is gone' is
+# NOT proof the peer is dead"), `peer_status` ("it cannot be a verdict"), the
+# peers legend ("watcher liveness, NOT reachability"). A registered session that
+# has not armed its watcher is the single most common state on this bus; it is
+# the state stop.sh and deliver.sh exist to nag about. Two Claude Code tabs in
+# one repo is the ordinary case, and this hook was telling the second one that
+# the first one's name was unheld: reclaiming it de-identifies that session
+# silently — `whoami` goes empty, its hooks deliver nothing ever again — and
+# hands its private queued mail to the new holder. So report the evidence and
+# what reclaiming costs, and let the human decide. `cmd_reap` already models the
+# right register for this: print the mail at stake and refuse to decide.
 if [ -z "$me" ]; then
   dormant=$(cd "$cwd" && "$bridger" dormant 2>/dev/null || true)
   if [ -n "$dormant" ]; then
-    echo "bridger: this directory has registered peer name(s) that no live session holds. Identity is per session — nothing is adopted automatically. Offer the user to reclaim one (which also delivers the messages queued to it) via CLI \`register <name>\`, or to register a fresh name. Reclaimable (queued unread):"
+    echo "bridger: this directory has registered peer name(s) with NO WATCHER running. That is not proof they are free — a live session that never armed its watcher looks exactly the same from here. Reclaiming one takes the name AND its queued messages away from whatever session holds it, which is silent and not undoable, so CONFIRM with the user first. Then either reclaim via CLI \`register <name>\`, or register a fresh name. Names here (queued unread):"
     printf '%s\n' "$dormant" | while IFS="$(printf '\t')" read -r nm cnt; do
       echo "  $nm ($cnt queued)"
     done

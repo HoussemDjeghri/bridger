@@ -1610,6 +1610,33 @@ if [ "$(id -u)" -ne 0 ]; then
 )
 fi
 
+# --- session-start must not call a LIVE session's name unheld -----------------
+# `dormant`'s only liveness filter is a heartbeat, and a registered session that
+# never armed its watcher — the state stop.sh exists to nag about — is
+# indistinguishable from an abandoned name. Two Claude Code tabs in one repo is
+# the ordinary case, and the hook was telling the second one that the first one's
+# name was held by nobody. Acting on that de-identifies tab one silently (whoami
+# empty, hooks deliver nothing, forever) and hands over its private mail. The
+# listing is useful; the verdict in front of it is what cannot be supported.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  lv=$(mktemp -d); mkdir -p "$lv/a" "$lv/cfg"
+  CLAUDE_CONFIG_DIR="$lv/cfg"; export CLAUDE_CONFIG_DIR   # never the real ~/.claude
+  hook="$here/hooks/session-start.sh"
+  (cd "$lv/a" && BRIDGER_SESSION_ID=lv-a "$bridger" register lvalpha >/dev/null)
+  # Tab two: same directory, different session id, no identity of its own.
+  out=$(printf '%s' '{"hook_event_name":"SessionStart","cwd":"'"$lv/a"'","session_id":"lv-b"}' \
+    | bash "$hook") || fail "session-start exited nonzero for a second session in a registered dir"
+  grep -q 'lvalpha' <<<"$out" \
+    || fail "session-start hid the reclaimable name entirely (got: $out)"
+  ! grep -q 'no live session holds' <<<"$out" \
+    || fail "session-start called a live session's name unheld, off a heartbeat alone"
+  grep -qi 'confirm' <<<"$out" \
+    || fail "session-start invited a reclaim without telling the agent to confirm first (got: $out)"
+  pass "session-start reports a nameless watcher as evidence, not as a free name"
+  rm -rf "$BRIDGER_ROOT" "$lv"
+)
+
 # --- log/mirror survive a corrupt message, exactly as poll does --------------
 # poll was hardened to skip an unparseable message and keep going; log and
 # mirror read the same files and must not be the readers that still stop dead.
