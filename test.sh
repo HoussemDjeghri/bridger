@@ -2566,6 +2566,75 @@ $(cd "$cw/b" && "$bridger" poll 2>/dev/null || true)"
   rm -rf "$BRIDGER_ROOT" "$nb"
 )
 
+# --- a dangling symlink at NNNNN.json must wedge, not vanish -------------------
+# `[ -e "$f" ]` follows symlinks, so a symlink whose target is gone failed the
+# test that exists to absorb "the glob matched nothing" and was `continue`d — in
+# max_seq AND in sorted_stems. The message never entered the scan, so nothing on
+# either channel said a word, and the cursor moved straight past it to the next
+# one: silent, permanent loss of exactly one message. open() on it gives ENOENT,
+# which is the transient shape ("reads fine next time"), not the unparseable one,
+# so it must stop the scan the way chmod 000 does.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  ds=$(mktemp -d); mkdir -p "$ds/a" "$ds/b"
+  (cd "$ds/a" && BRIDGER_SESSION_ID=ds-a "$bridger" register dssend >/dev/null)
+  (cd "$ds/b" && BRIDGER_SESSION_ID=ds-b "$bridger" register dsrecv >/dev/null)
+  for i in 1 2 3; do
+    (cd "$ds/a" && BRIDGER_SESSION_ID=ds-a "$bridger" send dsrecv chat "d$i" >/dev/null 2>&1)
+  done
+  td="$BRIDGER_ROOT/threads/dsrecv--dssend"
+  rm -f "$td/00002.json"; ln -s "$td/gone-target.json" "$td/00002.json"
+  err=$( (cd "$ds/b" && BRIDGER_SESSION_ID=ds-b "$bridger" poll >/dev/null) 2>&1 || true )
+  grep -q 'cannot read' <<<"$err" \
+    || fail "a dangling symlink message was skipped with no diagnostic (stderr: $err)"
+  # The one that matters. A dangling link is the transient shape — the target can
+  # come back (a remounted volume, a not-yet-synced file) — so resolving it must
+  # deliver the message. Skipping it moved the cursor to 3 in the poll above, and
+  # #2 was then unreachable for good, which is the loss this asserts against.
+  # `--peek` is no use here: it stops at the wedge too, so what is behind the
+  # fault is correctly invisible until the fault is gone.
+  printf '{"seq":2,"from":"dssend","to":"dsrecv","type":"chat","body":"d2","ts":"2026-01-01T00:00:00Z"}\n' \
+    > "$td/gone-target.json"
+  got=$( (cd "$ds/b" && BRIDGER_SESSION_ID=ds-b "$bridger" poll) 2>/dev/null || true )
+  grep -q 'd2' <<<"$got" \
+    || fail "the cursor advanced past a dangling symlink; the message was gone once readable (got: $got)"
+  grep -q 'd3' <<<"$got" \
+    || fail "the message behind a repaired dangling symlink was never delivered (got: $got)"
+  pass "a dangling symlink message wedges its thread instead of vanishing"
+  rm -rf "$BRIDGER_ROOT" "$ds"
+)
+
+# --- ... and max_seq must see it too, or every later send DIES ----------------
+# max_seq is the write path's "what number is free". Blind to a dangling symlink
+# at the highest seq it keeps handing that same number out, and the two tests in
+# cmd_send's retry loop disagree about it in the worst possible way: `ln` fails
+# EEXIST because the entry is there, then `[ -e "$target" ]` is FALSE because the
+# link dangles, which is the branch that means "not a collision — disk full or
+# read-only" and dies. So the send does not retry and does not succeed: every
+# message to that peer, forever, exits 1 with "cannot write message into …", a
+# diagnostic pointing at permissions that are fine. The scan's own guard cannot
+# catch this — the scan is bounded by the number this function returns.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  dm=$(mktemp -d); mkdir -p "$dm/a" "$dm/b"
+  (cd "$dm/a" && BRIDGER_SESSION_ID=dm-a "$bridger" register dmsend >/dev/null)
+  (cd "$dm/b" && BRIDGER_SESSION_ID=dm-b "$bridger" register dmrecv >/dev/null)
+  for i in 1 2 3; do
+    (cd "$dm/a" && BRIDGER_SESSION_ID=dm-a "$bridger" send dmrecv chat "s$i" >/dev/null 2>&1)
+  done
+  td="$BRIDGER_ROOT/threads/dmrecv--dmsend"
+  rm -f "$td/00003.json"; ln -s "$td/absent.json" "$td/00003.json"   # the HIGHEST seq
+  # Not fatal to the suite: the whole point is that this send fails, and an
+  # aborted run reports nothing about why.
+  serr=$( (cd "$dm/a" && BRIDGER_SESSION_ID=dm-a "$bridger" send dmrecv chat s4 >/dev/null) 2>&1 || true )
+  [ -f "$td/00004.json" ] \
+    || fail "send past a dangling symlink at the top seq failed: $serr"
+  [ -L "$td/00003.json" ] \
+    || fail "send overwrote the dangling symlink instead of taking the next free seq"
+  pass "max_seq counts a dangling symlink, so send does not wedge on its seq"
+  rm -rf "$BRIDGER_ROOT" "$dm"
+)
+
 # --- the batched scan must not have an ARG_MAX cliff of its own ----------------
 # One jq argv for the whole unread run costs len(thread_dir) + 20 bytes per
 # message, so the ceiling is a function of how DEEP the bus root is, not of the

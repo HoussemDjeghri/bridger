@@ -279,10 +279,17 @@ thread_dir() {
   else echo "$BRIDGER_ROOT/threads/$2--$1"; fi
 }
 
+# A dangling symlink fails `-e` (which follows the link) while still being a real
+# entry the glob matched, so `-L` has to catch it — in BOTH loops, and for two
+# different reasons. Here, leaving it out of `top` hid the seq from the scan
+# bound; in sorted_stems it was dropped from the scan itself, and the cursor then
+# moved past a message nobody was ever told about. Its bytes cannot be read right
+# now (open() gives ENOENT), which is the transient shape unread_in_thread wedges
+# on, not the unparseable one it skips.
 max_seq() {
   local dir="$1" max=0 f s stem
   for f in "$dir"/[0-9]*.json; do
-    [ -e "$f" ] || continue
+    [ -e "$f" ] || [ -L "$f" ] || continue
     # The glob only anchors the FIRST character, so `00001 2.json` (a Finder
     # duplicate), `0009-2.json` or `00006x.json` all reach here — and `$((10#…))`
     # on those is a fatal bash arithmetic error under set -e. max_seq is on the
@@ -331,7 +338,7 @@ max_seq() {
 sorted_stems() { # thread_dir
   local f stem
   for f in "$1"/[0-9]*.json; do
-    [ -e "$f" ] || continue
+    [ -e "$f" ] || [ -L "$f" ] || continue   # see max_seq: a dangling symlink is a message
     stem=${f##*/}; stem=${stem%.json}
     case "$stem" in ''|*[!0-9]*) continue ;; esac   # see max_seq: not a message
     case "$stem" in ??????????????????*) continue ;; esac   # see SEQ_MAX_DIGITS
@@ -430,7 +437,11 @@ unread_in_thread() {
   for f in "${batch[@]}"; do
     stem=${f##*/}; stem=${stem%.json}
     s=$((10#$stem))
-    if [ ! -s "$f" ]; then
+    # `-s` is false for a dangling symlink too, and this branch SKIPS — which is
+    # the wrong half of the decision for a file that merely cannot be opened
+    # right now. Let it fall through to jq, whose exit 2 lands it in the wedge
+    # below with the diagnostic already written for it.
+    if [ -e "$f" ] && [ ! -s "$f" ]; then
       echo "bridger: message $f is empty — skipped" >&2
       continue
     fi
