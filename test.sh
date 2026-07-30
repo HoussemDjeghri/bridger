@@ -156,6 +156,39 @@ fi
 [ "$(cd "$disc/plain" && "$bridger" whoami)" = "plain" ] || fail "join must register the directory"
 pass "opt-in by default: autoregister refuses, join works"
 
+# --- a derived name must be one the bus will accept ---------------------------
+# Both derived-name paths build `<base>-<suffix>`; only the tagged one budgeted
+# for the suffix. The untagged collision path appended `-2` to a base already at
+# the 32-char cap (34, rejected), and name_from_dir stripped the trailing dash
+# BEFORE truncating, so a cut landing on a dash produced `base--2`, which is the
+# thread-directory separator and rejected outright. Either way the peer is
+# written, listed by `peers`, and completely mute: nobody can send to it, it
+# cannot send or ask, re-registering under its own name is refused as invalid,
+# and one such peer makes every @all broadcast exit nonzero for everyone else.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  dn=$(mktemp -d)
+  # 32 chars once truncated (length trigger), and 31 + "-" (the `--` trigger).
+  long=acme-platform-billing-service-v1
+  dash=acme-platform-billing-service-x
+  mkdir -p "$dn/$long-prod" "$dn/$long-dev" "$dn/$dash-prod" "$dn/$dash-dev" "$dn/peer"
+  (cd "$dn/peer" && BRIDGER_SESSION_ID=dn-p "$bridger" register dnpeer >/dev/null)
+  for d in "$long-prod" "$long-dev" "$dash-prod" "$dash-dev"; do
+    nm=$(cd "$dn/$d" && BRIDGER_SESSION_ID="dn-$d" "$bridger" join 2>&1 | sed 's/.*as .//;s/.$//')
+    [ -n "$nm" ] || fail "join derived no name at all in $d"
+    # Mute in both directions is the symptom; test both.
+    (cd "$dn/peer" && BRIDGER_SESSION_ID=dn-p "$bridger" send "$nm" chat hi >/dev/null 2>&1) \
+      || fail "derived name '$nm' (${#nm} chars) cannot be sent to"
+    (cd "$dn/$d" && BRIDGER_SESSION_ID="dn-$d" "$bridger" send dnpeer chat hi >/dev/null 2>&1) \
+      || fail "derived name '$nm' (${#nm} chars) cannot send"
+  done
+  # One bad peer used to make the whole broadcast exit nonzero for everyone.
+  (cd "$dn/peer" && BRIDGER_SESSION_ID=dn-p "$bridger" send @all chat allhi >/dev/null 2>&1) \
+    || fail "@all broadcast failed because of a derived name"
+  pass "a derived name stays inside the bus's own name rules, suffix included"
+  rm -rf "$BRIDGER_ROOT" "$dn"
+)
+
 # --- discovery under CLAUDE_BRIDGER_AUTO=1: names, scopes, status --------------
 export CLAUDE_BRIDGER_AUTO=1
 

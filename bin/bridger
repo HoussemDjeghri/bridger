@@ -255,6 +255,11 @@ git_branch() {
 }
 
 # Turn a directory into a usable peer name: "my-app" from /code/my-app.
+# The truncation can land on a dash, so a derived name may END in one. That is a
+# legal name (valid_name rejects only a DOUBLED dash) and every reader of a
+# thread directory already accounts for it — see monitor/server.py's _split_pair.
+# What must not happen is a suffix being appended straight onto it; that is
+# handled where the suffix is built, in derive_and_register.
 name_from_dir() {
   local base
   base=$(basename "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' \
@@ -1054,7 +1059,14 @@ derive_and_register() { # dir [tagged]
   else
     name="$base"
     while [ -f "$(peer_file "$name")" ]; do
-      name="$base-$n"
+      # Budget for the suffix, the way the tagged branch above does. `$base-$n`
+      # off a base already at the 32-char cap is 34, which valid_name rejects —
+      # and the peer is written anyway, so it lands on the bus listed, mute in
+      # both directions, unrepairable by re-registering its own name, and it
+      # makes every @all broadcast exit nonzero for everyone else. Builtins
+      # only: this runs inside a collision loop.
+      name=${base:0:$((31 - ${#n}))}
+      name="${name%-}-$n"
       n=$((n + 1))
     done
   fi
