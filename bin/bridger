@@ -540,8 +540,14 @@ thread_fault_notice() { # json peer dir seq text
 }
 
 unwritable_thread_notice() { # peer thread_dir json
+  # Says what was OBSERVED, not what was inferred. The cursor write failing does
+  # not prove a permission: reproduced on a full 1 MiB volume where the directory
+  # was mode 755 and owned by the caller, and the notice sent the operator to
+  # check permissions that were fine. (Also verified there: an existing cursor
+  # file is rewritten successfully under ENOSPC — two bytes into an allocated
+  # block — so a full disk cannot truncate or corrupt one.)
   thread_fault_notice "$3" "$1" "$2" "" \
-    "bridger: the thread with $1 is stuck: it is not writable, so its messages will repeat on every poll until that is fixed: $2"
+    "bridger: the thread with $1 is stuck: its read position could not be recorded (permission denied, or the filesystem is full), so its messages will repeat on every poll until that is fixed: $2"
 }
 
 # Is this message file safe to render? For the history readers (`log`, `mirror`)

@@ -2616,8 +2616,14 @@ if [ "$(id -u)" -ne 0 ]; then
   nerr="$nb/poll.err"
   nout=$(cd "$nb/b" && "$bridger" poll 2>"$nerr" || true)
   chmod 755 "$BRIDGER_ROOT" "$ntd2"
-  grep -q "not writable" <<<"$nout" \
+  # The notice names the OBSERVED fault — the position could not be recorded —
+  # rather than asserting a permission it never tested: on a full filesystem the
+  # directory is mode 755 and owned by the caller, and "not writable" sent the
+  # operator to check permissions that were fine.
+  grep -q "read position could not be recorded" <<<"$nout" \
     || fail "a position that could not be recorded anywhere said nothing on stdout (got: $nout)"
+  grep -q "the filesystem is full" <<<"$nout" \
+    || fail "the notice named only one of the two causes it cannot tell apart (got: $nout)"
   grep -q "cannot record the read position" "$nerr" \
     || fail "a cursor that could not be written was not reported (stderr: $(cat "$nerr"))"
   # The raw shell diagnostic is not a diagnostic: it names a line number in
