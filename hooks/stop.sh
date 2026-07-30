@@ -35,14 +35,15 @@ IFS=$'\t' read -r cwd sid active < <(
 BRIDGER_SESSION_ID="${sid:-}"
 export BRIDGER_SESSION_ID
 
-# Charset-limited before it becomes a filename, as in `statusline_state_file`
-# and hooks/deliver.sh: a session id containing `/` made this a path through a
-# directory that does not exist, and the `: >` below then failed and errexit
-# killed the hook one line before the nudge it exists to emit.
-case "${sid:-}" in
-  ''|*[!A-Za-z0-9._-]*) nudge_id=nosession ;;
-  *) nudge_id="$sid" ;;
-esac
+# Same id-to-filename mapping as hooks/deliver.sh — see the note there. Raw, a
+# `/` in the id made this path unwritable and errexit killed the hook one line
+# before the nudge it exists to emit. Collapsed to a constant, the marker became
+# shared, which is worse here than a suppressed report: this file IS the
+# permission to speak, so the first such session took the only nudge on the
+# machine and every other one went idle deaf without ever being warned.
+nudge_id=${sid//[!A-Za-z0-9._-]/_}
+nudge_id=${nudge_id:-nosession}
+[ ${#nudge_id} -le 64 ] || nudge_id=${nudge_id: -64}   # see deliver.sh: bash 3.2
 nudged="$BRIDGER_ROOT/armed-nudge-$nudge_id"
 [ -f "$nudged" ] && exit 0
 

@@ -33,14 +33,22 @@ me=$(cd "$cwd" && "$bridger" autoregister 2>/dev/null) || me=""
 #      collision the drop-in dir cannot prevent) re-offers to re-wire, once per
 #      wired→unwired transition, never as a nag.
 badge="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/bridger-statusline.sh"
+# Every write here is allowed to fail. A root that cannot be written (owned by
+# another uid, a restored archive, a full disk) used to kill this hook under
+# errexit ABOVE everything it exists to say — the peer's name, the dormant names,
+# the unread list, the arm-the-watcher instruction — while the mail itself sat on
+# disk perfectly readable. Badge bookkeeping never outranks the delivery report;
+# the offer repeating is the safe direction.
 if "$bridger" statusline-status >/dev/null 2>&1; then
-  mkdir -p "$BRIDGER_ROOT"; : > "$BRIDGER_ROOT/statusline_wired"
+  mkdir -p "$BRIDGER_ROOT" 2>/dev/null || true
+  { : > "$BRIDGER_ROOT/statusline_wired"; } 2>/dev/null || true
 elif [ -f "$BRIDGER_ROOT/statusline_wired" ]; then
-  rm -f "$BRIDGER_ROOT/statusline_wired"
+  rm -f "$BRIDGER_ROOT/statusline_wired" 2>/dev/null || true
   echo "bridger: the statusline badge is no longer wired into your active statusline — another statusline setup replaced it. Re-wire it (collision-proof, via the drop-in dir) by running /bridger:statusline."
 elif [ ! -f "$badge" ] && [ ! -f "$BRIDGER_ROOT/statusline_offered" ]; then
   echo "The bridger statusline badge is not set up. Offer the user ONCE to wire it: run /bridger:statusline (it drops a fragment into ~/.claude/statusline.d and never overwrites another tool's statusline). If they decline, drop it — this offer never repeats."
-  mkdir -p "$BRIDGER_ROOT"; : > "$BRIDGER_ROOT/statusline_offered"
+  mkdir -p "$BRIDGER_ROOT" 2>/dev/null || true
+  { : > "$BRIDGER_ROOT/statusline_offered"; } 2>/dev/null || true
 fi
 # Prune per-session badge state left by sessions that ended long ago; the badge
 # only renders in a live session, so old files are pure litter.

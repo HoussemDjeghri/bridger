@@ -87,17 +87,25 @@ esac
 # This runs BEFORE whoami and peers. It needs neither, and sitting below them it
 # had already spent most of the hook's cost — the cost this gate exists to avoid,
 # paid on every tool call of every session on the machine.
-# The id goes into a FILENAME, so it gets charset-limited first, exactly as
+# The id goes into a FILENAME, so it is charset-limited first, as
 # `statusline_state_file` does in bin/bridger for the same reason. Interpolated
 # raw, a session id containing `/` made the marker a path through a directory
 # that does not exist; `mv` then failed and errexit killed the hook — after the
-# peek had already found the mail and before it could be reported. Claude Code
-# sends UUIDs, so this was one malformed field away from the silent-no-delivery
-# behaviour the rest of this file exists to prevent.
-case "${sid:-}" in
-  ''|*[!A-Za-z0-9._-]*) marker_id=nosession ;;
-  *) marker_id="$sid" ;;
-esac
+# peek had already found the mail and before it could be reported.
+#
+# MAPPED, not collapsed. Answering every unusable id with one constant name made
+# all of them share a high-water marker, and the gate below is unscoped across
+# threads — so the first such session to stamp it silenced every other one's
+# waiting mail for good. `statusline_state_file` avoids that by returning nothing
+# at all rather than a shared name; here the name is needed, so make it per
+# session instead. Claude Code sends UUIDs, so both defects are latent — one
+# malformed field away from the silent-no-delivery behaviour this file exists to
+# prevent.
+marker_id=${sid//[!A-Za-z0-9._-]/_}
+marker_id=${marker_id:-nosession}
+# Only when it is actually too long: on bash 3.2 `${var: -64}` yields EMPTY for a
+# shorter string, which collapsed every session onto one marker named `reported-`.
+[ ${#marker_id} -le 64 ] || marker_id=${marker_id: -64}
 marker="$BRIDGER_ROOT/reported-$marker_id"
 if [ "${event:-}" = "PostToolUse" ] && [ "$registered_now" -eq 0 ] && [ -f "$marker" ]; then
   [ -n "$(find "$BRIDGER_ROOT/threads" -name '*.json' -newer "$marker" -print -quit 2>/dev/null)" ] \
@@ -147,7 +155,11 @@ unread=$(cd "$cwd" && "$bridger" poll --peek 2>/dev/null || true)
 # direction, whereas letting the failure propagate loses the mail the peek is
 # holding right now.
 if [ -n "$stamp" ]; then
-  if [ "${event:-}" = "PostToolUse" ]; then
+  # Not into a DIRECTORY sitting at the marker path: `mv` would succeed by moving
+  # the stamp inside it, so `[ -f "$marker" ]` above stays false forever and every
+  # run leaves another temp file in there. Removing someone else's directory is not
+  # this hook's call; skipping the marker only costs a repeated report.
+  if [ "${event:-}" = "PostToolUse" ] && [ ! -d "$marker" ]; then
     mv "$stamp" "$marker" 2>/dev/null || rm -f "$stamp"
   else
     rm -f "$stamp"

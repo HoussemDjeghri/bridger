@@ -1237,8 +1237,29 @@ PYEOF
   # Tolerating the failed write is only half of it: an id that cannot be a
   # filename must still get a USABLE marker, or the `-newer` gate never engages
   # for that session and every tool call it ever makes pays the full hook cost.
-  [ -f "$BRIDGER_ROOT/reported-nosession" ] \
+  [ -f "$BRIDGER_ROOT/reported-a_b" ] \
     || fail "an unusable session id left no high-water marker at all, so the fast path can never engage"
+
+  # And that marker has to be PER SESSION. Mapping every unusable id onto one
+  # constant name made them share it, and the gate is unscoped across threads —
+  # so the first such session to stamp it silenced every other one's waiting mail
+  # for good.
+  mkdir -p "$up/slash2"
+  (cd "$up/slash2" && BRIDGER_SESSION_ID=c/d "$bridger" register slashpeer2 >/dev/null)
+  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send slashpeer2 ask "SLASHED-TOO" >/dev/null 2>/dev/null)
+  out=$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","session_id":"c/d"}' "$up/slash2" | bash "$hook")
+  jq -r '.hookSpecificOutput.additionalContext' <<<"$out" 2>/dev/null | grep -q "SLASHED-TOO" \
+    || fail "one session's high-water marker suppressed another session's mail (got: $out)"
+
+  # A directory sitting at the marker path: `mv` succeeds by moving the stamp
+  # INSIDE it, so the gate stays dead forever and every run leaks a temp file.
+  rm -f "$BRIDGER_ROOT/reported-reader-sess"
+  mkdir "$BRIDGER_ROOT/reported-reader-sess"
+  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send reader ask "DIRMARK" >/dev/null 2>/dev/null)
+  printf '%s' "$ptu" | bash "$hook" >/dev/null
+  [ -z "$(find "$BRIDGER_ROOT/reported-reader-sess" -name '.mark.*' -print -quit)" ] \
+    || fail "a directory at the marker path absorbed the high-water stamp"
+  rmdir "$BRIDGER_ROOT/reported-reader-sess"
 
   # A read-only bus root: the mail is on disk and readable, so it must still be
   # reported. The high-water stamp was taken before the peek, so a root that
@@ -1317,6 +1338,19 @@ PYEOF
   # for that id as well, or "once, never a nag" becomes a block on every turn.
   [ -z "$(printf '{"cwd":"%s","session_id":"a/b","stop_hook_active":false}' "$st/slash" | bash "$hook")" ] \
     || fail "an unusable session id made the Stop nudge repeat every turn"
+  # ...and per session, not per machine. Here a shared marker LOSES the nudge
+  # rather than repeating it: the first such session consumes the only one, and
+  # every other one goes idle deaf having never been warned.
+  mkdir -p "$st/slash2"
+  (cd "$st/slash2" && BRIDGER_SESSION_ID=c/d "$bridger" register slashstop2 >/dev/null)
+  second=$(printf '{"cwd":"%s","session_id":"c/d","stop_hook_active":false}' "$st/slash2" | bash "$hook")
+  [ "$(jq -r .decision <<<"$second")" = "block" ] \
+    || fail "one session's nudge marker consumed another session's only warning (got: $second)"
+  # session-end must clean up the name the writers actually wrote, or a new
+  # session inherits a dead one's "already nudged" state.
+  printf '{"session_id":"c/d","cwd":"%s"}' "$st/slash2" | bash "$here/hooks/session-end.sh" >/dev/null 2>&1 || true
+  [ -f "$BRIDGER_ROOT/armed-nudge-c_d" ] \
+    && fail "session-end left the nudge marker behind, so the next session inherits it"
 
   # A turn Claude Code is already continuing because of a stop hook.
   rm -f "$BRIDGER_ROOT/armed-nudge-solo-sess"
@@ -1335,6 +1369,40 @@ PYEOF
   pass "Stop hook blocks once until a registered session is actually listening"
   rm -rf "$BRIDGER_ROOT" "$st"
 )
+
+# --- session-start: badge bookkeeping must never outrank the delivery report --
+# The hook's two statusline markers are written in the bus root, and under errexit
+# those writes sat ABOVE everything it exists to say: the peer's name, the dormant
+# names, the unread list, the arm-the-watcher instruction. So a root owned by
+# another uid, restored read-only, or simply full lost the entire report — while
+# the mail itself sat on disk perfectly readable, as the same bus proves by
+# reporting it a moment earlier.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  ss=$(mktemp -d); mkdir -p "$ss/a" "$ss/b" "$ss/cfg"
+  CLAUDE_CONFIG_DIR="$ss/cfg"; export CLAUDE_CONFIG_DIR   # never the real ~/.claude
+  hook="$here/hooks/session-start.sh"
+  (cd "$ss/a" && BRIDGER_SESSION_ID=ss-a "$bridger" register ssreader >/dev/null)
+  (cd "$ss/b" && BRIDGER_SESSION_ID=ss-b "$bridger" register sswriter >/dev/null)
+  (cd "$ss/b" && BRIDGER_SESSION_ID=ss-b "$bridger" send ssreader ask "AT-SESSION-START" >/dev/null 2>&1)
+  payload='{"hook_event_name":"SessionStart","cwd":"'"$ss/a"'","session_id":"ss-a","source":"resume"}'
+
+  base=$(printf '%s' "$payload" | bash "$hook") \
+    || fail "session-start exited nonzero on a healthy bus"
+  grep -q "AT-SESSION-START" <<<"$base" \
+    || fail "session-start did not report queued mail at all (got: $base)"
+
+  rm -f "$BRIDGER_ROOT/statusline_offered" "$BRIDGER_ROOT/statusline_wired"
+  chmod 555 "$BRIDGER_ROOT"
+  ro=$(printf '%s' "$payload" | bash "$hook") || true
+  chmod 755 "$BRIDGER_ROOT"
+  grep -q "AT-SESSION-START" <<<"$ro" \
+    || fail "a read-only bus root cost session-start its whole report (got: $ro)"
+  pass "session-start reports queued mail even when it cannot write its own markers"
+  rm -rf "$BRIDGER_ROOT" "$ss"
+)
+fi
 
 # --- log/mirror survive a corrupt message, exactly as poll does --------------
 # poll was hardened to skip an unparseable message and keep going; log and
