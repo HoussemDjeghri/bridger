@@ -1782,6 +1782,13 @@ PYEOF
   # while it waits. Printing the empty selection puts a blank line into a stream
   # documented as one JSON object per line. Captured output hides it (`$( )` eats
   # trailing newlines), so measure the bytes.
+  #
+  # A GUARD test, deliberately, and it is worth saying so once: it is green
+  # against the commit before the batch existed, so it is not differential — the
+  # blank line it forbids was introduced by the batch and fixed in the same
+  # commit. It does kill its own mutant (drop the `[ -z "$out" ] ||` in the fast
+  # path and this fires), so it is not vacuous either. Kept as the standing
+  # statement of the invariant, not re-derived as a regression test.
   (cd "$bl/writer" && BRIDGER_SESSION_ID=w "$bridger" poll --json) >"$bl/sent.json" 2>/dev/null
   [ ! -s "$bl/sent.json" ] \
     || fail "poll --json emitted $(wc -c <"$bl/sent.json") bytes for a run that selected nothing"
