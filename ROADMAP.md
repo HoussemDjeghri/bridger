@@ -33,11 +33,6 @@ audit reports under
   the whole unread run. Design is worked out and sound (`cycle6-delivery.md`), but
   0.14.0 removed both reasons it was urgent — the fork-per-message cost and the
   `ARG_MAX` cliff.
-- **`advance_cursor`'s `top = 0` early return reports the wrong fault.** A wedge at
-  seq 1 in a read-only thread directory is announced as a permission problem and
-  the wedge seq is never named; an empty read-only thread directory emits a
-  spurious notice on every poll. Diagnostic quality — the cursor is correct and
-  nothing is consumed. Spec: `cycle6-mutation.md` `## M15`.
 - **The monitor 500s on an over-long pid in a beat file.** `monitor/server.py`
   raises `OverflowError` past `int` range. The web view is read-only and advisory;
   the bus is unaffected. Spec: `cycle6-mutation.md` `## P10`.

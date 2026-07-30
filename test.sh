@@ -1953,6 +1953,35 @@ if [ "$(id -u)" -ne 0 ]; then
 )
 fi
 
+# --- a wedge at the FIRST seq must still name the wedge ------------------------
+# advance_cursor returns early for top=0 because there is nothing before seq 1 to
+# mark read. Drop that and it instead tries to WRITE cursor 0: in a thread
+# directory that is readable but not writable — a restored bus, a root shared with
+# another uid — the write fails, cmd_poll takes the unwritable-thread branch, and
+# the agent is told to fix a permission when the actual fault is one unreadable
+# message file. Wrong fault, wrong remedy, and the wedge seq is never named.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  w1="$work/wedge1"; mkdir -p "$w1/a" "$w1/b"
+  "$bridger" register esend "$w1/a" >/dev/null
+  "$bridger" register erecv "$w1/b" >/dev/null
+  etd="$BRIDGER_ROOT/threads/erecv--esend"; mkdir -p "$etd"
+  for s in 1 2; do
+    jq -n --argjson s "$s" '{seq:$s,from:"esend",to:"erecv",type:"chat",
+      body:("e"+($s|tostring)),ts:"2026-01-01T00:00:00Z"}' > "$etd/0000$s.json"
+  done
+  chmod 000 "$etd/00001.json"
+  chmod 555 "$etd"
+  egot=$(cd "$w1/b" && "$bridger" poll 2>/dev/null || true)
+  chmod 755 "$etd"; chmod 644 "$etd/00001.json"
+  grep -q 'stuck at message 1' <<<"$egot" \
+    || fail "a wedge at the first seq did not name the wedge (got: $egot)"
+  pass "a wedge at the first seq names the wedge, not a permission"
+  rm -rf "$BRIDGER_ROOT"
+)
+fi
+
 # --- the unread scan must not read past the bound its cursor will be set to ----
 # cmd_poll snapshots max_seq ONCE and hands the same value to the scan and to
 # advance_cursor. Drop the upper half of the scan's range check and the scan reads
