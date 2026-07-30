@@ -518,9 +518,30 @@ advance_cursor() { # thread_dir me top
 # when advance_cursor could not record the position in EITHER place, which is the
 # one state where the messages really do repeat on every poll — and it repeats
 # with them, there being nowhere left to record that it was said.
+# A thread-level fault, on the channel the caller can actually read. Prose for a
+# human or an agent; ONE JSON object for --json, whose consumer parses line by
+# line and would choke on a sentence.
+#
+# Both --peek and --json used to be exempt from every notice here, which removed
+# it from precisely the paths that run WITHOUT a watcher — and a wedge cannot be
+# noticed any other way when there is no watcher. The delivery hook peeks and
+# sends stderr to /dev/null, so it reported "1 unread message(s)" for a thread
+# holding three that would never move; `ask` drains --json on the very thread it
+# is blocked on and was told nothing at all. stderr is not a channel that reaches
+# a session — that is why these notices are on stdout in the first place.
+thread_fault_notice() { # json peer dir seq text
+  if [ "$1" -eq 1 ]; then
+    jq -nc --arg peer "$2" --arg dir "$3" --arg seq "$4" --arg note "$5" \
+      '{bridger: "stuck", peer: $peer, dir: $dir, note: $note,
+        seq: (if $seq == "" then null else ($seq | tonumber) end)}'
+  else
+    printf '%s\n' "$5"
+  fi
+}
+
 unwritable_thread_notice() { # peer thread_dir json
-  [ "$3" -eq 0 ] || return 0   # --json is a parsed stream: `ask` drains it
-  echo "bridger: the thread with $1 is not writable, so its messages will repeat on every poll until that is fixed: $2"
+  thread_fault_notice "$3" "$1" "$2" "" \
+    "bridger: the thread with $1 is stuck: it is not writable, so its messages will repeat on every poll until that is fixed: $2"
 }
 
 # Is this message file safe to render? For the history readers (`log`, `mirror`)
@@ -1438,9 +1459,8 @@ cmd_poll() {
         # Nothing was recorded, or there was nowhere to record it. Either way we
         # do not know how far we may advance, so advance nothing — but this thread
         # IS stuck, and stderr reaches no session, so it cannot pass in silence.
-        if [ "$peek" -eq 0 ] && [ "$json" -eq 0 ]; then
-          echo "bridger: the thread with $peer is stuck and will deliver nothing further until $dir can be read and $BRIDGER_ROOT can be written."
-        fi
+        thread_fault_notice "$json" "$peer" "$dir" "" \
+          "bridger: the thread with $peer is stuck and will deliver nothing further until $dir can be read and $BRIDGER_ROOT can be written."
         continue ;;
       esac
       # Advance to just BEFORE the message that could not be read. Refusing to
@@ -1453,19 +1473,24 @@ cmd_poll() {
         unwritable_thread_notice "$peer" "$dir" "$json"
         continue
       fi
-      # Say so where the agent will actually see it. stderr does not reach a
-      # session — only the watcher's stdout re-invokes one — and a permanent
-      # fault (a directory or a root-owned file at NNNNN.json) otherwise stops
-      # this thread forever with nothing said on the channel that could act on
-      # it. Keyed to the seq on disk so it is one line per fault, not one per
-      # tick. --json is exempt: `ask` parses that stream.
-      if [ "$peek" -eq 0 ] && [ "$json" -eq 0 ] \
-         && [ "$(cat "$dir/wedge-$me" 2>/dev/null || true)" != "$wedge" ]; then
-        echo "bridger: the thread with $peer is stuck at message $wedge and will deliver nothing past it until that message file in $dir is readable or removed."
+      # Say so where the agent will actually see it. A permanent fault (a
+      # directory or a root-owned file at NNNNN.json) otherwise stops this thread
+      # forever with nothing said on a channel that could act on it.
+      #
+      # The marker keys the WATCHER's cadence — one line per fault rather than
+      # one per 0.5s tick. It cannot gate the other two callers: --peek must not
+      # write anything, and a --json consumer is a one-shot drain, so for both of
+      # them the notice is per call and that is the correct bound.
+      if [ "$peek" -eq 1 ] || [ "$json" -eq 1 ] \
+         || [ "$(cat "$dir/wedge-$me" 2>/dev/null || true)" != "$wedge" ]; then
+        thread_fault_notice "$json" "$peer" "$dir" "$wedge" \
+          "bridger: the thread with $peer is stuck at message $wedge and will deliver nothing past it until that message file in $dir is readable or removed."
         # After the line, not before: if the marker cannot be written the notice
         # simply repeats next tick, which is the harmless direction. Failing to
         # write it must not cost the notice itself.
-        echo "$wedge" > "$dir/wedge-$me" 2>/dev/null || true
+        if [ "$peek" -eq 0 ] && [ "$json" -eq 0 ]; then
+          echo "$wedge" > "$dir/wedge-$me" 2>/dev/null || true
+        fi
       fi
       continue
     fi
@@ -1578,6 +1603,15 @@ cmd_ask() {
       if [ -z "$answer" ] && [ "$ref" = "$seq" ] && [ "$sender" = "$to" ]; then
         answer="$line"
         continue
+      fi
+      # This thread is wedged: nothing at or behind the fault will ever be
+      # delivered, and the answer is written above it. Waiting out the full
+      # timeout to report a bare "no reply" hides the one fact that would let
+      # anyone fix it. Only when the answer is not already in hand — the wedge
+      # notice is emitted after the messages the scan did deliver.
+      if [ -z "$answer" ] && [ "$(jq -r '.bridger // empty' <<<"$line")" = "stuck" ]; then
+        jq -r '.note' <<<"$line" >&2
+        return 1
       fi
       # Other traffic from the SAME peer, consumed while waiting — surface it,
       # don't drop it. Scoped to this thread now (see --peer), so a third peer's

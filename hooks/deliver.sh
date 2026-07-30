@@ -180,8 +180,16 @@ if [ -z "$unread" ]; then
   emit "bridger: this session is now registered, but NOT yet listening. Registering does not start the watcher. $ARM"
 fi
 MAX_SHOWN=5
-n=$(grep -c . <<<"$unread" || true)
+# Messages only. A peek also carries thread-fault notices now — a wedged thread
+# says so here, which is the whole point of putting them on stdout — and those
+# are not messages: counting them said "4 unread" for three, and a thread wedged
+# at its first message reported "1 unread" with nothing an agent could act on.
+n=$(grep -c '^#' <<<"$unread" || true)
 shown=$(head -n "$MAX_SHOWN" <<<"$unread")
+if [ "$n" -eq 0 ]; then
+  emit "bridger: nothing new for peer '$me', but a thread is stuck and will deliver NOTHING until it is fixed — including anything already waiting behind the fault:
+$shown"
+fi
 if [ "$n" -gt "$MAX_SHOWN" ]; then
   shown="$shown
   ... and $((n - MAX_SHOWN)) more — CLI \`poll --peek\` for the rest."

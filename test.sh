@@ -154,6 +154,61 @@ pass "ask/answer roundtrip with ref matching"
   rm -rf "$BRIDGER_ROOT" "$aw"
 )
 
+# --- a wedged thread must say so on the channels that have no watcher ---------
+# The notice was moved to stdout precisely because "stderr does not reach a
+# session — only the watcher's stdout re-invokes one". Then --peek and --json
+# were both made exempt from it, which removed it from every path that runs
+# WITHOUT a watcher: the delivery hook peeks and discards stderr, so it reported
+# "1 unread message(s)" for a thread holding three that would never move, and
+# `ask`, blocked on the very thread that is stuck, was told nothing at all and
+# waited out its whole timeout for an answer that can never arrive.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  wg=$(mktemp -d); mkdir -p "$wg/a" "$wg/b"
+  (cd "$wg/a" && BRIDGER_SESSION_ID=wg-a "$bridger" register wgalice >/dev/null)
+  (cd "$wg/b" && BRIDGER_SESSION_ID=wg-b "$bridger" register wgbob   >/dev/null)
+  for i in 1 2 3; do
+    (cd "$wg/b" && BRIDGER_SESSION_ID=wg-b "$bridger" send wgalice chat "w$i" >/dev/null)
+  done
+  td="$BRIDGER_ROOT/threads/wgalice--wgbob"
+  chmod 000 "$td/00002.json"
+
+  peeked=$( (cd "$wg/a" && BRIDGER_SESSION_ID=wg-a "$bridger" poll --peek) 2>/dev/null || true )
+  grep -q 'stuck' <<<"$peeked" \
+    || fail "--peek reported a wedged thread as an ordinary unread count (got: $peeked)"
+  # --json is a parsed stream, so the notice has to be parseable too.
+  js=$( (cd "$wg/a" && BRIDGER_SESSION_ID=wg-a "$bridger" poll --peek --json) 2>/dev/null || true )
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    jq -e . >/dev/null 2>&1 <<<"$l" || fail "--json emitted a line that is not JSON: $l"
+  done <<<"$js"
+  [ "$(jq -rs '[.[] | select(.bridger == "stuck")] | length' <<<"$js")" = "1" ] \
+    || fail "--json carried no machine-readable wedge notice (got: $js)"
+
+  # ask blocks on a thread that can never deliver: it must say why, not time out.
+  start=$SECONDS
+  aerr=$( (cd "$wg/a" && BRIDGER_SESSION_ID=wg-a "$bridger" ask wgbob "q?" --timeout 30 >/dev/null) 2>&1 || true )
+  [ $((SECONDS - start)) -lt 25 ] \
+    || fail "ask waited out its timeout on a thread that was already stuck"
+  grep -q 'stuck' <<<"$aerr" \
+    || fail "ask reported no reason for a wedged thread (stderr: $aerr)"
+  # The delivery hook peeks, so the notice reaches it — but it must not be
+  # counted as a message. The ask above consumed up to the fault, so #2 is now
+  # the first unread and nothing at all is deliverable: the hook has to say that
+  # rather than report a count.
+  hookout=$(printf '%s' '{"hook_event_name":"UserPromptSubmit","cwd":"'"$wg/a"'","session_id":"wg-a"}' \
+    | bash "$here/hooks/deliver.sh" 2>/dev/null || true)
+  grep -q 'stuck' <<<"$hookout" \
+    || fail "the delivery hook hid a wedged thread from the session (got: $hookout)"
+  ! grep -q '[0-9] unread message' <<<"$hookout" \
+    || fail "the delivery hook counted a fault notice as a message (got: $hookout)"
+  chmod 644 "$td/00002.json"
+  pass "a wedged thread is reported on --peek, in --json, and to a blocked ask"
+  rm -rf "$BRIDGER_ROOT" "$wg"
+)
+fi
+
 # --- timeouts ---------------------------------------------------------------
 if (cd "$work/app" && "$bridger" ask liba "void" --timeout 3 >/dev/null 2>&1); then
   fail "ask without responder must time out with nonzero exit"
