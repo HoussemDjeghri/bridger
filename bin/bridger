@@ -1396,7 +1396,14 @@ EOF
   local dir tmp seq target
   dir=$(thread_dir "$from" "$to")
   mkdir -p "$dir"
-  tmp=$(mktemp "$dir/.msg.XXXXXX")
+  # The die below cannot report this: errexit aborts here first, so a `send` into
+  # a thread directory it cannot write printed a bare `mktemp: mkstemp failed`
+  # with no `bridger:` prefix and nothing naming the bus. Through `ask` it read
+  # differently again — a command substitution launders errexit on bash 3.2, so
+  # execution fell through with $tmp empty and produced two raw shell lines
+  # before the good message. One fault, three reports, none of them chosen.
+  tmp=$(mktemp "$dir/.msg.XXXXXX" 2>/dev/null) \
+    || die "cannot write message into $dir — the thread directory is not writable, or the filesystem is full"
   while :; do
     seq=$(( $(max_seq "$dir") + 1 ))
     jq -n --argjson seq "$seq" --arg from "$from" --arg to "$to" \

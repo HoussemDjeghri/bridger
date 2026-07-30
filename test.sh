@@ -2433,6 +2433,38 @@ if [ "$(id -u)" -ne 0 ]; then
 )
 fi
 
+# --- send into an unwritable thread must name the bus, once, on both paths -----
+# `send` died at its mktemp, so the `die "cannot write message into …"` written
+# for exactly this fault was unreachable and the user got a bare
+# `mktemp: mkstemp failed`. `ask` reported the SAME fault differently — a command
+# substitution launders errexit on bash 3.2, so it fell through with an empty
+# $tmp and emitted two raw shell lines first. One fault, three reports.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  uw="$work/unwrit"; mkdir -p "$uw/a" "$uw/b"
+  "$bridger" register usend "$uw/a" >/dev/null
+  "$bridger" register urecv "$uw/b" >/dev/null
+  utd="$BRIDGER_ROOT/threads/urecv--usend"; mkdir -p "$utd"
+  chmod 555 "$utd"
+  for verb in send ask; do
+    case "$verb" in
+      send) uout=$( (cd "$uw/a" && "$bridger" send urecv chat hello) 2>&1 ) || true ;;
+      ask)  uout=$( (cd "$uw/a" && "$bridger" ask urecv hi --timeout 1) 2>&1 ) || true ;;
+    esac
+    grep -q '^bridger: cannot write message into' <<<"$uout" \
+      || { chmod 755 "$utd"; rm -rf "$BRIDGER_ROOT"
+           fail "'$verb' into an unwritable thread said nothing about the bus (got: $uout)"; }
+    grep -q 'mkstemp failed\|No such file or directory' <<<"$uout" \
+      && { chmod 755 "$utd"; rm -rf "$BRIDGER_ROOT"
+           fail "'$verb' leaked a raw shell error alongside its own message (got: $uout)"; }
+  done
+  chmod 755 "$utd"
+  pass "send and ask report an unwritable thread the same way, and name the bus"
+  rm -rf "$BRIDGER_ROOT"
+)
+fi
+
 # --- the unread scan must not read past the bound its cursor will be set to ----
 # cmd_poll snapshots max_seq ONCE and hands the same value to the scan and to
 # advance_cursor. Drop the upper half of the scan's range check and the scan reads
