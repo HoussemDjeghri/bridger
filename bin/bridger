@@ -743,8 +743,17 @@ require_identity() {
 # mkdir is the atomic primitive available to a shell script; a directory is the
 # lock. Held only across a bounded mktemp + jq + mv, never across a fork of git
 # or a network call.
-peer_lock() { # name
-  local lock="$(peer_file "$1").lock" tries=0 stuck=0 holder err
+# $2 names WHICH lock: `lock` guards a record write, `claim` guards the whole
+# decide-then-write in cmd_register. Two separate names because this is a `mkdir`
+# and so not reentrant — write_peer takes `lock` from inside the claimed region.
+peer_lock() { # name [kind]
+  local lock="$(peer_file "$1").${2:-lock}" tries=0 stuck=0 holder err
+  # The lock lives in peers/, so its own precondition is that peers/ exists —
+  # cmd_register now claims the name before write_peer gets anywhere near
+  # creating it, and on a fresh bus that made every first register die with
+  # "cannot lock". Idempotent, and a genuinely unwritable root still falls
+  # through to the decision below with the real error in hand.
+  mkdir -p "$BRIDGER_ROOT/peers" 2>/dev/null || true
   # `until mkdir … 2>/dev/null` cannot tell "someone holds it" from "this can
   # never succeed" — a full disk, a peers/ without write bits, a read-only mount
   # — and hid the difference along with the error. The loop's only exit is a
@@ -785,7 +794,7 @@ peer_lock() { # name
   echo $$ > "$lock/pid"
 }
 
-peer_unlock() { rm -rf "$(peer_file "$1").lock"; }
+peer_unlock() { rm -rf "$(peer_file "$1").${2:-lock}"; }
 
 # Remove a registration, under its lock so a concurrent summary cannot write the
 # record back after it is gone.
@@ -877,6 +886,18 @@ cmd_register() {
   case "$dir" in *$'\n'*) die "refusing to register '$name': its directory path contains a newline" ;; esac
   sid=$(session_id)
 
+  # Serialise the whole claim, not just the write. write_peer's own lock is taken
+  # BELOW the refusals, so two simultaneous callers each read peers/<name> while
+  # it does not exist yet, neither refusal fires for either, and the second `mv`
+  # wins: both were told they had registered it, both lit the badge, and the loser
+  # was left with no identity — receiving nothing, unable to send, and unable to
+  # re-register, because by then the cross-directory refusal did work. 60/60 of
+  # simultaneous claims, measured. The trap covers `die` as well as the normal
+  # path; a claimer killed outright leaves the directory behind, and peer_lock's
+  # pid fencing is what stops that from wedging the name forever.
+  peer_lock "$name" claim
+  trap 'peer_unlock "$name" claim' EXIT
+
   # DECIDE BEFORE DESTROYING. Both refusals below used to sit AFTER the two
   # `rm -f` blocks, so a register that was about to be refused had already
   # deleted the caller's own registration: the session was left with no identity
@@ -951,6 +972,7 @@ cmd_register() {
   # directory opted back IN to autoregistration with no registration to show for
   # it. Nothing between the two depends on the order.
   BRIDGER_SESSION_ID="$sid" write_peer "$name" "$dir"   # claim it for this session
+  trap - EXIT; peer_unlock "$name" claim   # the record exists: the name is taken
   optout_remove "$dir"   # naming a directory is an explicit opt-in
   statusline_write "$name"   # light the badge this tick, no statusLine rewrite
   echo "registered '$name' -> $dir"

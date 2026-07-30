@@ -1772,6 +1772,38 @@ if [ "$(id -u)" -ne 0 ]; then
 )
 fi
 
+# --- two sessions claiming one name at the same instant -----------------------
+# Putting write_peer under a lock serialises the WRITE, not the CLAIM: the lock is
+# taken below both refusals, so two simultaneous callers each read peers/<name>
+# while it does not exist yet, neither refusal can fire for either, and the second
+# mv wins. Both were told they registered it, both lit the badge, and the loser
+# had no identity at all — it received nothing, could not send, and could not even
+# re-register, because by then the cross-directory refusal did work. Measured
+# 60/60 before the fix. Delay one caller 50ms and the refusal already does the
+# right thing, so the claim is the only thing missing.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  cl="$work/claim"; mkdir -p "$cl/x" "$cl/y"
+  (cd "$cl/x" && BRIDGER_SESSION_ID=raceA "$bridger" register raced >"$cl/out-a" 2>&1
+   echo $? >"$cl/rc-a") &
+  (cd "$cl/y" && BRIDGER_SESSION_ID=raceZ "$bridger" register raced >"$cl/out-z" 2>&1
+   echo $? >"$cl/rc-z") &
+  wait
+  told=0
+  if [ "$(cat "$cl/rc-a")" = 0 ]; then told=$((told + 1)); fi
+  if [ "$(cat "$cl/rc-z")" = 0 ]; then told=$((told + 1)); fi
+  [ "$told" -eq 1 ] \
+    || fail "simultaneous register of one name: $told callers were told it worked (want 1) — [$(cat "$cl/out-a")] [$(cat "$cl/out-z")]"
+  # …and the one that lost has to be able to act on it: a refusal that names the
+  # directory holding the name is the difference between picking another name and
+  # believing you own this one.
+  if [ "$(cat "$cl/rc-a")" = 0 ]; then loser="$cl/out-z"; else loser="$cl/out-a"; fi
+  grep -q "raced" "$loser" \
+    || fail "the caller that lost the name was not told which name it lost (got: $(cat "$loser"))"
+  pass "a simultaneous same-name register is refused for exactly one of the two callers"
+  rm -rf "$BRIDGER_ROOT"
+)
+
 # --- a wedge may not consume a message it never delivered ---------------------
 # `advance_cursor "$((wedge - 1))"` is only sound while the scan runs in ASCENDING
 # NUMERIC order. The glob sorts lexicographically, and the two stop agreeing at
