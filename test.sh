@@ -1921,6 +1921,38 @@ fi
   rm -rf "$BRIDGER_ROOT"
 )
 
+# --- a wedge whose seq could not be recorded must still be announced -----------
+# The scratch file carrying the wedge seq is optional by design (a read-only root
+# must stay readable, and --peek needs no bound). When it cannot be created
+# ANYWHERE, cmd_poll does not know how far it may advance — and must still say the
+# thread is stuck, because stderr reaches no session. Without the ''|non-numeric
+# arm the empty wedge falls through: `$((wedge - 1))` is -1, advance_cursor
+# returns 0 for it so no unwritable notice prints, and the notice de-dup compares
+# "" against a marker that does not exist and finds them equal. The thread is then
+# permanently stuck in total silence.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  nw="$work/nowedge"; mkdir -p "$nw/a" "$nw/b"
+  "$bridger" register wsnd "$nw/a" >/dev/null
+  "$bridger" register wrcv "$nw/b" >/dev/null
+  ntd="$BRIDGER_ROOT/threads/wrcv--wsnd"; mkdir -p "$ntd"
+  for s in 1 2 3; do
+    jq -n --argjson s "$s" '{seq:$s,from:"wsnd",to:"wrcv",type:"chat",
+      body:("w"+($s|tostring)),ts:"2026-01-01T00:00:00Z"}' > "$ntd/0000$s.json"
+  done
+  chmod 000 "$ntd/00002.json"
+  chmod 555 "$BRIDGER_ROOT"                       # no .wedge.XXXXXX in the root
+  # …and no fallback either, so no wedge seq exists to be read back at all
+  ngot=$(cd "$nw/b" && TMPDIR=/nonexistent-bridger-test "$bridger" poll 2>/dev/null || true)
+  chmod 755 "$BRIDGER_ROOT"; chmod 644 "$ntd/00002.json"
+  grep -q 'is stuck' <<<"$ngot" \
+    || fail "a thread stuck with no recordable wedge seq said nothing on stdout (got: $ngot)"
+  pass "a wedge that could not be recorded is still announced"
+  rm -rf "$BRIDGER_ROOT"
+)
+fi
+
 # --- a read-only bus ROOT must not silently reinstate the storm ---------------
 # Making the wedge scratch file optional (so a read-only root stays readable) also
 # turned "I could not learn the wedge seq" into "there was no wedge" on a
