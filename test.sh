@@ -2150,6 +2150,46 @@ if [ "$(id -u)" -ne 0 ]; then
 )
 fi
 
+# --- an OBSTRUCTED lock path must fail fast, and contention must not ----------
+# The branch that decides "this mkdir can never succeed" cannot read that off the
+# lock being absent: under contention the holder releases between the mkdir and
+# the test, and two such readings in a row made a perfectly ordinary race die
+# with mkdir's own "File exists" in the message. It asks the bus directly now —
+# but a probe answers "the bus is fine" for the two obstructions that block only
+# the lock PATH, and those would then spin forever with nothing on either stream,
+# which is the failure that branch exists to prevent. A dangling symlink is the
+# second one because `[ -e ]` is false for it while mkdir still fails EEXIST.
+(
+  ob=$(mktemp -d); mkdir -p "$ob/bus" "$ob/d"
+  (cd "$ob/d" && BRIDGER_ROOT="$ob/bus" "$bridger" register obst) >/dev/null 2>&1 \
+    || { rm -rf "$ob"; fail "the obstruction fixture could not register its peer"; }
+  for junk in file danglink; do
+    case "$junk" in
+      file)     : > "$ob/bus/peers/obst.json.lock" ;;
+      danglink) ln -s "$ob/bus/peers/no-such-target" "$ob/bus/peers/obst.json.lock" ;;
+    esac
+    (cd "$ob/d" && BRIDGER_ROOT="$ob/bus" "$bridger" summary "blocked by $junk") \
+      >/dev/null 2>"$ob/err" &
+    obpid=$!
+    for _ in $(seq 1 60); do kill -0 "$obpid" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$obpid" 2>/dev/null; then
+      kill -9 "$obpid" 2>/dev/null || true
+      rm -rf "$ob"
+      fail "a $junk at the lock path made peer_lock spin instead of failing"
+    fi
+    wait "$obpid" 2>/dev/null \
+      && { rm -rf "$ob"; fail "a $junk at the lock path was reported as a successful write"; }
+    grep -q "is not a lock directory" "$ob/err" \
+      || { err=$(cat "$ob/err"); rm -rf "$ob"; fail "a $junk at the lock path died without naming it (got: $err)"; }
+    rm -f "$ob/bus/peers/obst.json.lock"
+  done
+  # And the same peer still writes normally once the path is clear — the guard
+  # must not have left the lock behind.
+  (cd "$ob/d" && BRIDGER_ROOT="$ob/bus" "$bridger" summary "clear now") >/dev/null 2>&1 \
+    || { rm -rf "$ob"; fail "the peer could not be written after the obstruction was removed"; }
+  rm -rf "$ob"
+  pass "a file or a dangling symlink at the lock path fails fast and says which"
+)
 
 # --- two sessions claiming one name at the same instant -----------------------
 # Putting write_peer under a lock serialises the WRITE, not the CLAIM: the lock is

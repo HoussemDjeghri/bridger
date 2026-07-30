@@ -798,7 +798,7 @@ require_identity() {
 # decide-then-write in cmd_register. Two separate names because this is a `mkdir`
 # and so not reentrant — write_peer takes `lock` from inside the claimed region.
 peer_lock() { # name [kind]
-  local lock="$(peer_file "$1").${2:-lock}" tries=0 stuck=0 holder err
+  local lock="$(peer_file "$1").${2:-lock}" tries=0 holder err
   # The lock lives in peers/, so its own precondition is that peers/ exists —
   # cmd_register now claims the name before write_peer gets anywhere near
   # creating it, and on a fresh bus that made every first register die with
@@ -813,15 +813,35 @@ peer_lock() { # name [kind]
   # session hung at startup with no output at all. Keep the error and decide.
   until err=$(mkdir "$lock" 2>&1); do
     if [ ! -d "$lock" ]; then
-      # Not held, so waiting cannot help. Two consecutive readings, so a holder
-      # that releases between the failed mkdir and this test is not mistaken for
-      # an impossible one.
-      stuck=$((stuck + 1))
-      [ "$stuck" -lt 2 ] || die "cannot lock '$1' on this bus: $err"
-      sleep 0.02
-      continue
+      # Something that is not a lock occupies the lock path — a plain file left
+      # by hand or by a crash, or a dangling symlink, both of which `[ -d ]` reads
+      # as "not held" while mkdir goes on failing EEXIST forever. `-L` as well as
+      # `-e`, because a dangling link is invisible to `-e` and would otherwise
+      # fall through to the probe below and spin in silence, which is precisely
+      # the failure this whole branch exists to prevent.
+      if [ -e "$lock" ] || [ -L "$lock" ]; then
+        die "cannot lock '$1': $lock exists and is not a lock directory — remove it"
+      fi
+      # Nothing there at all. Either the mkdir failed for a reason waiting cannot
+      # fix, or the holder released in the microsecond between the mkdir and this
+      # test — which is simply what contention looks like from here. Counting
+      # consecutive readings does not separate the two: with thirty writers on one
+      # record it happened twice in a row often enough to fail one suite run in
+      # three, and the message it died with quoted mkdir's own "File exists" — the
+      # lock WAS held, and waiting was exactly the right move.
+      #
+      # So ask the question that has an answer rather than inferring it: can this
+      # process create anything here at all? A probe covers what `[ -w ]` cannot
+      # (a full disk answers ENOSPC with the write bits still set), and it runs
+      # only on this rare path. The name cannot collide with the peers/*.json
+      # glob — the suffix comes after .json.
+      if mkdir "$lock.probe.$$" 2>/dev/null; then
+        rmdir "$lock.probe.$$" 2>/dev/null || true
+        sleep 0.02
+        continue
+      fi
+      die "cannot lock '$1' on this bus: $err"
     fi
-    stuck=0
     tries=$((tries + 1))
     # Break in only for a holder that is GONE, never one that is merely slow.
     # Spinning a fixed number of times cannot tell those apart, and this machine
