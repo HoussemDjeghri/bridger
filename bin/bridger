@@ -602,11 +602,25 @@ peer_threads() { # name -> one thread dir per line
 # than a silent undercount. `reap` tells the operator to decide on this figure
 # before dropping a registration, and an unreadable message would otherwise make
 # a peer holding mail look emptier than it is.
+# How many messages are waiting for $2 in thread $1, up to $3 — with a trailing
+# "+" when the scan could not finish. The "+" is not decoration: a thread wedged
+# on an unreadable message stops the scan there, so the number is a FLOOR, and
+# without the marker a peer holding five messages reports one. Every caller that
+# shows a count goes through here, because the two that had their own copy of
+# this expression (`status` and the send-time warning — the two an agent actually
+# reads) were the two that printed the floor as a fact.
+unread_count_in_thread() { # thread_dir who top -> N or N+
+  local out partial=""
+  out=$(unread_in_thread "$1" "$2" "$3" 2>/dev/null) || partial="+"
+  printf '%s%s\n' "$(printf '%s' "$out" | grep -c . || true)" "$partial"
+}
+
 unread_total() { # name -> count, or "N+" when the count is incomplete
-  local name="$1" n=0 dir out partial=""
+  local name="$1" n=0 dir c partial=""
   while IFS= read -r dir; do
-    out=$(unread_in_thread "$dir" "$name" "$(max_seq "$dir")" 2>/dev/null) || partial="+"
-    n=$(( n + $(printf '%s' "$out" | grep -c . || true) ))
+    c=$(unread_count_in_thread "$dir" "$name" "$(max_seq "$dir")")
+    case "$c" in *+) partial="+"; c=${c%+} ;; esac
+    n=$((n + c))
   done < <(peer_threads "$name")
   printf '%s%s\n' "$n" "$partial"
 }
@@ -1238,7 +1252,7 @@ warn_if_unheard() { # to from
   status=$(peer_status "$to")
   [ "$status" = listening ] && return 0
   dir=$(thread_dir "$from" "$to")
-  n=$(unread_in_thread "$dir" "$to" "$(max_seq "$dir")" | grep -c . || true)
+  n=$(unread_count_in_thread "$dir" "$to" "$(max_seq "$dir")")   # "N+" when the thread is wedged
   # Same promise as "queued" — it may well be read — plus the one extra fact a
   # sender can act on: this registration looks abandoned, so if nobody answers,
   # that is the likely reason. Deliberately not phrased as unreachable.
@@ -1740,8 +1754,8 @@ cmd_status() {
     n=0; m=0
     if [ -d "$dir" ]; then
       top=$(max_seq "$dir")
-      n=$(unread_in_thread "$dir" "$me" "$top" | grep -c . || true)
-      m=$(unread_in_thread "$dir" "$peer" "$top" | grep -c . || true)
+      n=$(unread_count_in_thread "$dir" "$me" "$top")
+      m=$(unread_count_in_thread "$dir" "$peer" "$top")
     fi
     echo "peer: $peer [$(peer_status "$peer")]  unread: $n  unread-by-them: $m"
   done

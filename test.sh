@@ -209,6 +209,39 @@ if [ "$(id -u)" -ne 0 ]; then
 )
 fi
 
+# --- a count that cannot be completed must not be printed as a fact -----------
+# `unread_total` has carried a trailing "+" since it was written, for a stated
+# reason: "an unreadable message would otherwise make a peer holding mail look
+# emptier than it is". `status` and the send-time warning had their own copy of
+# the expression without it — and those two are the ones an agent actually reads.
+# Five messages waiting, #2 unreadable: both said one, flatly, and `status` is
+# the documented way to check for exactly this.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  fl=$(mktemp -d); mkdir -p "$fl/a" "$fl/b"
+  (cd "$fl/a" && BRIDGER_SESSION_ID=fl-a "$bridger" register flalice >/dev/null)
+  (cd "$fl/b" && BRIDGER_SESSION_ID=fl-b "$bridger" register flbob   >/dev/null)
+  for i in 1 2 3 4 5; do
+    (cd "$fl/b" && BRIDGER_SESSION_ID=fl-b "$bridger" send flalice chat "f$i" >/dev/null)
+  done
+  chmod 000 "$BRIDGER_ROOT/threads/flalice--flbob/00002.json"
+  st=$( (cd "$fl/a" && BRIDGER_SESSION_ID=fl-a "$bridger" status) 2>/dev/null | grep 'peer: flbob' )
+  grep -q 'unread: [0-9]*+' <<<"$st" \
+    || fail "status printed a wedged thread's floor as an exact count (got: $st)"
+  wn=$( (cd "$fl/b" && BRIDGER_SESSION_ID=fl-b "$bridger" send flalice chat f6 >/dev/null) 2>&1 )
+  grep -q '[0-9]+ message(s)' <<<"$wn" \
+    || fail "the send-time warning printed a wedged thread's floor as an exact count (got: $wn)"
+  # And the marker must not appear when the scan DID complete.
+  chmod 644 "$BRIDGER_ROOT/threads/flalice--flbob/00002.json"
+  st=$( (cd "$fl/a" && BRIDGER_SESSION_ID=fl-a "$bridger" status) 2>/dev/null | grep 'peer: flbob' )
+  grep -q 'unread: 6 ' <<<"$st" \
+    || fail "status marked a complete count as incomplete (got: $st)"
+  pass "an incomplete unread count carries its '+' everywhere it is shown"
+  rm -rf "$BRIDGER_ROOT" "$fl"
+)
+fi
+
 # --- timeouts ---------------------------------------------------------------
 if (cd "$work/app" && "$bridger" ask liba "void" --timeout 3 >/dev/null 2>&1); then
   fail "ask without responder must time out with nonzero exit"
