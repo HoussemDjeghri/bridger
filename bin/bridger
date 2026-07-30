@@ -580,17 +580,71 @@ statusline_clear() { # drop THIS session's badge state
 # A caller WITHOUT a session id (a plain-shell CLI query, a script) is not a
 # competing identity and never rebinds a peer, so it keeps the old convenience:
 # the longest-cwd directory match.
-resolve_identity() {
-  local f name cwd sess sid best="" bestlen=-1 mine="" minelen=-1
-  sid=$(session_id)
-  for f in "$BRIDGER_ROOT"/peers/*.json; do
+
+# Every peer record that yields a usable address, as THREE LINES per record —
+# name, session id, directory — and nothing at all for a record that does not
+# (unreadable, unparseable, not an object, or no `.cwd` string; see CWD_FILTER).
+#
+# The DIRECTORY is last because it is the one field that can never be empty, and
+# `$( )` strips trailing newlines: with the session id last, a record whose
+# `.session` is empty — every peer registered from a plain shell — lost its third
+# line to the capture below, the reader's third `read` hit EOF, and the LAST peer
+# in the registry resolved to nothing at all.
+#
+# One jq for the whole registry instead of two per record plus a `basename`.
+# Identity resolution is paid THREE times by every delivery-hook call (`whoami`,
+# inside `peers`, and `poll --peek`'s `require_identity`), so the per-record cost
+# was multiplied by three and by the peer count: 6 of the hook's 11 jq forks per
+# peer at 51 peers, and at ~80 peers the hook went over its 5s budget, was killed
+# mid-poll, delivered nothing, and left no marker — so the next tool call
+# repeated it and it never converged.
+#
+# Three lines, never a tab-separated triple: tab is IFS whitespace even when IFS
+# is set to just a tab, so `read -r name cwd sess` COLLAPSES a run of tabs and a
+# record with an empty `.session` shifts the session id into `$cwd`. One field
+# per line cannot shift — which is why a directory whose path contains a newline
+# is refused at registration and skipped here, in both paths.
+peer_registry() {
+  local f name cwd out
+  set -- "$BRIDGER_ROOT"/peers/*.json
+  [ -e "$1" ] || return 0
+  # CAPTURE, never stream: jq emits every record before the one it fails on, so
+  # a batch written straight to stdout would be re-emitted by the per-record walk
+  # below and one corrupt record would resolve identity twice over.
+  if out=$(jq -rn '
+        inputs
+        | if type != "object" then empty
+          else .cwd as $c
+          | if ($c | type) != "string" or ($c | length) == 0 then empty
+            elif ($c | contains("\n")) then error("peer directory contains a newline")
+            else (input_filename | split("/") | last | rtrimstr(".json")),
+                 (if (.session | type) == "string" then .session else "" end),
+                 $c
+            end
+          end' "$@" 2>/dev/null); then
+    [ -z "$out" ] || printf '%s\n' "$out"
+    return 0
+  fi
+  # One bad record must not cost every session its identity, so fall back to
+  # deciding each record on its own — the cost the batch exists to avoid is then
+  # paid only by a registry that actually has a fault.
+  for f in "$@"; do
     [ -e "$f" ] || continue
-    # The filename is the address, and an unreadable record resolves to nothing
-    # — skip it quietly rather than leaking three raw jq errors per record on
-    # every single command.
-    name=$(basename "$f" .json)
+    name=${f##*/}; name=${name%.json}
     cwd=$(jq -er "$CWD_FILTER" "$f" 2>/dev/null) || continue
-    sess=$(jq -r '.session // ""' "$f" 2>/dev/null || echo "")
+    case "$cwd" in *$'\n'*) continue ;; esac
+    printf '%s\n%s\n%s\n' "$name" \
+      "$(jq -r 'if (.session | type) == "string" then .session else "" end' "$f" 2>/dev/null || true)" \
+      "$cwd"
+  done
+}
+
+resolve_identity() {
+  local name cwd sess sid best="" bestlen=-1 mine="" minelen=-1
+  sid=$(session_id)
+  # Redirect from a process substitution, not a pipe: the loop must run in THIS
+  # shell or best/mine die with the subshell.
+  while IFS= read -r name && IFS= read -r sess && IFS= read -r cwd; do
     case "$PWD" in
       "$cwd"|"$cwd"/*)
         if [ "${#cwd}" -gt "$bestlen" ]; then best=$name; bestlen=${#cwd}; fi
@@ -598,7 +652,7 @@ resolve_identity() {
           mine=$name; minelen=${#cwd}
         fi ;;
     esac
-  done
+  done < <(peer_registry)
   if [ -n "$sid" ]; then
     [ -n "$mine" ] && echo "$mine"
   else
@@ -610,20 +664,16 @@ resolve_identity() {
 # register find a session's own prior identity for a clean rename, without
 # matching peers OTHER sessions registered in the same directory.
 resolve_my_identity() {
-  local f name cwd sess sid best="" bestlen=-1
+  local name cwd sess sid best="" bestlen=-1
   sid=$(session_id)
   [ -n "$sid" ] || return 0
-  for f in "$BRIDGER_ROOT"/peers/*.json; do
-    [ -e "$f" ] || continue
-    sess=$(jq -r '.session // ""' "$f" 2>/dev/null || echo "")
+  while IFS= read -r name && IFS= read -r sess && IFS= read -r cwd; do
     [ "$sess" = "$sid" ] || continue
-    name=$(basename "$f" .json)
-    cwd=$(jq -er "$CWD_FILTER" "$f" 2>/dev/null) || continue
     case "$PWD" in
       "$cwd"|"$cwd"/*)
         if [ "${#cwd}" -gt "$bestlen" ]; then best=$name; bestlen=${#cwd}; fi ;;
     esac
-  done
+  done < <(peer_registry)
   [ -n "$best" ] && echo "$best"
 }
 
@@ -711,6 +761,11 @@ write_peer() { # name dir
   # the same record: identity matches on `case "$PWD" in "$cwd"|"$cwd"/*)`, so an
   # empty cwd is a peer that answers to every directory on the machine.
   [ -n "$dir" ] || die "refusing to register '$name' with no directory"
+  # The sink refuses this too, for the same reason it refuses an empty dir: the
+  # peer registry, `peers`, the statusline and the hooks are all line-oriented,
+  # so a path with a newline in it shifts every field after it — in identity
+  # resolution that decides who a session IS.
+  case "$dir" in *$'\n'*) die "refusing to register '$name': its directory path contains a newline" ;; esac
   created=$(now_utc)
   mkdir -p "$BRIDGER_ROOT/peers"
   # This whole function is one read-modify-write on a peer record: it reads
@@ -771,6 +826,10 @@ cmd_register() {
   valid_name "$name" || die "invalid name '$name' (lowercase letters, digits, single dashes; max 32 chars)"
   [ -d "$dir" ] || die "no such directory: $dir"
   dir=$(cd "$dir" && pwd)
+  # Decided here as well as in write_peer, because everything between the two
+  # destroys: the rename path `rm -f`s the caller's own record before the sink is
+  # ever reached (see "DECIDE BEFORE DESTROYING" below).
+  case "$dir" in *$'\n'*) die "refusing to register '$name': its directory path contains a newline" ;; esac
   sid=$(session_id)
 
   # DECIDE BEFORE DESTROYING. Both refusals below used to sit AFTER the two

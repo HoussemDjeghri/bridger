@@ -337,6 +337,47 @@ pass "same name: live holder refused, dead holder taken over"
   rm -rf "$BRIDGER_ROOT" "$bw"
 )
 
+# --- identity resolution must not cost a process per peer record --------------
+# Every delivery-hook call resolves identity three times (whoami, inside peers,
+# and poll --peek's require_identity), so a per-record cost is multiplied by
+# three and by the peer count. At 51 peers that was 6 of the hook's 11 jq forks
+# per peer; at ~80 the hook went over its 5s budget, was killed mid-poll,
+# delivered nothing, and left no marker — so the next tool call repeated it and
+# it never converged. Count forks, not seconds: a wall-clock bound on a shared
+# machine flakes, a fork count cannot.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  fr=$(mktemp -d); mkdir -p "$fr/shim"
+  real_jq=$(command -v jq) || fail "no jq on PATH"
+  printf '#!/bin/sh\nprintf x >> "%s/forks"\nexec %s "$@"\n' "$fr" "$real_jq" > "$fr/shim/jq"
+  chmod +x "$fr/shim/jq"
+  for i in $(seq 1 40); do
+    mkdir -p "$fr/p$i"
+    (cd "$fr/p$i" && BRIDGER_SESSION_ID="s$i" "$bridger" register "p$i" >/dev/null)
+  done
+  : > "$fr/forks"
+  out=$(cd "$fr/p40" && PATH="$fr/shim:$PATH" BRIDGER_SESSION_ID=s40 "$bridger" whoami)
+  [ "$out" = "p40" ] || fail "whoami resolved '$out', expected p40"
+  forks=$(wc -c <"$fr/forks" | tr -d ' ')
+  [ "$forks" -le 6 ] \
+    || fail "whoami cost $forks jq forks at 40 peers — identity resolution is O(peers) again"
+  pass "identity resolution reads the whole peer registry in a bounded number of forks"
+
+  # The registry is read as one field per line, so a directory whose path
+  # contains a newline would shift every field after it — the F8 field-shift, in
+  # the one place that decides who a session IS. Refuse it at the boundary
+  # instead, which is also the only surface where such a path can be introduced:
+  # `peers`, the statusline and the hooks are all line-oriented already.
+  nl=$(printf 'two\nlines')
+  mkdir -p "$fr/$nl"
+  if (cd "$fr" && BRIDGER_SESSION_ID=s-nl "$bridger" register nlpeer "$fr/$nl" >/dev/null 2>&1); then
+    fail "register accepted a directory whose path contains a newline"
+  fi
+  [ -f "$BRIDGER_ROOT/peers/nlpeer.json" ] && fail "the refused register wrote a record anyway"
+  pass "a peer directory whose path contains a newline is refused, not half-recorded"
+  rm -rf "$BRIDGER_ROOT" "$fr"
+)
+
 # --- a register that is REFUSED must not have destroyed anything first -------
 # The rename block ran before the refusal, so a register that was going to be
 # rejected had already `rm -f`'d the caller's own peer record: the session ended
