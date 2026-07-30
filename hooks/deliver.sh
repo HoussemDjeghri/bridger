@@ -69,18 +69,6 @@ emit() { # text
 
 ARM='Arm the watcher NOW, before anything else: run CLI `wait --follow` as a persistent background task (Monitor tool if available, otherwise a background Bash task). It is what delivers messages to this session while it sits idle — nothing else does. Each line it emits is one message "#<seq> <from> <type>: <body>".'
 
-# Did this call look like a registration? Only a hint, never a verdict: the
-# command is matched as a SUBSTRING, so a grep, a doc edit or a test that merely
-# mentions the phrase looks identical to the real thing. This used to emit-and-
-# exit right here, which meant such a command both asserted "this session is now
-# registered" — of a session that might not be registered at all — and skipped
-# the unread delivery below it. So only remember it, and let the checks that read
-# actual state decide.
-registered_now=0
-case "${cmd:-}" in
-  *"bridger register"*|*"bridger join"*) registered_now=1 ;;
-esac
-
 # Mid-task, the report is per arrival, not per tool call. The marker is the
 # high-water mark of what has already been reported; a thread file newer than
 # it means something landed since. One find, no jq, stops at the first hit.
@@ -111,6 +99,29 @@ marker_id=${marker_id:-nosession}
 # shorter string, which collapsed every session onto one marker named `reported-`.
 [ ${#marker_id} -le 64 ] || marker_id=${marker_id: -64}
 marker="$BRIDGER_ROOT/reported-$marker_id"
+# Said once per session, not once per matching tool call — see the emit below.
+# Its own marker rather than stop.sh's `armed-nudge-`: that one gates a Stop
+# BLOCK, the last thing standing between a deaf session and going idle, and
+# spending it here on a message the agent may scroll past would trade the
+# stronger guarantee for the weaker one.
+armed="$BRIDGER_ROOT/registered-nudge-$marker_id"
+
+# Did this call look like a registration? Only a hint, never a verdict: the
+# command is matched as a SUBSTRING, so a grep, a doc edit or a test that merely
+# mentions the phrase looks identical to the real thing — an agent working on
+# this repo trips it constantly. This used to emit-and-exit right here, which
+# meant such a command both asserted "this session is now registered" — of a
+# session that might not be registered at all — and skipped the unread delivery
+# below it. So only remember it, and let the checks that read actual state decide.
+#
+# Once the session has been told, the hint stops counting at all: it is what
+# bypasses the high-water gate below, so every grep for the phrase paid the full
+# scan and re-emitted the same paragraph, unbounded, for the whole session.
+registered_now=0
+case "${cmd:-}" in
+  *"bridger register"*|*"bridger join"*) [ -f "$armed" ] || registered_now=1 ;;
+esac
+
 if [ "${event:-}" = "PostToolUse" ] && [ "$registered_now" -eq 0 ] && [ -f "$marker" ]; then
   [ -n "$(find "$BRIDGER_ROOT/threads" -name '*.json' -newer "$marker" -print -quit 2>/dev/null)" ] \
     || exit 0
@@ -125,6 +136,11 @@ me=$(cd "$cwd" && "$bridger" whoami 2>/dev/null) || exit 0
 # against a 5s budget.
 listed=$(cd "$cwd" && "$bridger" peers "$me" 2>/dev/null) || exit 0
 if grep -q "^$me \[listening\]" <<<"$listed"; then
+  # Listening is the one moment the push is provably unnecessary, so the marker
+  # goes with it: a watcher killed later, or a machine asleep past the staleness
+  # window, must be able to raise it again. stop.sh does the same with its own,
+  # once per turn; this is per tool call, so it re-arms sooner.
+  rm -f "$armed" 2>/dev/null || true
   exit 0
 fi
 
@@ -177,7 +193,14 @@ fi
 # halves of the claim: this session IS registered, and it is NOT listening.
 if [ -z "$unread" ]; then
   [ "$registered_now" -eq 1 ] || exit 0
-  emit "bridger: this session is now registered, but NOT yet listening. Registering does not start the watcher. $ARM"
+  # "IS registered", not "is NOW registered". The trigger is a substring of the
+  # tool's command; the state checks above prove only that this session is
+  # registered and not listening — equally true before the call — so "now" was a
+  # claim about an event that may never have happened. It fired on sessions that
+  # had merely grepped for the phrase, which is how it reached a reviewer's own
+  # context three times in one sitting.
+  { : > "$armed"; } 2>/dev/null || true   # a marker that cannot be written costs a repeat, never the push
+  emit "bridger: this session is registered as peer '$me' and is NOT listening — messages will land on disk with nothing to announce them. Registering does not start the watcher. $ARM"
 fi
 MAX_SHOWN=5
 # Messages only. A peek also carries thread-fault notices now — a wedged thread

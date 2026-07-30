@@ -1543,8 +1543,21 @@ pass "an untraversable parent leaves a peer registered and unreaped"
   (cd "$up/reader" && BRIDGER_SESSION_ID=reader-sess "$bridger" poll >/dev/null 2>&1)
   regcall='{"hook_event_name":"PostToolUse","cwd":"'"$up/reader"'","session_id":"reader-sess","tool_input":{"command":"'"$bridger"' register scout"}}'
   out=$(printf '%s' "$regcall" | bash "$hook")
-  jq -r '.hookSpecificOutput.additionalContext' <<<"$out" | grep -q "NOT yet listening" \
+  jq -r '.hookSpecificOutput.additionalContext' <<<"$out" | grep -q "NOT listening" \
     || fail "a register call must draw the arm-the-watcher instruction (got: $out)"
+  # The trigger is a SUBSTRING of the tool's command, so the text may only claim
+  # what whoami and peers actually proved — that this session is registered and
+  # deaf, both equally true before the call. "now registered" asserted an event
+  # that may never have happened, and it reached a reviewer's own context three
+  # times in one sitting off nothing but greps for the phrase.
+  jq -r '.hookSpecificOutput.additionalContext' <<<"$out" | grep -q "now registered" \
+    && fail "the registration nudge asserted an event the hook cannot observe (got: $out)"
+  # And it is said once per session, not on every matching tool call: the hint
+  # also bypasses the high-water gate, so an unbounded nudge means an unbounded
+  # full scan with it. An agent working on this repo matches constantly.
+  again=$(printf '%s' "$regcall" | bash "$hook")
+  [ -z "$again" ] \
+    || fail "the registration nudge repeated on a later matching tool call (got: $again)"
 
   # But mail outranks the nag: a registration in a session that has unread
   # messages must still DELIVER them, and the arm instruction rides along in the
