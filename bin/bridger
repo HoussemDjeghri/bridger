@@ -392,9 +392,25 @@ unread_in_thread() {
   # already reads as "bytes that will never improve, skip loudly", so the fallback
   # emits the existing diagnostic unchanged. Its partial stdout is discarded with
   # the rest of the capture.
-  if [ "$batch_ok" -eq 1 ] && out=$(jq -c --arg me "$me" \
-       'if type == "object" then select(.to == $me) else halt_error(5) end' \
-       "${batch[@]}" 2>/dev/null); then
+  # In CHUNKS, because jq's argv is bounded by ARG_MAX (1 MB) and each entry costs
+  # len(thread_dir) + 20 bytes — so the ceiling is a function of how deep the bus
+  # root is, not of the message count. One argv for the whole run put it at ~12k
+  # unread on a short root but ~3k on a 336-char one, and past it the exec fails,
+  # the per-file walk runs, and the 5s hook timeout is back exactly as it was
+  # before the batch existed. 500 entries stays under 1 MB even at PATH_MAX, so
+  # the argv never grows and the fork count is N/500 at any root depth.
+  local i=0 part fast="$batch_ok" chunk=500
+  out=""
+  while [ "$fast" -eq 1 ] && [ "$i" -lt "${#batch[@]}" ]; do
+    part=$(jq -c --arg me "$me" \
+      'if type == "object" then select(.to == $me) else halt_error(5) end' \
+      "${batch[@]:$i:$chunk}" 2>/dev/null) || { fast=0; break; }
+    if [ -n "$part" ]; then
+      if [ -n "$out" ]; then out=$out$'\n'$part; else out=$part; fi
+    fi
+    i=$((i + chunk))
+  done
+  if [ "$fast" -eq 1 ]; then
     # A run addressed entirely to the other peer selects nothing; printf would
     # then emit a blank line, which render_lines counts as a message.
     [ -z "$out" ] || printf '%s\n' "$out"

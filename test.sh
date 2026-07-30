@@ -2290,6 +2290,38 @@ $(cd "$cw/b" && "$bridger" poll 2>/dev/null || true)"
   rm -rf "$BRIDGER_ROOT" "$nb"
 )
 
+# --- the batched scan must not have an ARG_MAX cliff of its own ----------------
+# One jq argv for the whole unread run costs len(thread_dir) + 20 bytes per
+# message, so the ceiling is a function of how DEEP the bus root is, not of the
+# message count: ~12k unread on a short root but ~3k on a 336-char one. Past it
+# the exec fails, the per-file walk runs, and the 5s delivery-hook timeout is
+# back exactly as it was before the batch existed — same signature, same silent
+# permanent non-delivery. Build a root deep enough that the cliff is cheap to
+# reach and cross it.
+(
+  BRIDGER_ROOT=$(mktemp -d)/$(printf 'd%.0s' $(seq 1 60))/$(printf 'e%.0s' $(seq 1 60))/$(printf 'f%.0s' $(seq 1 60))
+  export BRIDGER_ROOT; mkdir -p "$BRIDGER_ROOT"
+  am=$(mktemp -d); mkdir -p "$am/r" "$am/w"
+  (cd "$am/r" && BRIDGER_SESSION_ID=am-r "$bridger" register amreader >/dev/null)
+  (cd "$am/w" && BRIDGER_SESSION_ID=am-w "$bridger" register amwriter >/dev/null)
+  (cd "$am/w" && BRIDGER_SESSION_ID=am-w "$bridger" send amreader chat m1 >/dev/null 2>&1)
+  td="$BRIDGER_ROOT/threads/amreader--amwriter"
+  # The cliff for THIS root, from the same arithmetic the kernel uses, plus a
+  # margin — so the fixture stays valid if the paths or the padding ever change.
+  n=$(( 1048576 / (${#td} + 20) + 300 ))
+  for i in $(seq 2 "$n"); do
+    printf '{"seq":%d,"from":"amwriter","to":"amreader","type":"chat","body":"m%d","ts":"2026-01-01T00:00:00Z"}\n' \
+      "$i" "$i" > "$td/$(printf '%05d' "$i").json"
+  done
+  start=$SECONDS
+  got=$( (cd "$am/r" && BRIDGER_SESSION_ID=am-r "$bridger" poll --peek --json) 2>/dev/null | grep -c . )
+  [ $((SECONDS - start)) -lt 5 ] \
+    || fail "a $n-message run over a ${#td}-char thread dir took $((SECONDS - start))s — the argv hit ARG_MAX"
+  [ "$got" -eq "$n" ] || fail "delivered $got of $n messages across the chunk boundary"
+  pass "the batched scan chunks its argv, so a deep bus root has no cliff"
+  rm -rf "$BRIDGER_ROOT" "$am"
+)
+
 # --- monitor: the web view reads what the CLI writes -------------------------
 # The reader reimplements cursor and heartbeat semantics in Python, so it has
 # its own self-check; this also points it at the root this suite just built, to
