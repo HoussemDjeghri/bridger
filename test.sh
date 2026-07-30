@@ -1823,13 +1823,18 @@ fi
   rm -rf "$BRIDGER_ROOT"
 )
 
-# Each shape needs its own bus: a cursor left past these seqs by an earlier
-# fixture would skip them and the assertion would pass vacuously.
+# Its own bus: a cursor left past these seqs by an earlier fixture would skip
+# them and the assertion would pass vacuously.
+# This ran a second shape until 0.15.0 — a 19-digit stem wrapping onto seq 1 — and
+# that shape asserted nothing. sorted_stems' width bound keeps a stem that wide
+# out of the scan, so its `chmod 000` file was never opened: no wedge, no notice,
+# cursor at top, and both assertions below passed without exercising one. The
+# bound is what needed the coverage, and it has its own two assertions further
+# down.
 if [ "$(id -u)" -ne 0 ]; then
-for shape in overflow duplicate; do
 (
   BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
-  dp="$work/dup-$shape"; mkdir -p "$dp/a" "$dp/b"
+  dp="$work/dup-bare"; mkdir -p "$dp/a" "$dp/b"
   "$bridger" register psend "$dp/a" >/dev/null
   "$bridger" register precv "$dp/b" >/dev/null
   ptd="$BRIDGER_ROOT/threads/precv--psend"; mkdir -p "$ptd"
@@ -1838,30 +1843,83 @@ for shape in overflow duplicate; do
       '{seq:$s,from:"psend",to:"precv",type:"chat",
         body:("dup-"+($s|tostring)),ts:"2026-01-01T00:00:00Z"}' > "$ptd/0000$s.json"
   done
-  if [ "$shape" = overflow ]; then
-    # 19+ digits: `$((10#…))` wraps to 1 while `sort -n` puts the stem LAST.
-    cp "$ptd/00001.json" "$ptd/18446744073709551617.json"
-    faulty="$ptd/18446744073709551617.json"; marker=dup-1
-  else
-    # Two files at one seq: the scan emitted the padded one, then wedged on the
-    # bare one at the SAME seq, so `wedge - 1` sat below what it had just sent.
-    cp "$ptd/00003.json" "$ptd/3.json"
-    faulty="$ptd/3.json"; marker=dup-3
-  fi
+  # Two files at one seq: the scan emitted the padded one, then wedged on the
+  # bare one at the SAME seq, so `wedge - 1` sat below what it had just sent.
+  cp "$ptd/00003.json" "$ptd/3.json"
+  faulty="$ptd/3.json"; marker=dup-3
   chmod 000 "$faulty"
 
   first=$(cd "$dp/b" && "$bridger" poll 2>/dev/null || true)
   grep -q "$marker" <<<"$first" \
-    || fail "$shape: the message before the fault was never delivered (got: $first)"
+    || fail "the message before the fault was never delivered (got: $first)"
   second=$(cd "$dp/b" && "$bridger" poll 2>/dev/null || true)
   grep -q "$marker" <<<"$second" \
-    && fail "$shape: a delivered message is re-delivered on every poll — the storm is back (got: $second)"
+    && fail "a delivered message is re-delivered on every poll — the storm is back (got: $second)"
   chmod 644 "$faulty"
-  pass "no filename shape ($shape) makes a wedge repeat what it already delivered"
+  pass "a bare seq beside a padded one does not make a wedge repeat what it delivered"
   rm -rf "$BRIDGER_ROOT"
 )
-done
 fi
+
+# --- a seq too wide to evaluate is not a message, on both sides of the scan ---
+# `$((10#$stem))` is int64, so a 19+ digit stem wraps to an unrelated number. The
+# bound has to be in BOTH places that glob the thread. Without it in sorted_stems
+# the scan visits the file at its WRAPPED position, and a stem that wraps inside
+# the unread run is delivered as a message at a seq that is not its own — a Finder
+# duplicate, a restored archive or an older bus with a wider name becomes traffic.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  wd="$work/wide"; mkdir -p "$wd/a" "$wd/b"
+  "$bridger" register wsend "$wd/a" >/dev/null
+  "$bridger" register wrecv "$wd/b" >/dev/null
+  wtd="$BRIDGER_ROOT/threads/wrecv--wsend"; mkdir -p "$wtd"
+  for s in 1 2 5; do
+    jq -n --argjson s "$s" '{seq:$s,from:"wsend",to:"wrecv",type:"chat",
+      body:("real-"+($s|tostring)),ts:"2026-01-01T00:00:00Z"}' > "$wtd/0000$s.json"
+  done
+  # 2^64+3: twenty digits, wrapping to 3 — inside the unread run and colliding
+  # with no real seq, so sorted_stems' own dedup cannot mask the difference.
+  jq -n '{seq:3,from:"wsend",to:"wrecv",type:"chat",body:"GHOST",
+          ts:"2026-01-01T00:00:00Z"}' > "$wtd/18446744073709551619.json"
+  wgot=$(cd "$wd/b" && "$bridger" poll 2>/dev/null || true)
+  grep -q GHOST <<<"$wgot" \
+    && fail "a 20-digit stem was delivered as a message at its wrapped seq (got: $wgot)"
+  [ "$(grep -c 'real-' <<<"$wgot")" -eq 3 ] \
+    || fail "the three real messages did not all arrive (got: $wgot)"
+  pass "a seq too wide to evaluate is not a message in the scan either"
+  rm -rf "$BRIDGER_ROOT"
+)
+
+# --- …and it must not become the cursor's high-water mark ----------------------
+# The other half of the same bound, in max_seq. Keeping the file out of the scan
+# is not enough: without the bound here the wrapped value becomes `top`,
+# advance_cursor writes it, and every real message at or below it is marked read
+# without ever being delivered. One badly named file in a restored bus would
+# swallow the thread's entire future in silence.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  hw="$work/highwater"; mkdir -p "$hw/a" "$hw/b"
+  "$bridger" register qsend "$hw/a" >/dev/null
+  "$bridger" register qrecv "$hw/b" >/dev/null
+  htd="$BRIDGER_ROOT/threads/qrecv--qsend"; mkdir -p "$htd"
+  for s in 1 2 3 4; do
+    jq -n --argjson s "$s" '{seq:$s,from:"qsend",to:"qrecv",type:"chat",
+      body:("m"+($s|tostring)),ts:"2026-01-01T00:00:00Z"}' > "$htd/0000$s.json"
+  done
+  echo 3 > "$htd/cursor-qrecv"
+  # 2^64+1000: twenty digits, wrapping to 1000 — far above every real seq.
+  cp "$htd/00001.json" "$htd/18446744073709552616.json"
+  (cd "$hw/b" && "$bridger" poll >/dev/null 2>&1) || true
+  [ "$(cat "$htd/cursor-qrecv")" = "4" ] \
+    || fail "a 20-digit stem became the cursor's high-water mark (cursor=$(cat "$htd/cursor-qrecv"))"
+  jq -n '{seq:5,from:"qsend",to:"qrecv",type:"chat",body:"AFTER",ts:"2026-01-01T00:00:00Z"}' \
+    > "$htd/00005.json"
+  hgot=$(cd "$hw/b" && "$bridger" poll 2>/dev/null || true)
+  grep -q AFTER <<<"$hgot" \
+    || fail "a message arriving after a wide-stem file was never delivered (got: $hgot)"
+  pass "a seq too wide to evaluate does not become the cursor's high-water mark"
+  rm -rf "$BRIDGER_ROOT"
+)
 
 # --- a read-only bus ROOT must not silently reinstate the storm ---------------
 # Making the wedge scratch file optional (so a read-only root stays readable) also
