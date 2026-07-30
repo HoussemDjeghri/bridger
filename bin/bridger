@@ -882,16 +882,28 @@ write_peer() { # name dir [summary] [created]
   # summary committed in between was still overwritten with the stale value.
   peer_lock "$name"
   if [ -f "$(peer_file "$name")" ]; then
-    summary=$(jq -r '.summary // ""' "$(peer_file "$name")")
+    local had_cwd had_session
+    had_cwd=$(jq -r '.cwd // ""' "$(peer_file "$name")")
+    had_session=$(jq -r '.session // ""' "$(peer_file "$name")")
     created=$(jq -r '.created // empty' "$(peer_file "$name")")
+    # Inherit the description unless the record is being HANDED OVER — a
+    # different directory and a different session, which is the reclaim of a
+    # `missing` name in cmd_register. A summary is a claim of responsibility
+    # ("owns the API schema") that the new holder never made, and `peers` prints
+    # it in the column agents pick a peer BY, so the takeover was invisible
+    # there: the name kept advertising the previous holder's job while its mail
+    # went somewhere else. Both halves are required — the same session rebinding
+    # its own name from a new directory is still describing itself, and a new
+    # session continuing the work in the SAME directory inherits the role with it.
+    if [ "$had_cwd" = "$dir" ] || [ -z "$session" ] || [ "$had_session" = "$session" ]; then
+      summary=$(jq -r '.summary // ""' "$(peer_file "$name")")
+    fi
     # Inherit the recorded session id ONLY while the directory is unchanged. A
     # record whose cwd is being rewritten is being handed to a different
     # session, and keeping the old id there made the new record claim to BE the
     # previous holder — so the peer read as live and held, by a session that no
     # longer had anything to do with it.
-    [ -n "$session" ] \
-      || [ "$(jq -r '.cwd // ""' "$(peer_file "$name")")" != "$dir" ] \
-      || session=$(jq -r '.session // ""' "$(peer_file "$name")")
+    [ -n "$session" ] || [ "$had_cwd" != "$dir" ] || session="$had_session"
   fi
   # Last, so it covers both a record that had no stamp and a fresh name with
   # nothing carried in.
@@ -995,9 +1007,20 @@ cmd_register() {
     # running for the name), which is what keeps reclaiming a deleted worktree
     # working; and a session may always rebind its own name.
     prev=$(peer_cwd "$name" || true)
-    if [ -n "$prev" ] && [ "$prev" != "$dir" ] && [ "$status" != "missing" ] \
+    if [ -n "$prev" ] && [ "$prev" != "$dir" ] \
        && ! { [ -n "$sid" ] && [ "$holder" = "$sid" ]; }; then
-      die "'$name' is registered to $prev — run 'bridger reap' there first, or pick another name"
+      [ "$status" = "missing" ] \
+        || die "'$name' is registered to $prev — run 'bridger reap' there first, or pick another name"
+      # Allowed, but SAID. `missing` is the strongest evidence available and it
+      # is still not proof: a session open in a removed directory keeps its $PWD
+      # and goes on polling and sending — the reproduction for this had the old
+      # holder answering messages while the record read `missing`. `reap` treats
+      # exactly these three facts as a human's call (dry run, --force, backlog
+      # printed first); `register` cannot refuse, because this is the only way a
+      # deleted worktree is ever reclaimed, so it reports instead of asking.
+      echo "note: '$name' was registered to $prev, whose directory is gone — reassigning it here" \
+           "with $(unread_total "$name" || echo '?') queued message(s). If a session is still open in $prev," \
+           "it has just lost this name and everything addressed to it." >&2
     fi
   fi
 

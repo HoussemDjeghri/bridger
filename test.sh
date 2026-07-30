@@ -852,6 +852,55 @@ pass "dormant name reclaimed by a new session; queued messages delivered"
   rm -rf "$BRIDGER_ROOT" "$rn"
 )
 
+# --- reclaiming a `missing` name is a reassignment, and must read like one ----
+# The hatch itself is load-bearing: `missing` is the only way a deleted worktree
+# ever gets its name back. But it is not proof the old holder is gone — a session
+# whose directory was rm -rf'd keeps its $PWD and goes on polling and sending, so
+# the reproduction had it answering messages while the bus called it `missing`.
+# `reap` treats those same three facts as a human's call (dry run, --force, the
+# backlog printed first); `register` took them as proof, silently, and handed
+# over the previous holder's SUMMARY with the name — a claim of responsibility
+# the new session never made, in the column agents pick a peer by. The takeover
+# was then invisible in `peers` except for the directory.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  rc=$(mktemp -d); mkdir -p "$rc/gone" "$rc/taker" "$rc/sender"
+  (cd "$rc/gone" && BRIDGER_SESSION_ID=rc-old "$bridger" register ghost >/dev/null)
+  (cd "$rc/gone" && BRIDGER_SESSION_ID=rc-old "$bridger" summary "owns the API schema" >/dev/null)
+  (cd "$rc/sender" && BRIDGER_SESSION_ID=rc-s "$bridger" register rcsender >/dev/null)
+  (cd "$rc/sender" && BRIDGER_SESSION_ID=rc-s "$bridger" send ghost chat "for the old holder" >/dev/null 2>&1)
+  rm -rf "$rc/gone"
+  # stderr is what carries the note, so it is redirected FIRST — `2>&1 >/dev/null`
+  # keeps stdout out of the capture without swallowing the stream under test.
+  note=$( (cd "$rc/taker" && BRIDGER_SESSION_ID=rc-new "$bridger" register ghost 2>&1 >/dev/null) || true )
+  case "$note" in
+    *"was registered to"*) ;;
+    *) fail "reclaiming a missing name said nothing about the previous holder (got: $note)" ;;
+  esac
+  grep -q "1 queued message" <<<"$note" \
+    || fail "the reassignment note must say how much mail moves with the name (got: $note)"
+  [ -z "$(jq -r .summary "$BRIDGER_ROOT/peers/ghost.json")" ] \
+    || fail "the reclaimed record kept the previous holder's self-description"
+
+  # ...and the two shapes that are NOT a handover keep it. A new session
+  # continuing the work in the same directory inherits the role with the name,
+  # and a session rebinding its OWN name from a new directory is still
+  # describing itself.
+  mkdir -p "$rc/same"
+  (cd "$rc/same" && BRIDGER_SESSION_ID=rc-a "$bridger" register keeper >/dev/null)
+  (cd "$rc/same" && BRIDGER_SESSION_ID=rc-a "$bridger" summary "owns the loader" >/dev/null)
+  (cd "$rc/same" && BRIDGER_SESSION_ID=rc-b "$bridger" register keeper >/dev/null)
+  [ "$(jq -r .summary "$BRIDGER_ROOT/peers/keeper.json")" = "owns the loader" ] \
+    || fail "a same-directory re-register dropped the summary"
+  mkdir -p "$rc/moved"
+  (cd "$rc/moved" && BRIDGER_SESSION_ID=rc-b "$bridger" register keeper >/dev/null) \
+    || fail "a session must be able to rebind its own name from another directory"
+  [ "$(jq -r .summary "$BRIDGER_ROOT/peers/keeper.json")" = "owns the loader" ] \
+    || fail "a session rebinding its own name lost its own summary"
+  pass "reclaiming a missing name is reported and drops the old holder's summary"
+  rm -rf "$BRIDGER_ROOT" "$rc"
+)
+
 unset CLAUDE_BRIDGER_AUTO
 rm -rf "$disc"
 
@@ -1584,7 +1633,12 @@ marker, started, finished = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 # it the same way on a loaded machine.
 if finished - started < 1.0:
     sys.exit(1)          # the shim never slept: the fixture would prove nothing
-sys.exit(0 if os.stat(marker).st_mtime - started < (finished - started) / 2 else 1)
+age, window = os.stat(marker).st_mtime - started, finished - started
+if age >= window / 2:
+    # Numbers on the way out: this one has been red for load before, and "which
+    # half" is not something the reader can reconstruct from the message alone.
+    sys.stderr.write("  stamp landed %.3fs into a %.3fs run\n" % (age, window))
+    sys.exit(1)
 PYEOF
   rm -rf "$shimroot"
 
@@ -2095,6 +2149,7 @@ if [ "$(id -u)" -ne 0 ]; then
   pass "a record write that cannot succeed fails instead of hanging, and keeps the opt-out"
 )
 fi
+
 
 # --- two sessions claiming one name at the same instant -----------------------
 # Putting write_peer under a lock serialises the WRITE, not the CLAIM: the lock is
