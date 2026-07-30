@@ -1640,26 +1640,23 @@ cmd_wait() {
     done
     while :; do
       echo $$ > "$(beat_file "$me")"   # pid + mtime: who is listening, and since when
-      # `|| return 1` is load-bearing, not defensive. unread_in_thread refuses to
-      # advance the cursor past a message it could not read (EACCES, a revoked
-      # mount, EIO) — but it reaches that refusal by dying, and on bash 3.2, which
-      # is what /usr/bin/env bash resolves to on stock macOS, errexit is NOT
-      # inherited into a command substitution. Without this, cmd_poll did not
-      # abort: it fell through to advance_cursor on its own next line and marked
-      # the unreadable message AND everything behind it delivered, while this loop
-      # kept beating and the peer kept reading [listening]. Silent permanent loss,
-      # on the one path that reaches an idle session.
+      # `|| true`, and nothing after it. cmd_poll returns nonzero when a thread
+      # could not be read (EACCES, a revoked mount, EIO), and a failing assignment
+      # would abort the watcher under set -e — killing the only thing that
+      # delivers to an idle session over a fault that is usually transient. So
+      # loop, keep beating, and retry.
       #
-      # Stopping is the safe half of the trade, exactly as it is inside
-      # unread_in_thread: the EXIT trap drops the beat, the peer falls back to
-      # [queued], and every message is still on disk to be delivered once the
-      # fault clears.
-      # `|| true`: cmd_poll now returns nonzero when a thread could not be read,
-      # and a failing assignment would abort the watcher under set -e. A transient
-      # fault must not kill the only thing delivering to this session — loop, keep
-      # beating, and retry. The cursor is not advanced, so nothing is lost and it
-      # self-heals the moment the file is readable again.
-      out=$(cmd_poll) || true || return 1
+      # That is safe only because of where the refusal happens: unread_in_thread
+      # stops the scan at the unreadable message and cmd_poll does not advance the
+      # cursor past it, so nothing is marked delivered that was not. Every message
+      # stays on disk and the thread self-heals the moment the file is readable
+      # again. This line used to end `|| true || return 1`, with twenty lines
+      # above it arguing that the `return 1` was load-bearing — it had been
+      # unreachable since the `|| true` was added, and the argument it made
+      # (stop the watcher, let the peer fall back to [queued]) is the opposite of
+      # what the code does. Keeping both left the next reader to guess which half
+      # was true.
+      out=$(cmd_poll) || true
       [ -n "$out" ] && echo "$out"
       sleep 0.5
     done
