@@ -592,8 +592,24 @@ require_identity() {
 # lock. Held only across a bounded mktemp + jq + mv, never across a fork of git
 # or a network call.
 peer_lock() { # name
-  local lock="$(peer_file "$1").lock" tries=0 holder
-  until mkdir "$lock" 2>/dev/null; do
+  local lock="$(peer_file "$1").lock" tries=0 stuck=0 holder err
+  # `until mkdir … 2>/dev/null` cannot tell "someone holds it" from "this can
+  # never succeed" — a full disk, a peers/ without write bits, a read-only mount
+  # — and hid the difference along with the error. The loop's only exit is a
+  # successful mkdir, so the second case spun forever and said nothing, on EVERY
+  # record write: including the autoregister the session-start hook runs, so a
+  # session hung at startup with no output at all. Keep the error and decide.
+  until err=$(mkdir "$lock" 2>&1); do
+    if [ ! -d "$lock" ]; then
+      # Not held, so waiting cannot help. Two consecutive readings, so a holder
+      # that releases between the failed mkdir and this test is not mistaken for
+      # an impossible one.
+      stuck=$((stuck + 1))
+      [ "$stuck" -lt 2 ] || die "cannot lock '$1' on this bus: $err"
+      sleep 0.02
+      continue
+    fi
+    stuck=0
     tries=$((tries + 1))
     # Break in only for a holder that is GONE, never one that is merely slow.
     # Spinning a fixed number of times cannot tell those apart, and this machine
@@ -754,8 +770,12 @@ cmd_register() {
     drop_peer "$existing"
   fi
 
-  optout_remove "$dir"   # naming a directory is an explicit opt-in
+  # After the record exists, not before: `write_peer` can still fail (a peers/
+  # that cannot be written, a full disk), and cancelling the opt-out first left a
+  # directory opted back IN to autoregistration with no registration to show for
+  # it. Nothing between the two depends on the order.
   BRIDGER_SESSION_ID="$sid" write_peer "$name" "$dir"   # claim it for this session
+  optout_remove "$dir"   # naming a directory is an explicit opt-in
   statusline_write "$name"   # light the badge this tick, no statusLine rewrite
   echo "registered '$name' -> $dir"
 }
@@ -780,8 +800,8 @@ cmd_leave() {
 
 cmd_join() {
   local me
-  optout_remove "$PWD"
   me=$(derive_and_register "$PWD")
+  optout_remove "$PWD"   # after the record exists — see cmd_register
   statusline_write "$me"
   echo "joined the bridger as '$me'"
 }

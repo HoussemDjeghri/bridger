@@ -1544,6 +1544,38 @@ if [ "$(id -u)" -ne 0 ]; then
 )
 fi
 
+# --- a record write that CANNOT succeed must fail, not spin forever ----------
+# peer_lock's only exit was a successful `mkdir`, and `2>/dev/null` made "someone
+# holds it" and "this can never succeed" (a full disk, a peers/ without write
+# bits, a read-only mount) the same event. The second spun forever with nothing on
+# stdout or stderr — on every record write, including the autoregister the
+# SessionStart hook runs, so a session hung at startup saying nothing at all.
+# The same unwritable state pins the opt-out ordering: `optout_remove` used to run
+# BEFORE the record was written, so a register that never completed still opted the
+# directory back in to autoregistration.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  ro=$(mktemp -d); mkdir -p "$ro/peers" "$work/ro-dir"
+  (cd "$work/ro-dir" && BRIDGER_ROOT="$ro" "$bridger" leave) >/dev/null 2>&1
+  chmod 555 "$ro/peers"
+  (cd "$work/ro-dir" && BRIDGER_ROOT="$ro" "$bridger" register nowhere) >/dev/null 2>&1 &
+  lockpid=$!
+  for _ in $(seq 1 60); do kill -0 "$lockpid" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$lockpid" 2>/dev/null; then
+    kill -9 "$lockpid" 2>/dev/null || true
+    chmod 755 "$ro/peers"; rm -rf "$ro"
+    fail "register on an unwritable peers/ never returned — peer_lock spins on a mkdir that cannot succeed"
+  fi
+  wait "$lockpid" 2>/dev/null \
+    && { chmod 755 "$ro/peers"; rm -rf "$ro"; fail "register on an unwritable peers/ reported success"; }
+  chmod 755 "$ro/peers"
+  grep -qxF "$work/ro-dir" "$ro/optout" \
+    || { rm -rf "$ro"; fail "a register that registered nothing still cancelled the opt-out"; }
+  rm -rf "$ro"
+  pass "a record write that cannot succeed fails instead of hanging, and keeps the opt-out"
+)
+fi
+
 # --- a wedge may not consume a message it never delivered ---------------------
 # `advance_cursor "$((wedge - 1))"` is only sound while the scan runs in ASCENDING
 # NUMERIC order. The glob sorts lexicographically, and the two stop agreeing at
