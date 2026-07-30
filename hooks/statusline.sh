@@ -34,6 +34,18 @@ sid=$(head -c 4096 2>/dev/null | tr -d '\n' | sed -n 's/.*"session_id" *: *"\([A
 name=$(head -c 64 "$STATE/$sid" 2>/dev/null | LC_ALL=C tr -cd 'A-Za-z0-9._-')
 [ -n "$name" ] || exit 0
 
+# The state file is written once, at registration, and deleted only by THIS
+# session's `leave` — so on its own it is a cache that nothing invalidates. When
+# another session registers the same name (the reclaim session-start offers), the
+# loser kept rendering the badge for a name it no longer holds, and painted it
+# green off the NEW owner's heartbeat, which is read by name: a session whose
+# `whoami` is empty and which cannot receive anything was shown as a live peer.
+# The badge is this plugin's only passive detector, so a lie here is the
+# expensive kind. The record is the authority on who holds the name; ask it.
+# Exact compare rather than a regex over `$sid` — `.` is in the id's charset.
+sess=$(sed -n 's/.*"session" *: *"\([^"]*\)".*/\1/p' "$ROOT/peers/$name.json" 2>/dev/null | head -1)
+[ "$sess" = "$sid" ] || exit 0
+
 # Liveness from the same heartbeat file `bridger peers` reads: the watcher
 # rewrites it every cycle, so a missing or stale beat means no watcher. Two
 # stats, no `bridger` subprocess — this runs on every statusline refresh.

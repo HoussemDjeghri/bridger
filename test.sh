@@ -1098,16 +1098,37 @@ pass "an untraversable parent leaves a peer registered and unreaped"
 
   # Name sanitization: the state file is dynamic, session-supplied content. A
   # crafted name must not smuggle control chars / ANSI escapes to the terminal.
-  mkdir -p "$BRIDGER_ROOT/statusline"
+  mkdir -p "$BRIDGER_ROOT/statusline" "$BRIDGER_ROOT/peers"
   # Whitelist keeps [A-Za-z0-9._-]: ESC, '[', BEL and ';' are dropped, the safe
   # bytes of the escape ("31m") survive as ordinary text — harmless, no injection.
   printf 'bad\033[31mX\007;Y' > "$BRIDGER_ROOT/statusline/evil-sess"
+  # The badge now cross-checks the record, so the fixture needs one. Anyone who
+  # can plant the state file can plant this too — sanitisation is still the only
+  # thing between a crafted name and the terminal.
+  printf '{\n  "name": "bad31mXY",\n  "session": "evil-sess"\n}\n' > "$BRIDGER_ROOT/peers/bad31mXY.json"
   out=$(render_badge evil-sess)
   case "$out" in *$'\007'*) fail "badge leaked a BEL control char from a crafted name" ;; esac
   # Strip the badge's own colour codes; what remains must be only the safe charset.
   clean=$(printf '%s' "$out" | sed "s/$(printf '\033')\[[0-9;]*m//g")
   [ "$clean" = "[⇄ BRIDGER:bad31mXY ⚠ queued]" ] || fail "badge must strip to a safe charset (got: $(printf %q "$clean"))"
   pass "badge sanitizes crafted names (no ANSI/control-char injection)"
+
+  # A takeover must take the badge with the name. The state file is written once
+  # and deleted only by this session's `leave`, so nothing invalidated it when
+  # another session registered the same name — and liveness is read from
+  # `peers/<name>.beat`, which is keyed by NAME, so the loser rendered a green
+  # "watcher live" badge off the winner's heartbeat while its own whoami was
+  # empty and it could not receive anything at all.
+  rm -rf "$BRIDGER_ROOT/statusline" "$BRIDGER_ROOT/peers" "$BRIDGER_ROOT/threads"
+  (cd "$sw/proj" && CLAUDE_CODE_SESSION_ID=to-first "$bridger" register handover >/dev/null)
+  case "$(render_badge to-first)" in *"BRIDGER:handover"*) ;;
+    *) fail "badge must show the name this session just registered" ;; esac
+  (cd "$sw/proj" && CLAUDE_CODE_SESSION_ID=to-second "$bridger" register handover >/dev/null)
+  [ -z "$(render_badge to-first)" ] \
+    || fail "badge kept rendering a name another session took over: $(render_badge to-first)"
+  case "$(render_badge to-second)" in *"BRIDGER:handover"*) ;;
+    *) fail "badge must follow the name to its new holder" ;; esac
+  pass "badge stops rendering a name once another session holds the record"
 
   # Registered-but-deaf must be VISIBLE. The badge reads the same heartbeat
   # `peers` does, so it flips on watcher liveness, not on registration: a
