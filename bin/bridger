@@ -345,23 +345,56 @@ sorted_stems() { # thread_dir
 # from two different instants would let a message that lands in between be
 # marked read without ever being delivered.
 unread_in_thread() {
-  local dir="$1" me="$2" top="$3" cur=0 f s rc stem
+  local dir="$1" me="$2" top="$3" cur=0 f s rc stem out batch_ok=1
+  local -a batch; batch=()
   [ -f "$dir/cursor-$me" ] && cur=$(cat "$dir/cursor-$me")
   # A cursor read as empty or junk must mean "read nothing yet", never "read
   # everything": advance_cursor truncates before writing, so a concurrent reader
   # can catch it empty, and `[ "$s" -gt "" ]` would then skip every message and
   # still move the cursor to the top — silent, permanent, unrecoverable loss.
   case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+  # Collect the unread run first, decide it second. Selecting inside this loop
+  # cost one jq per UNREAD message (~3.6ms), and `poll --peek` pays that on every
+  # delivery-hook call without ever consuming anything — so past ~1400 unread the
+  # hook's 5s budget killed every invocation mid-scan, its output was discarded,
+  # and the backlog could never shrink: silent, permanent non-delivery, which is
+  # the exact failure this hook exists to prevent.
   # Digits only, so word splitting here is safe.
   for stem in $(sorted_stems "$dir"); do
-    f="$dir/$stem.json"
     s=$((10#$stem))
     [ "$s" -gt "$cur" ] && [ "$s" -le "$top" ] || continue
+    f="$dir/$stem.json"
     # A zero-byte message reads as "no output, exit 0" — indistinguishable, to
     # the select below, from a perfectly good message addressed to someone else.
     # So poll consumed it as nothing and moved the cursor past it, silently.
     # Size is free to check and catches the case that actually happens (a
-    # truncated write, a half-synced or restored bus).
+    # truncated write, a half-synced or restored bus). jq is just as blind to it
+    # in a batch, so one empty file sends the whole run down the slow path — that
+    # is the only place the diagnostic below gets emitted.
+    [ -s "$f" ] || batch_ok=0
+    batch+=("$f")
+  done
+  [ "${#batch[@]}" -gt 0 ] || return 0
+
+  # One jq for the whole run: 9.89s -> 0.23s at 3000 unread. CAPTURE it, never
+  # stream it — jq emits files 1..N-1 before failing on N, so a batch piped
+  # straight to stdout would re-deliver all of them when the per-file walk below
+  # re-reads the run. Any failure at all (a parse error, an unreadable file, an
+  # argv past ARG_MAX) discards the capture and falls through to the per-file
+  # walk, which is where the wedge/skip semantics live and where they stay. The
+  # fork-per-message cost is then paid only by a thread that actually has a fault.
+  if [ "$batch_ok" -eq 1 ] && out=$(jq -c --arg me "$me" \
+       'if type == "object" then select(.to == $me) else error("not a message object") end' \
+       "${batch[@]}" 2>/dev/null); then
+    # A run addressed entirely to the other peer selects nothing; printf would
+    # then emit a blank line, which render_lines counts as a message.
+    [ -z "$out" ] || printf '%s\n' "$out"
+    return 0
+  fi
+
+  for f in "${batch[@]}"; do
+    stem=${f##*/}; stem=${stem%.json}
+    s=$((10#$stem))
     if [ ! -s "$f" ]; then
       echo "bridger: message $f is empty — skipped" >&2
       continue

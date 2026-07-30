@@ -1303,6 +1303,58 @@ PYEOF
   rm -rf "$BRIDGER_ROOT" "$up"
 )
 
+# --- a large unread backlog must still fit inside the hook's timeout ---------
+# The delivery hooks are the only path into a session with no watcher, and the
+# plugin gives them 5s. `--peek` never consumes, so a backlog too big to scan
+# inside that budget can never shrink through the hook: every invocation is
+# killed mid-scan, its output discarded, and the session goes permanently deaf
+# with no diagnostic anywhere. That made the scan's per-message cost a
+# correctness property, not a performance one — one fork per unread message put
+# the cliff at ~1400 messages.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  bl=$(mktemp -d); mkdir -p "$bl/reader" "$bl/writer"
+  (cd "$bl/reader" && BRIDGER_SESSION_ID=r "$bridger" register breader >/dev/null)
+  (cd "$bl/writer" && BRIDGER_SESSION_ID=w "$bridger" register bwriter >/dev/null)
+  # One real send to create the thread the way the CLI names it; the rest are
+  # written straight in, because 3000 `send` forks would dominate this suite.
+  (cd "$bl/writer" && BRIDGER_SESSION_ID=w "$bridger" send breader chat m1 >/dev/null)
+  td="$BRIDGER_ROOT/threads/breader--bwriter"
+  [ -d "$td" ] || fail "backlog fixture: thread dir $td not created by send"
+  for i in $(seq 2 3000); do
+    printf '{"seq":%d,"from":"bwriter","to":"breader","type":"chat","body":"m%d","ts":"2026-01-01T00:00:00Z"}\n' \
+      "$i" "$i" > "$td/$(printf '%05d' "$i").json"
+  done
+
+  payload='{"hook_event_name":"UserPromptSubmit","cwd":"'"$bl/reader"'","session_id":"r"}'
+  # The real budget, enforced the way the harness enforces it: SIGALRM at 5s,
+  # after which the hook's stdout is discarded and nothing reaches the session.
+  out=$(printf '%s' "$payload" | BRIDGER_SESSION_ID=r perl -e 'alarm 5; exec @ARGV' \
+    bash "$here/hooks/deliver.sh" 2>&1) || true
+  grep -q 'unread message' <<<"$out" \
+    || fail "deliver.sh delivered nothing on a 3000-message backlog (got: $out)"
+  pass "the delivery hook survives its own timeout on a 3000-message backlog"
+
+  # And the scan itself must not be linear in forks: the hook budget is the
+  # symptom, the fork per unread message is the cause, so bound it directly.
+  start=$SECONDS
+  (cd "$bl/reader" && BRIDGER_SESSION_ID=r "$bridger" poll --peek) >/dev/null 2>&1
+  [ $((SECONDS - start)) -lt 3 ] \
+    || fail "poll --peek over 3000 unread took $((SECONDS - start))s — one fork per message is back"
+  pass "the unread scan does not cost a process per unread message"
+
+  # A batch whose whole run is addressed to the other peer selects nothing, and
+  # that is the ordinary state of the side that has only sent — `ask`'s state
+  # while it waits. Printing the empty selection puts a blank line into a stream
+  # documented as one JSON object per line. Captured output hides it (`$( )` eats
+  # trailing newlines), so measure the bytes.
+  (cd "$bl/writer" && BRIDGER_SESSION_ID=w "$bridger" poll --json) >"$bl/sent.json" 2>/dev/null
+  [ ! -s "$bl/sent.json" ] \
+    || fail "poll --json emitted $(wc -c <"$bl/sent.json") bytes for a run that selected nothing"
+  pass "an unread run that selects nothing prints nothing"
+  rm -rf "$BRIDGER_ROOT" "$bl"
+)
+
 # --- Stop hook: a registered session must not go idle deaf -------------------
 # End of turn is where the watcher stops being optional: nothing else reaches
 # an idle session. The hook cannot start it, so it blocks the turn once until
