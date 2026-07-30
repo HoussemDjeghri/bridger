@@ -899,7 +899,18 @@ function apply(snapshot) {
   renderThread();
 }
 
+// One request at a time. The server rebuilds the whole snapshot from disk per
+// request and bridger never prunes a thread — every thread doubles as an audit
+// log — so service time grows without bound: measured at 2.1s for 50k messages
+// and 6.9s for 100k, i.e. past this interval. Ticking regardless of completion
+// made arrivals outrun service, and at 100k a poll issued at t=0 landed at
+// t=70s with 9 of 15 still outstanding and NOTHING rendered. Skipping a tick
+// costs one interval of freshness; queueing costs the whole view.
+let polling = false;
+
 async function poll() {
+  if (polling) return;
+  polling = true;
   try {
     const response = await fetch("/api/state", { cache: "no-store" });
     if (!response.ok) throw new Error("HTTP " + response.status);
@@ -910,6 +921,8 @@ async function poll() {
     // The server is gone or wedged; say so rather than showing stale data as live.
     $("conn").dataset.state = "down";
     $("conn").textContent = "reconnecting — " + err.message;
+  } finally {
+    polling = false;
   }
 }
 

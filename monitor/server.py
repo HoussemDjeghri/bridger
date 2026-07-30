@@ -174,10 +174,20 @@ def beat_pid_alive(beat_path):
 def read_int(path):
     """A cursor file holds one integer. Absent or unreadable means 0 consumed."""
     try:
-        with open(path) as handle:
-            return int(handle.read().strip() or 0)
-    except (OSError, ValueError):
+        # newline="" and rstrip("\n"): bash reads this as `cur=$(cat …)`, which
+        # strips trailing newlines and nothing else, so a `\r` has to survive to
+        # be judged — see below.
+        with open(path, newline="") as handle:
+            text = handle.read().rstrip("\n")
+    except (OSError, ValueError):    # includes UnicodeDecodeError on raw bytes
         return 0
+    # Numeric means exactly what bash's `case $cur in ''|*[!0-9]*) cur=0` means,
+    # as in watcher_alive above. int() is looser in ways a cursor file really
+    # hits — a sign, a `_` separator, Unicode digits, surrounding whitespace, the
+    # stray `\r` from a bus synced through a Windows-aware tool — and every one of
+    # those disagreements HIDES queued mail: the monitor reports nothing waiting
+    # for a session the CLI is about to hand messages to.
+    return int(text) if re.fullmatch(r"[0-9]+", text) else 0
 
 
 def _reject_constant(token):
@@ -189,6 +199,15 @@ def _reject_constant(token):
     boundary instead, and let the existing one-file warning report it.
     """
     raise ValueError("%s is not valid JSON" % token)
+
+
+# Every "this one file is unreadable, degrade to a warning" handler catches the
+# same three. RecursionError is the non-obvious one: it is a RuntimeError, so
+# deeply nested JSON slipped past handlers that named only OSError and ValueError
+# and 500'd the whole request — the exact blast radius they exist to prevent.
+# Named once, because it was widened in two of the four places and the other two
+# kept the bug.
+UNREADABLE = (OSError, ValueError, RecursionError)
 
 
 def _load_json(handle):
@@ -219,7 +238,7 @@ def read_peers(root, now, warnings):
         name = os.path.basename(path)[: -len(".json")]
         try:
             record = _load_object(path)
-        except (OSError, ValueError, RecursionError) as err:
+        except UNREADABLE as err:
             # write_peer now lands atomically, so this is a hand-edited or
             # truncated record rather than a mid-write read. Either way it is one
             # peer: report it and keep serving the rest.
@@ -342,20 +361,29 @@ def _read_messages(directory, pair, warnings):
     for path in sorted(glob.glob(os.path.join(glob.escape(directory), "[0-9]*.json"))):
         name = os.path.basename(path)
         stem = name[: -len(".json")]
-        if not stem.isdigit():
+        # ASCII digits only, exactly like bash's `case $stem in ''|*[!0-9]*)`.
+        # Two separate bugs lived in the gap between `str.isdigit()` and `int()`,
+        # which agree on neither end. `isdigit()` is true for the whole Unicode
+        # digit category while `int()` accepts only the decimal one, so `0³.json`
+        # (the glob anchors the first character only) passed this guard and then
+        # raised ValueError from `int(stem)` OUTSIDE every handler — a 500 for the
+        # entire snapshot, the exact blast radius these handlers exist to prevent.
+        # And an Arabic-Indic stem like `3٤.json` satisfies BOTH, so it was
+        # accepted silently: bin/bridger's `[0-9]` filter cannot see that file, so
+        # the monitor rendered a message the CLI will never deliver and counted it
+        # as queued mail no cursor can ever reach, with no warning at all.
+        if not re.fullmatch(r"[0-9]+", stem):
             warnings.append("message %s/%s is not a numbered message — skipped" % (pair, name))
             continue
         try:
             with open(path) as handle:
                 record = _load_json(handle)
-        # RecursionError is a RuntimeError, so deeply nested JSON slipped past
-        # the per-file handlers that exist precisely to degrade one bad file to a
-        # warning, and 500'd the whole request instead. jq has its own depth
-        # limit and fails per file, so the CLI already behaves correctly here.
-        except (OSError, ValueError, RecursionError) as err:
+            # int() inside the handler too: on 3.11+ it refuses a stem past
+            # sys.get_int_max_str_digits(), and that ValueError would escape.
+            messages.append(_normalize(record, int(stem)))
+        except UNREADABLE as err:
             warnings.append("message %s/%s unreadable: %s" % (pair, name, err))
             continue
-        messages.append(_normalize(record, int(stem)))
     messages.sort(key=lambda message: message["seq"])
     return messages
 
@@ -481,7 +509,11 @@ def compute_metrics(peers, threads, root, now):
         "listening": len(listening),
         "queued": sum(thread["queued"] for thread in threads),
         "threads": len(threads),
-        "messages": len(stamps),
+        # Messages, not timestamped messages: `stamps` drops anything whose `ts`
+        # is missing or unparseable, so the flow tile read "0 messages" and turned
+        # amber on a bus whose thread header, counting the same list, said 3. The
+        # series below legitimately needs stamps; this number does not.
+        "messages": sum(len(thread["messages"]) for thread in threads),
         "deaf": deaf,
         "nudges": len(nudges),
         "last_hour": sum(1 for stamp in stamps if now - stamp < 3600),
@@ -507,7 +539,7 @@ def check_wiring(root):
                 break
         if plugin_key is None:
             enabled = False
-    except (OSError, ValueError):
+    except UNREADABLE:
         # No settings file, or one we cannot parse: report unknown rather than
         # claiming the plugin is disabled.
         pass
@@ -528,7 +560,7 @@ def _plugin_field(key):
     restates a fact the manifest already owns."""
     try:
         return _load_object(os.path.join(PLUGIN_ROOT, ".claude-plugin", "plugin.json")).get(key)
-    except (OSError, ValueError):
+    except UNREADABLE:
         return None
 
 
@@ -561,13 +593,31 @@ ALLOWED_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 def _host_of(header):
     """The name out of a Host header, without the port. IPv6 arrives bracketed
-    as `[::1]:8787`, where splitting on the first colon would give `[`."""
+    as `[::1]:8787`, where splitting on the first colon would give `[`.
+
+    Anything that is not a host[:port] answers "" — an allowlist must not be fed
+    a value assembled by discarding the parts that did not fit. Brackets used to
+    be taken as "IPv6, trust what is inside", so `[localhost]`, `[127.0.0.1]` and
+    `[::1]evil.example` were all served, as was `127.0.0.1:evil.example`. No
+    browser produces those (they fail URL parsing before a request is made), so
+    this was looseness rather than a hole — but this function IS the access
+    control, and it should not depend on the client being a browser.
+    """
     # Lower-cased: a Host header is case-insensitive per RFC 9110, so a user who
     # types LOCALHOST in the address bar is naming an allowed host. Folding case
     # on an allowlist can only ever refuse the same set or fewer.
+    header = header.strip().lower()
     if header.startswith("["):
-        return header[1:].split("]")[0].lower()
-    return header.split(":")[0].lower()
+        host, closed, rest = header[1:].partition("]")
+        if not closed or ":" not in host:
+            return ""          # brackets are for IPv6 literals, nothing else
+        if rest and not re.fullmatch(r":[0-9]+", rest):
+            return ""          # junk after the bracket, or a "port" that is not one
+        return host
+    host, sep, port = header.partition(":")
+    if sep and not re.fullmatch(r"[0-9]+", port):
+        return ""
+    return host
 
 
 class MonitorHandler(BaseHTTPRequestHandler):
@@ -842,6 +892,20 @@ def selftest():
     trips = metrics["round_trips"]
     assert trips == {"asks": 1, "answered": 1, "median_latency": 120.0, "stale": []}, trips
 
+    # A cursor the CLI cannot parse means "nothing consumed" on BOTH sides. int()
+    # accepted every one of these — a `\r` from a bus synced through a
+    # Windows-aware tool, whitespace, a sign, a `_` separator, a Unicode digit —
+    # while bash's `case $cur in *[!0-9]*)` resets to 0, and each disagreement
+    # made the monitor report mail as delivered that poll is about to hand over.
+    beta_cursor = os.path.join(thread_dir, "cursor-beta")
+    for junk in ("1\r", " 1 ", "+1", "1_0", "١"):
+        with open(beta_cursor, "w", newline="") as handle:
+            handle.write(junk)
+        unparsed = next(t for t in snapshot(root, now=now)["threads"] if t["id"] == "alpha--beta")
+        assert unparsed["undelivered"]["beta"] == 3, (junk, unparsed["undelivered"])
+    with open(beta_cursor, "w") as handle:
+        handle.write("1\n")
+
     # Both a half-written peer file and one that is valid JSON of the wrong
     # shape degrade to a warning. The second is what a hand edit produces, and
     # it used to reach `.get()` on a list and take the whole request down.
@@ -889,17 +953,56 @@ def selftest():
 
     # Only a Host the user could have typed is served, so a domain that resolves
     # to 127.0.0.1 cannot read the bus from a page the user is merely visiting.
-    assert _host_of("127.0.0.1:8787") == "127.0.0.1"
-    assert _host_of("localhost") == "localhost"
-    assert _host_of("[::1]:8787") == "::1"
-    assert _host_of("bridger.evil.example:8787") not in ALLOWED_HOSTS
-    assert _host_of("LOCALHOST:8787") in ALLOWED_HOSTS, "Host is case-insensitive"
+    #
+    # Asserted through the DECISION, and then through a real request. The version
+    # of this block that compared _host_of's return value stayed green with the
+    # guard deleted from do_GET outright — the one mutation that matters here,
+    # since /api/state carries every message body on the bus.
+    def host_allowed(host):
+        handler = MonitorHandler.__new__(MonitorHandler)
+        handler.headers = {} if host is None else {"Host": host}
+        return handler._host_allowed()
+
+    for host in ("127.0.0.1:8787", "127.0.0.1", "localhost", "LOCALHOST:8787",
+                 "LocalHost", "[::1]:8787", "[::1]", " localhost "):
+        assert host_allowed(host) is True, host
     # Everything else a browser or an attacker can put there must be refused.
     # This is the server's only access control and /api/state carries every
-    # message body, so the allowlist has to stay an allowlist.
-    for denied in ("", "localhost.", "127.0.0.1.", "0.0.0.0", "127.1",
-                   "attacker.example", "::ffff:127.0.0.1", "127.0.0.1.evil.example"):
-        assert _host_of(denied) not in ALLOWED_HOSTS, denied
+    # message body, so the allowlist has to stay an allowlist. The bracketed and
+    # bogus-port forms are not browser-producible — they fail URL parsing before a
+    # request is made — but this decision must not depend on the client being a
+    # browser.
+    for denied in ("", None, "localhost.", "127.0.0.1.", "0.0.0.0", "127.1",
+                   "attacker.example", "::ffff:127.0.0.1", "127.0.0.1.evil.example",
+                   "localhost@evil.example", "127.0.0.2:8787",
+                   "[localhost]", "[127.0.0.1]", "[evil.example]", "[::1]evil.example",
+                   "[localhost]:evil", "[::1", "127.0.0.1:evil.example"):
+        assert host_allowed(denied) is False, denied
+
+    # And the guard has to RUN, ahead of routing. Nothing above proves that: the
+    # deletion that matters is the two lines in do_GET, and only a real request
+    # over a socket can see them missing. Served out of a sandbox root, never the
+    # user's own bus.
+    import http.client
+    import threading
+
+    guarded = ThreadingHTTPServer(("127.0.0.1", 0), MonitorHandler)
+    guarded.bridger_root = root
+    threading.Thread(target=guarded.serve_forever, daemon=True).start()
+    try:
+        port = guarded.server_address[1]
+        for host, expected in (("127.0.0.1:%d" % port, 200), ("evil.example", 421),
+                               ("127.0.0.1.evil.example", 421), ("[localhost]", 421)):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.putrequest("GET", "/api/state", skip_host=True, skip_accept_encoding=True)
+            conn.putheader("Host", host)
+            conn.endheaders()
+            status = conn.getresponse().status
+            conn.close()
+            assert status == expected, (host, status, expected)
+    finally:
+        guarded.shutdown()
+        guarded.server_close()
 
     # A message field that is not a string must be coerced HERE. A list `to`
     # reached cursors.get() as an unhashable key and raised TypeError — neither
@@ -930,6 +1033,48 @@ def selftest():
     json.dumps(degraded, allow_nan=False)
     for name in ("nanny", "deep"):
         assert any(name in warning for warning in degraded["warnings"]), degraded["warnings"]
+
+    # A filename is a filename on both sides of the bus. `str.isdigit()` and
+    # `int()` disagree at both ends of the Unicode digit category, and each gap
+    # was its own bug: a superscript stem passed the guard and then raised out of
+    # every handler (500 for the whole snapshot), while an Arabic-Indic stem
+    # passed both and became a message bin/bridger's `[0-9]` filter cannot see —
+    # rendered as real, counted as queued mail no cursor can ever reach, silently.
+    for stem, seq in (("0³", None), ("3٤", 34)):
+        with open(os.path.join(hostile_thread, stem + ".json"), "w") as handle:
+            json.dump({"to": "beta", "from": "alpha", "type": "chat", "body": "x",
+                       "ts": "2026-07-26T11:40:00Z"}, handle)
+        state = snapshot(hostile, now=now)          # must not raise
+        assert any(stem in warning for warning in state["warnings"]), state["warnings"]
+        seqs = [message["seq"] for message in state["threads"][0]["messages"]]
+        assert seq not in seqs, (stem, seqs)
+
+    # The flow tile counts MESSAGES. Counting only the ones with a parseable `ts`
+    # made it read 0, and turn amber, on a bus whose thread header — counting the
+    # same list one function away — read 3.
+    with open(os.path.join(hostile_thread, "00008.json"), "w") as handle:
+        json.dump({"to": "beta", "from": "alpha", "type": "chat", "body": "y",
+                   "ts": 1785000000}, handle)      # a number: parse_ts gives None
+    counted = snapshot(hostile, now=now)["metrics"]
+    assert counted["messages"] == 2, counted
+    assert counted["last_day"] < counted["messages"], counted
+
+    # check_wiring and _plugin_field read files OUTSIDE the bus, on every request,
+    # and kept the narrower handler when the other two were widened. The 500 they
+    # produced also blamed $BRIDGER_ROOT, which is not the file at fault.
+    config = os.path.join(hostile, "cfg")
+    os.makedirs(config)
+    with open(os.path.join(config, "settings.json"), "w") as handle:
+        handle.write("[" * 100000 + "]" * 100000)
+    previous = os.environ.get("CLAUDE_CONFIG_DIR")
+    os.environ["CLAUDE_CONFIG_DIR"] = config
+    try:
+        assert snapshot(hostile, now=now)["wiring"]["plugin_enabled"] is None
+    finally:
+        if previous is None:
+            del os.environ["CLAUDE_CONFIG_DIR"]
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = previous
     shutil.rmtree(hostile)
 
     shutil.rmtree(root)
