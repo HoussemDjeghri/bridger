@@ -110,6 +110,17 @@ def dir_gone(path):
     return os.access(parent, os.X_OK)
 
 
+class NotRegularFile(OSError):
+    """A fifo, a device or a directory where a message was expected.
+
+    Its own type because the two sides of the bus disagree about how bad it is.
+    bin/bridger's per-file walk skips anything with no size (`[ -e ] && [ ! -s ]`,
+    bin/bridger:447) — a fifo included — but stops the whole scan on a message it
+    merely cannot open. Folding the two together would report a thread as stuck
+    for a stray fifo the CLI walks straight past.
+    """
+
+
 def _open_regular(path, *args, **kwargs):
     """open(), but only for a regular file.
 
@@ -132,7 +143,7 @@ def _open_regular(path, *args, **kwargs):
     handle = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     try:
         if not stat.S_ISREG(os.fstat(handle).st_mode):
-            raise OSError("not a regular file: %s" % path)
+            raise NotRegularFile("not a regular file: %s" % path)
         os.set_blocking(handle, True)
         return os.fdopen(handle, *args, **kwargs)
     except BaseException:
@@ -324,7 +335,7 @@ def read_threads(root, warnings):
         if names is None:
             continue
         left, right = names
-        messages = _read_messages(directory, pair, warnings)
+        messages, blocked = _read_messages(directory, pair, warnings)
         # Two places, highest wins — exactly as unread_in_thread reads it. A
         # thread directory that cannot be written keeps its cursor under the bus
         # root instead (bin/bridger advance_cursor), and reading only the primary
@@ -350,7 +361,11 @@ def read_threads(root, warnings):
                 "messages": messages,
                 "cursors": cursors,
                 "undelivered": undelivered,
+                # A floor, not a count, whenever `blocked` is set: the unreadable
+                # file's recipient is unknowable, and everything behind it is held
+                # back too. Same shape as the CLI's `N+`.
                 "queued": undelivered[left] + undelivered[right],
+                "blocked": blocked,
                 "last_ts": messages[-1]["ts"] if messages else None,
             }
         )
@@ -394,8 +409,14 @@ def _split_pair(pair, warnings):
 
 
 def _read_messages(directory, pair, warnings):
-    """Messages are immutable files named %05d.json; .msg.XXXXXX temps are not."""
+    """Messages are immutable files named %05d.json; .msg.XXXXXX temps are not.
+
+    Returns (messages, blocked), where blocked is the lowest seq whose file could
+    not be READ — the point bin/bridger stops delivering this thread at, and None
+    when there is no such file.
+    """
     messages = []
+    blocked = None
     for path in sorted(glob.glob(os.path.join(glob.escape(directory), "[0-9]*.json"))):
         name = os.path.basename(path)
         stem = name[: -len(".json")]
@@ -414,16 +435,40 @@ def _read_messages(directory, pair, warnings):
             warnings.append("message %s/%s is not a numbered message — skipped" % (pair, name))
             continue
         try:
+            # Inside the try, and first: on 3.11+ int() refuses a stem past
+            # sys.get_int_max_str_digits(), and that ValueError would otherwise
+            # escape every handler and 500 the whole snapshot. Being first is
+            # what lets the OSError arm below use `seq` unconditionally.
+            seq = int(stem)
             with _open_regular(path) as handle:
                 record = _load_json(handle)
-            # int() inside the handler too: on 3.11+ it refuses a stem past
-            # sys.get_int_max_str_digits(), and that ValueError would escape.
-            messages.append(_normalize(record, int(stem)))
+            messages.append(_normalize(record, seq))
+        except NotRegularFile as err:
+            # Not a message and never was. The CLI walks past it too — see there.
+            warnings.append("message %s/%s unreadable: %s" % (pair, name, err))
+            continue
+        except OSError as err:
+            # The one case the CLI refuses to walk past: an intact message it
+            # cannot open right now (EACCES, a revoked mount, EIO). jq exits 2,
+            # unread_in_thread returns 1 rather than skipping (bin/bridger:459-478)
+            # — skipping would advance the cursor over a perfectly good message —
+            # so NOTHING at or after this seq reaches either peer until the file
+            # reads again, and `unread_total` says `N+` for exactly this reason.
+            # Dropping it into the same handler as a corrupt file made the monitor
+            # report a plain count, and a normal amber tile, for a thread that was
+            # delivering nothing at all.
+            warnings.append(
+                "message %s/%s cannot be read: %s — this thread delivers NOTHING "
+                "from seq %d until that is fixed" % (pair, name, err, seq))
+            blocked = seq if blocked is None else min(blocked, seq)
+            continue
         except UNREADABLE as err:
+            # Bytes that will never improve: unparseable, or valid JSON of the
+            # wrong shape. jq exits 5 and the CLI skips it, loudly.
             warnings.append("message %s/%s unreadable: %s" % (pair, name, err))
             continue
     messages.sort(key=lambda message: message["seq"])
-    return messages
+    return messages, blocked
 
 
 def _normalize(record, seq):
@@ -546,6 +591,10 @@ def compute_metrics(peers, threads, root, now):
         "peers": len(peers),
         "listening": len(listening),
         "queued": sum(thread["queued"] for thread in threads),
+        # Threads, not messages: the number the page needs is "how many
+        # conversations are handing over nothing right now", and one unreadable
+        # file stops a whole thread. Nonzero makes `queued` a floor.
+        "blocked": sum(1 for thread in threads if thread["blocked"] is not None),
         "threads": len(threads),
         # Messages, not timestamped messages: `stamps` drops anything whose `ts`
         # is missing or unparseable, so the flow tile read "0 messages" and turned
@@ -1205,6 +1254,33 @@ def selftest():
         piped = returned[0]      # never call it on this thread again: see above
         for name in ("00009", "00010", "piper"):
             assert any(name in warning for warning in piped["warnings"]), piped["warnings"]
+        # …and none of them is a STUCK thread. bin/bridger skips a sizeless file
+        # and keeps delivering, so a fifo that reported "blocked" here would put
+        # the page's most alarming state on a bus that is working.
+        assert piped["metrics"]["blocked"] == 0, piped["metrics"]
+
+    # A message that is intact but cannot be opened is the one file the CLI
+    # refuses to walk past: `poll` delivers nothing from this thread and exits
+    # nonzero, while the monitor used to drop the message, count what was left
+    # and paint a routine amber tile — on the single state its own docstring
+    # exists to catch. root cannot chmod its way out of readability, so the
+    # barrier is not one there.
+    if os.geteuid() != 0:
+        stopped = os.path.join(hostile_thread, "00011.json")
+        with open(stopped, "w") as handle:
+            json.dump({"to": "beta", "from": "alpha", "type": "chat", "body": "z",
+                       "ts": "2026-07-26T11:45:00Z"}, handle)
+        os.chmod(stopped, 0o000)
+        try:
+            state = snapshot(hostile, now=now)
+            thread = next(t for t in state["threads"] if t["id"] == "alpha--beta")
+            assert thread["blocked"] == 11, thread["blocked"]
+            assert state["metrics"]["blocked"] == 1, state["metrics"]
+            assert any("delivers NOTHING" in warning for warning in state["warnings"]), \
+                state["warnings"]
+        finally:
+            os.chmod(stopped, 0o644)
+            os.remove(stopped)
 
     shutil.rmtree(hostile)
 

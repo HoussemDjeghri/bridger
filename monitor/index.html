@@ -582,7 +582,7 @@ const TIPS = {
   jq: "A small helper program that bridger needs in order to read and write messages. If it is missing, nothing works and nothing complains \u2014 messages just quietly go nowhere.",
   plugin: "Whether bridger is switched on for your Claude Code sessions. If it is off, no session can send or receive anything.",
   watchers: "Sessions that are awake and checking for new messages right now. A session that is not checking cannot be reached until it wakes up.",
-  queued: "Messages that were sent but nobody has read yet. Nothing is lost \u2014 they are picked up the next time that session does something.",
+  queued: "Messages that were sent but nobody has read yet. Nothing is lost \u2014 they are picked up the next time that session does something. A \u201c+\u201d means one of these conversations has a message that cannot be read at all: the real number is higher, and nothing in that conversation moves until it is fixed. The warning line below names the file.",
   deaf: "Sessions that have messages waiting but are not checking for them, so they have not heard you yet. A session that is simply closed with nothing waiting does not count.",
   flow: "How many messages moved in the last hour and the last day, and when the most recent one arrived. Quiet just means nobody is talking \u2014 it does not mean something is broken.",
   "round trips": "How many questions got an answer back, and how long an answer usually takes. Stalled means a question has gone unanswered for more than 10 minutes.",
@@ -618,7 +618,17 @@ function renderHealth(snapshot) {
     tile("plugin", pluginText, w.plugin_key || "not switched on anywhere", pluginTone),
     tile("watchers", m.listening + "/" + m.peers, "listening now",
       m.peers === 0 ? null : m.listening === 0 ? "bad" : m.listening < m.peers ? "warn" : "ok"),
-    tile("queued", String(m.queued), "undelivered messages", m.queued > 0 ? "warn" : "ok"),
+    // A thread with an unreadable message delivers NOTHING, and the count the
+    // monitor can compute for it is a floor — the unreadable file's recipient is
+    // unknowable. The CLI says `N+` for the same reason (bin/bridger unread_total),
+    // so say it the same way rather than showing a routine amber number for the
+    // one state where the bus is provably stopped.
+    tile("queued", m.blocked ? m.queued + "+" : String(m.queued),
+      m.blocked
+        ? m.blocked + (m.blocked === 1 ? " conversation is" : " conversations are") +
+          " stuck — delivering nothing"
+        : "undelivered messages",
+      m.blocked > 0 ? "bad" : m.queued > 0 ? "warn" : "ok"),
     tile("deaf", String(m.deaf.length),
       m.deaf.length
         ? m.deaf.join(", ") + " cannot hear"
