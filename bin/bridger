@@ -1481,7 +1481,16 @@ cmd_poll() {
   [ "$peek" -eq 1 ] \
     || BRIDGER_WEDGE_FILE=$(mktemp "$BRIDGER_ROOT/.wedge.XXXXXX" 2>/dev/null \
       || mktemp "${TMPDIR:-/tmp}/bridger-wedge.XXXXXX" 2>/dev/null || true)
-  trap 'if [ -n "$BRIDGER_WEDGE_FILE" ]; then rm -f "$BRIDGER_WEDGE_FILE"; fi' RETURN
+  # EXIT as well as RETURN: RETURN fires on a function return, which a signal
+  # never reaches — a `bridger poll` killed mid-scan left its scratch file in the
+  # bus root, and nothing here ever prunes one. Six kills, six files. The watcher
+  # and `ask` were never affected and it is worth knowing why: both drain the
+  # poll through a command substitution, so the child returns from cmd_poll
+  # normally and RETURN does fire. Only a directly-killed poll leaks — and a poll
+  # on a backlog is a seconds-long command, so an interrupted one is not exotic.
+  # `${x:-}` because at process exit the local is long out of scope, and errexit
+  # in a trap on an unset variable would be a worse bug than the litter.
+  trap 'if [ -n "${BRIDGER_WEDGE_FILE:-}" ]; then rm -f "$BRIDGER_WEDGE_FILE"; fi' RETURN EXIT
   # Whether this process may keep the heartbeat fresh WHILE it polls. The loop in
   # cmd_wait beats once per cycle, outside this call, so a poll longer than
   # BEAT_STALE_SECS made a running watcher read [queued]: senders were told it is
