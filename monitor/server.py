@@ -23,9 +23,11 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import statistics
 import sys
 import tempfile
+import threading
 import time
 import webbrowser
 from datetime import datetime, timezone
@@ -108,6 +110,36 @@ def dir_gone(path):
     return os.access(parent, os.X_OK)
 
 
+def _open_regular(path, *args, **kwargs):
+    """open(), but only for a regular file.
+
+    Every read here used to be a bare blocking open(), so one fifo anywhere in
+    the bus wedged the reading thread forever. The page polls every two seconds,
+    which turns that into ~1800 permanently-blocked handler threads an hour for
+    as long as the tab is open — and requests answer 200 again the moment the
+    fifo is gone, so nothing ever surfaces the leak. bin/bridger walks the same
+    tree behind `[ -f ]` and only skips the file.
+
+    O_NONBLOCK is what makes the open itself return on a fifo; the fstat is what
+    decides, and blocking mode is restored for the regular files that pass so
+    reads behave exactly as before. A stat-then-open would leave a TOCTOU window
+    on the very case this exists for.
+
+    Raises OSError rather than ValueError because that is already what every
+    caller treats as "this one file is unreadable" — the fault degrades to a
+    warning instead of escaping as a 500.
+    """
+    handle = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(handle).st_mode):
+            raise OSError("not a regular file: %s" % path)
+        os.set_blocking(handle, True)
+        return os.fdopen(handle, *args, **kwargs)
+    except BaseException:
+        os.close(handle)
+        raise
+
+
 def watcher_alive(beat_path):
     """Mirrors watcher_alive (bin/bridger): the beat holds the watcher's pid, so
     a death shows immediately instead of at the end of the staleness window.
@@ -117,7 +149,7 @@ def watcher_alive(beat_path):
     a session `bridger peers` calls listening.
     """
     try:
-        with open(beat_path, newline="") as handle:
+        with _open_regular(beat_path, newline="") as handle:
             pid = handle.readline().rstrip("\n")
     except OSError:
         return False
@@ -150,7 +182,7 @@ def beat_pid_alive(beat_path):
     worktree's registration alive forever.
     """
     try:
-        with open(beat_path, newline="") as handle:
+        with _open_regular(beat_path, newline="") as handle:
             pid = handle.readline().rstrip("\n")
     except OSError:
         return False
@@ -177,7 +209,7 @@ def read_int(path):
         # newline="" and rstrip("\n"): bash reads this as `cur=$(cat …)`, which
         # strips trailing newlines and nothing else, so a `\r` has to survive to
         # be judged — see below.
-        with open(path, newline="") as handle:
+        with _open_regular(path, newline="") as handle:
             text = handle.read().rstrip("\n")
     except (OSError, ValueError):    # includes UnicodeDecodeError on raw bytes
         return 0
@@ -222,7 +254,7 @@ def _load_object(path):
     escaping as a 500. Raise ValueError instead, so the callers' existing
     "unreadable file" path handles it.
     """
-    with open(path) as handle:
+    with _open_regular(path) as handle:
         record = _load_json(handle)
     if not isinstance(record, dict):
         raise ValueError("expected a JSON object, got %s" % type(record).__name__)
@@ -382,7 +414,7 @@ def _read_messages(directory, pair, warnings):
             warnings.append("message %s/%s is not a numbered message — skipped" % (pair, name))
             continue
         try:
-            with open(path) as handle:
+            with _open_regular(path) as handle:
                 record = _load_json(handle)
             # int() inside the handler too: on 3.11+ it refuses a stem past
             # sys.get_int_max_str_digits(), and that ValueError would escape.
@@ -628,6 +660,13 @@ def _host_of(header):
 
 class MonitorHandler(BaseHTTPRequestHandler):
     server_version = "bridger-monitor"
+    # BaseHTTPRequestHandler leaves this None, so a connection that opens and
+    # never sends a byte holds its handler thread for as long as the process
+    # lives — 20 such connections, 20 threads, no log line. Loopback-only, so
+    # this is a leak rather than a door, but the ceiling costs one line. Safe at
+    # any value here: the handler speaks HTTP/1.0, so it closes after each
+    # response and never sits idle on a keep-alive.
+    timeout = 10
 
     def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's naming
         if not self._host_allowed():
@@ -650,7 +689,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
         """The plugin's mark, at a fixed path. Not a static directory: this is
         one hard-coded file, so there is nothing for a traversal to walk."""
         try:
-            with open(LOGO_PATH, "rb") as handle:
+            with _open_regular(LOGO_PATH, "rb") as handle:
                 body = handle.read()
         except OSError:
             # An install without assets/ still renders; the markup drops the img.
@@ -660,7 +699,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def _send_page(self):
         try:
-            with open(os.path.join(HERE, "index.html"), "rb") as handle:
+            with _open_regular(os.path.join(HERE, "index.html"), "rb") as handle:
                 body = handle.read()
         except OSError as err:
             self.send_error(500, "cannot read index.html: %s" % err)
@@ -1124,6 +1163,49 @@ def selftest():
             del os.environ["CLAUDE_CONFIG_DIR"]
         else:
             os.environ["CLAUDE_CONFIG_DIR"] = previous
+
+    # A fifo is the one file type that costs the reader everything, and it does
+    # so in two different places — which is why the fix needs both halves:
+    #
+    #   no writer attached    open() blocks until one appears, which is never.
+    #                         The read that follows would return EOF at once, so
+    #                         O_NONBLOCK alone is enough here.
+    #   a writer attached     the open rendezvous succeeds, and the READ is what
+    #                         blocks. Only refusing the file type escapes that.
+    #
+    # Every reader is covered — message, cursor, peer record, beat — because they
+    # were five separate bare opens and each one wedges its whole request.
+    if hasattr(os, "mkfifo"):
+        with open(os.path.join(hostile, "peers", "piped.json"), "w") as handle:
+            json.dump({"name": "piped", "cwd": hostile, "branch": "main",
+                       "summary": "", "session": "piped-sess",
+                       "created": "2026-07-26T11:00:00Z",
+                       "last_seen": "2026-07-26T11:00:00Z"}, handle)
+        os.mkfifo(os.path.join(hostile, "peers", "piped.beat"))
+        os.mkfifo(os.path.join(hostile, "peers", "piper.json"))
+        os.mkfifo(os.path.join(hostile_thread, "00009.json"))
+        os.mkfifo(os.path.join(hostile_thread, "cursor-beta"))
+        written = os.path.join(hostile_thread, "00010.json")
+        os.mkfifo(written)
+        # O_RDWR on a fifo neither blocks nor needs a peer, and it holds a writer
+        # open for as long as it is: the trick that makes "a read that never
+        # returns" a deterministic fixture rather than a race with a thread.
+        held = os.open(written, os.O_RDWR)
+        try:
+            # On a deadline, in a thread: a regression here does not fail, it
+            # HANGS, and a suite that hangs reports nothing at all.
+            returned = []
+            worker = threading.Thread(
+                daemon=True, target=lambda: returned.append(snapshot(hostile, now=now)))
+            worker.start()
+            worker.join(10)
+            assert returned, "a fifo in the bus blocked the snapshot"
+        finally:
+            os.close(held)
+        piped = returned[0]      # never call it on this thread again: see above
+        for name in ("00009", "00010", "piper"):
+            assert any(name in warning for warning in piped["warnings"]), piped["warnings"]
+
     shutil.rmtree(hostile)
 
     shutil.rmtree(root)
