@@ -87,7 +87,18 @@ esac
 # This runs BEFORE whoami and peers. It needs neither, and sitting below them it
 # had already spent most of the hook's cost — the cost this gate exists to avoid,
 # paid on every tool call of every session on the machine.
-marker="$BRIDGER_ROOT/reported-${sid:-nosession}"
+# The id goes into a FILENAME, so it gets charset-limited first, exactly as
+# `statusline_state_file` does in bin/bridger for the same reason. Interpolated
+# raw, a session id containing `/` made the marker a path through a directory
+# that does not exist; `mv` then failed and errexit killed the hook — after the
+# peek had already found the mail and before it could be reported. Claude Code
+# sends UUIDs, so this was one malformed field away from the silent-no-delivery
+# behaviour the rest of this file exists to prevent.
+case "${sid:-}" in
+  ''|*[!A-Za-z0-9._-]*) marker_id=nosession ;;
+  *) marker_id="$sid" ;;
+esac
+marker="$BRIDGER_ROOT/reported-$marker_id"
 if [ "${event:-}" = "PostToolUse" ] && [ "$registered_now" -eq 0 ] && [ -f "$marker" ]; then
   [ -n "$(find "$BRIDGER_ROOT/threads" -name '*.json' -newer "$marker" -print -quit 2>/dev/null)" ] \
     || exit 0
@@ -108,8 +119,18 @@ fi
 # the marker: `find -newer` could never see it, and every later tool call exited
 # at the gate above while the message sat unread. The poll takes seconds on a
 # busy bus, so the window is wide. `mv` preserves the mtime.
-mkdir -p "$BRIDGER_ROOT"
-stamp=$(mktemp "$BRIDGER_ROOT/.mark.XXXXXX")
+#
+# A root that cannot be written costs the marker, not the delivery: mail already
+# on disk is readable, so a read-only bus (a restored archive, a root shared with
+# another uid) must still be reported. Stamping it was above the peek, so a
+# failure there silenced the report entirely.
+mkdir -p "$BRIDGER_ROOT" 2>/dev/null || true
+stamp=$(mktemp "$BRIDGER_ROOT/.mark.XXXXXX" 2>/dev/null || true)
+# Anything that ends the hook between here and the mv below — the 5s hook timeout
+# firing mid-poll, most likely — would otherwise leave the stamp behind for good;
+# nothing in the plugin prunes them. A no-op on the success path, where the mv has
+# already consumed it.
+[ -z "$stamp" ] || trap 'rm -f "$stamp"' EXIT
 
 unread=$(cd "$cwd" && "$bridger" poll --peek 2>/dev/null || true)
 # The marker belongs to the PostToolUse cadence alone. UserPromptSubmit reports
@@ -120,7 +141,18 @@ unread=$(cd "$cwd" && "$bridger" poll --peek 2>/dev/null || true)
 # arrived left a registered session that has never received a message with no
 # marker at all, so the gate above was skipped on every single tool call forever
 # — exactly the hot path it exists for.
-if [ "${event:-}" = "PostToolUse" ]; then mv "$stamp" "$marker"; else rm -f "$stamp"; fi
+#
+# And failing to record it must never cost a delivery: the worst case of a
+# missing marker is a report repeated on the next tool call, which is the safe
+# direction, whereas letting the failure propagate loses the mail the peek is
+# holding right now.
+if [ -n "$stamp" ]; then
+  if [ "${event:-}" = "PostToolUse" ]; then
+    mv "$stamp" "$marker" 2>/dev/null || rm -f "$stamp"
+  else
+    rm -f "$stamp"
+  fi
+fi
 # Nothing waiting. If this call really was a registration, the step easiest to
 # skip is the watcher — and by here `whoami` and `peers` have confirmed both
 # halves of the claim: this session IS registered, and it is NOT listening.

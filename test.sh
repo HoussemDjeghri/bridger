@@ -1221,6 +1221,44 @@ sys.exit(0 if age < 1.0 else 1)
 PYEOF
   rm -rf "$shimroot"
 
+  # A session id is not a filename. Interpolated raw into the marker path, a `/`
+  # in it made the marker a path through a directory that does not exist, `mv`
+  # failed, and errexit killed the hook — after the peek already had the mail in
+  # hand and before a word of it was reported. bin/bridger charset-limits the id
+  # before using it as a filename for exactly this reason; the hook did not.
+  mkdir -p "$up/slash"
+  (cd "$up/slash" && BRIDGER_SESSION_ID=a/b "$bridger" register slashpeer >/dev/null)
+  (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send slashpeer ask "SLASHED" >/dev/null 2>/dev/null)
+  slashcall='{"hook_event_name":"PostToolUse","cwd":"'"$up/slash"'","session_id":"a/b"}'
+  out=$(printf '%s' "$slashcall" | bash "$hook") \
+    || fail "a session id containing a slash made the delivery hook exit nonzero"
+  jq -r '.hookSpecificOutput.additionalContext' <<<"$out" | grep -q "SLASHED" \
+    || fail "a session id containing a slash cost a delivery (got: $out)"
+  # Tolerating the failed write is only half of it: an id that cannot be a
+  # filename must still get a USABLE marker, or the `-newer` gate never engages
+  # for that session and every tool call it ever makes pays the full hook cost.
+  [ -f "$BRIDGER_ROOT/reported-nosession" ] \
+    || fail "an unusable session id left no high-water marker at all, so the fast path can never engage"
+
+  # A read-only bus root: the mail is on disk and readable, so it must still be
+  # reported. The high-water stamp was taken before the peek, so a root that
+  # could not be written silenced the report instead of just the marker.
+  if [ "$(id -u)" -ne 0 ]; then
+    (cd "$up/writer" && BRIDGER_SESSION_ID=writer-sess "$bridger" send reader ask "READONLY" >/dev/null 2>/dev/null)
+    rm -f "$BRIDGER_ROOT/reported-reader-sess"
+    chmod 555 "$BRIDGER_ROOT"
+    ro=$(printf '%s' "$ptu" | bash "$hook") || true
+    chmod 755 "$BRIDGER_ROOT"
+    jq -r '.hookSpecificOutput.additionalContext' <<<"$ro" 2>/dev/null | grep -q "READONLY" \
+      || fail "a read-only bus root silenced mail that was perfectly readable (got: $ro)"
+  fi
+
+  # Nor may any run leave its high-water stamp behind: nothing in the plugin
+  # prunes them, and the paths that abort mid-hook (the 5s timeout firing during
+  # the poll, most of all) are the common ones.
+  [ -z "$(find "$BRIDGER_ROOT" -maxdepth 1 -name '.mark.*' -print -quit)" ] \
+    || fail "the delivery hook leaked its high-water stamp into the bus root"
+
   # And the claim must never be made for a session that is not registered at all.
   mkdir -p "$up/stranger"
   stranger=$(printf '{"hook_event_name":"PostToolUse","cwd":"%s","session_id":"stranger-sess","tool_input":{"command":"grep -n \\"bridger register\\" README.md"}}' "$up/stranger" | bash "$hook")
@@ -1264,6 +1302,21 @@ PYEOF
   # Once per session: an agent that ignores it still gets its turn back, and
   # falls through to the softer per-turn reminders instead of a hard loop.
   [ -z "$(printf '%s' "$payload" | bash "$hook")" ] || fail "Stop must block at most once per session"
+
+  # Same defect as the delivery hook's marker, one line earlier in its effect: a
+  # `/` in the session id made the nudge-marker path unwritable, and errexit
+  # killed the hook immediately before the block it exists to emit — leaving the
+  # session to go idle and deaf with nothing said.
+  mkdir -p "$st/slash"
+  (cd "$st/slash" && BRIDGER_SESSION_ID=a/b "$bridger" register slashstop >/dev/null)
+  slashed=$(printf '{"cwd":"%s","session_id":"a/b","stop_hook_active":false}' "$st/slash" | bash "$hook") \
+    || fail "a session id containing a slash made the Stop hook exit nonzero"
+  [ "$(jq -r .decision <<<"$slashed")" = "block" ] \
+    || fail "a session id containing a slash cost the deaf-session nudge (got: $slashed)"
+  # Tolerating the failed write is only half of it: the marker has to be usable
+  # for that id as well, or "once, never a nag" becomes a block on every turn.
+  [ -z "$(printf '{"cwd":"%s","session_id":"a/b","stop_hook_active":false}' "$st/slash" | bash "$hook")" ] \
+    || fail "an unusable session id made the Stop nudge repeat every turn"
 
   # A turn Claude Code is already continuing because of a stop hook.
   rm -f "$BRIDGER_ROOT/armed-nudge-solo-sess"

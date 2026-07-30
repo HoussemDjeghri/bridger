@@ -35,14 +35,25 @@ IFS=$'\t' read -r cwd sid active < <(
 BRIDGER_SESSION_ID="${sid:-}"
 export BRIDGER_SESSION_ID
 
-nudged="$BRIDGER_ROOT/armed-nudge-${sid:-nosession}"
+# Charset-limited before it becomes a filename, as in `statusline_state_file`
+# and hooks/deliver.sh: a session id containing `/` made this a path through a
+# directory that does not exist, and the `: >` below then failed and errexit
+# killed the hook one line before the nudge it exists to emit.
+case "${sid:-}" in
+  ''|*[!A-Za-z0-9._-]*) nudge_id=nosession ;;
+  *) nudge_id="$sid" ;;
+esac
+nudged="$BRIDGER_ROOT/armed-nudge-$nudge_id"
 [ -f "$nudged" ] && exit 0
 
 me=$(cd "$cwd" && "$bridger" whoami 2>/dev/null) || exit 0
 listed=$(cd "$cwd" && "$bridger" peers 2>/dev/null) || exit 0
 grep -q "^$me \[listening\]" <<<"$listed" && exit 0
 
-mkdir -p "$BRIDGER_ROOT"; : > "$nudged"
+# A marker that cannot be written costs a repeated nudge, which `stop_hook_active`
+# already bounds. Letting it propagate costs the nudge itself — a session left
+# idle and deaf, which is the whole thing this hook prevents.
+mkdir -p "$BRIDGER_ROOT"; { : > "$nudged"; } 2>/dev/null || true
 
 jq -nc --arg r "This session is registered as bridger peer '$me' but has no watcher running, so it is about to go idle unable to receive anything. Nothing else delivers to an idle session. Before finishing: run CLI \`$bridger wait --follow\` as a persistent background task (Monitor tool if available, otherwise a background Bash task) and leave it running for the rest of the session. Each line it emits is one incoming message \"#<seq> <from> <type>: <body>\" — answer an 'ask' from your own context with CLI \`$bridger send <from> answer \"<text>\" --ref <seq>\`. Then finish your turn as normal." \
   '{decision: "block", reason: $r}'

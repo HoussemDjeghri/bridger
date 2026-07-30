@@ -1090,21 +1090,27 @@ cmd_poll() {
   # `local` is enough for unread_in_thread to see it: bash scopes dynamically,
   # so a callee reads its caller's locals — and it keeps the name from leaking
   # back into the watcher loop that calls this.
-  local top rc failed=0 wedge BRIDGER_WEDGE_FILE
+  local top rc failed=0 wedge BRIDGER_WEDGE_FILE=''
   # One scratch file for the whole call: unread_in_thread reports the seq it
   # stopped at through it (see there for why it cannot be a variable).
-  # In the bus root, not TMPDIR: the root has to be writable for the bus to work
-  # at all, whereas keying delivery to TMPDIR added a second dependency that
-  # stopped every poll with a bare `mktemp: mkstemp failed` and no hint that the
-  # bus was involved.
-  BRIDGER_WEDGE_FILE=$(mktemp "$BRIDGER_ROOT/.wedge.XXXXXX")
-  trap 'rm -f "$BRIDGER_WEDGE_FILE"' RETURN
+  #
+  # In the bus root rather than TMPDIR, so that delivery does not acquire a
+  # second dependency that fails with a bare `mktemp: mkstemp failed` and no hint
+  # the bus is involved. Only for a consuming poll, and only if it can be
+  # created: `--peek` never advances a cursor, so it needs no wedge bound, and a
+  # bus root that is read-only must still be READABLE — peek is what the delivery
+  # hook runs, and a pure reader must not be stopped by a permission it does not
+  # need. Without the file a wedge simply cannot advance, which is the same thing
+  # a read-only root already enforces.
+  [ "$peek" -eq 1 ] \
+    || BRIDGER_WEDGE_FILE=$(mktemp "$BRIDGER_ROOT/.wedge.XXXXXX" 2>/dev/null || true)
+  trap 'if [ -n "$BRIDGER_WEDGE_FILE" ]; then rm -f "$BRIDGER_WEDGE_FILE"; fi' RETURN
   for peer in $(other_peers "$me"); do
     dir=$(thread_dir "$me" "$peer")
     [ -d "$dir" ] || continue
     top=$(max_seq "$dir")
     rc=0
-    : > "$BRIDGER_WEDGE_FILE"
+    [ -z "$BRIDGER_WEDGE_FILE" ] || : > "$BRIDGER_WEDGE_FILE"
     if [ "$json" -eq 1 ]; then
       unread_in_thread "$dir" "$me" "$top" || rc=$?
     else
