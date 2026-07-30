@@ -48,7 +48,7 @@ nudged="$BRIDGER_ROOT/armed-nudge-$nudge_id"
 [ -f "$nudged" ] && exit 0
 
 me=$(cd "$cwd" && "$bridger" whoami 2>/dev/null) || exit 0
-listed=$(cd "$cwd" && "$bridger" peers 2>/dev/null) || exit 0
+listed=$(cd "$cwd" && "$bridger" peers "$me" 2>/dev/null) || exit 0   # see deliver.sh: by ONE name
 grep -q "^$me \[listening\]" <<<"$listed" && exit 0
 
 # A marker that cannot be written costs a repeated nudge, which `stop_hook_active`

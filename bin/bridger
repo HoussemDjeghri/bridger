@@ -1039,12 +1039,20 @@ cmd_summary() {
 # The footer restates that inline: a reader who has only this output (not the
 # help text) otherwise reads "queued" as "nobody home" and skips the ask.
 cmd_peers() {
-  local scope=machine me my_repo f name cwd repo branch summary status mark
+  local scope=machine only="" me my_repo f name cwd repo branch summary status mark
   local queued_others=0 missing_any=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --machine|--repo|--dir) scope="${1#--}"; shift ;;
-      *) die "usage: bridger peers [--machine|--repo|--dir]" ;;
+      # One peer by name, which is the only question deliver.sh and stop.sh ever
+      # ask of this command: "is MY watcher alive". They were paying a rendered
+      # listing of every peer for it — five jq per record, 201 forks and 3.0s at
+      # 40 peers, on every tool call against a 5s hook budget. Answering it here
+      # rather than in the hooks keeps the 15s staleness rule in peer_status,
+      # which hooks/statusline.sh has already copied once too often.
+      -*) die "usage: bridger peers [--machine|--repo|--dir] [name]" ;;
+      *) [ -z "$only" ] || die "usage: bridger peers [--machine|--repo|--dir] [name]"
+         only="$1"; shift ;;
     esac
   done
   me=$(resolve_identity) || true
@@ -1060,7 +1068,12 @@ cmd_peers() {
     # errexit would abort this loop: every peer sorting after it disappears from
     # the listing, and deliver.sh/stop.sh both do `peers || exit 0`, so one
     # truncated file would silence unread reports for every session on the box.
-    name=$(basename "$f" .json)
+    # Parameter expansion, not `basename`: one fork per record, on a listing the
+    # delivery hooks run on every tool call.
+    name=${f##*/}; name=${name%.json}
+    # Before the four jq reads below, so a by-name listing costs one record and
+    # not the whole registry.
+    [ -z "$only" ] || [ "$name" = "$only" ] || continue
     # A record we cannot read a path out of still names an addressable peer, so
     # it stays in the listing with an empty directory — hiding it would repeat
     # the bug this guard fixes. The guard is only that jq's exit 5 must not abort
@@ -1672,8 +1685,9 @@ cmd_help() {
 bridger — message bus between Claude Code sessions (file-based, jq only)
 
 usage:
-  bridger peers [--machine|--repo|--dir]
+  bridger peers [--machine|--repo|--dir] [name]
                                       list peers: name, status, directory, branch, summary
+                                      (a name lists just that peer)
   bridger summary <text>               say what this session is working on
   bridger register <name> [dir]        make this (or given) directory addressable, by name
   bridger join                         register with a name derived from the directory

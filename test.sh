@@ -363,6 +363,25 @@ pass "same name: live holder refused, dead holder taken over"
     || fail "whoami cost $forks jq forks at 40 peers — identity resolution is O(peers) again"
   pass "identity resolution reads the whole peer registry in a bounded number of forks"
 
+  # ... and neither is the hook as a whole. deliver.sh asked `bridger peers` — a
+  # rendered listing of EVERY peer, five jq per record — to answer the one-peer
+  # question "is my own watcher alive": 201 forks and 3.0s at 40 peers, on every
+  # tool call, against a 5s budget.
+  : > "$fr/forks"
+  ptu40='{"hook_event_name":"PostToolUse","cwd":"'"$fr/p40"'","session_id":"s40"}'
+  printf '%s' "$ptu40" | PATH="$fr/shim:$PATH" BRIDGER_SESSION_ID=s40 \
+    bash "$here/hooks/deliver.sh" >/dev/null 2>&1 || true
+  forks=$(wc -c <"$fr/forks" | tr -d ' ')
+  [ "$forks" -le 40 ] || fail "one delivery-hook call cost $forks jq forks at 40 peers"
+  pass "a delivery-hook call is not O(peers) in forks"
+
+  out=$(cd "$fr/p40" && BRIDGER_SESSION_ID=s40 "$bridger" peers p17)
+  [ "$(grep -c '^p' <<<"$out")" -eq 1 ] || fail "peers <name> listed more than the named peer"
+  grep -q '^p17 ' <<<"$out" || fail "peers <name> did not list the named peer"
+  [ "$(cd "$fr/p40" && BRIDGER_SESSION_ID=s40 "$bridger" peers | grep -c '^p')" -eq 40 ] \
+    || fail "peers without a name must still list every peer"
+  pass "peers takes an optional name and lists only that peer"
+
   # The registry is read as one field per line, so a directory whose path
   # contains a newline would shift every field after it — the F8 field-shift, in
   # the one place that decides who a session IS. Refuse it at the boundary

@@ -114,9 +114,12 @@ fi
 
 me=$(cd "$cwd" && "$bridger" whoami 2>/dev/null) || exit 0
 
-# Unscoped listing matched by name: --dir compares directories exactly, so a
-# session running in a subdirectory of the one it registered would miss itself.
-listed=$(cd "$cwd" && "$bridger" peers 2>/dev/null) || exit 0
+# By name, not a scope filter: --dir compares directories exactly, so a session
+# running in a subdirectory of the one it registered would miss itself. And by
+# ONE name, because a full listing costs five jq per peer record — 201 forks and
+# 3.0s at 40 peers — to answer a question about a single peer, on every tool call
+# against a 5s budget.
+listed=$(cd "$cwd" && "$bridger" peers "$me" 2>/dev/null) || exit 0
 if grep -q "^$me \[listening\]" <<<"$listed"; then
   exit 0
 fi
