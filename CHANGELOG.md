@@ -4,6 +4,37 @@ All notable changes to bridger are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and bridger uses
 [semantic versioning](https://semver.org/).
 
+## [0.14.0] — 2026-07-30
+
+A backlog used to be able to lock a session out of its own mail permanently. The unread scan forked one `jq` per unread message, and the delivery hooks — the only thing that reaches a session with no watcher — call it under a 5s timeout. Past roughly 1400 unread the hook was killed mid-scan on every single invocation, its output discarded, and because `--peek` deliberately never consumes, the backlog could not shrink. Every tool call and every prompt repeated the same timeout with the same zero bytes, with no error anywhere.
+
+The scan now selects the whole unread run in one batched `jq`, chunked so the argv cannot outgrow `ARG_MAX` at any bus-root depth. **`poll --peek` over 3000 unread: 10s → 0s.**
+
+The same budget was being spent on peer count. Identity resolution ran two `jq` plus a `basename` per peer record and every hook call resolves identity three times; on top of that both hooks rendered a listing of *every* peer to answer "is my own watcher alive". At 81 peers that put the hook over its timeout, where it is killed before it can stamp its marker — so the next tool call repeats the work and it never converges. **One `deliver.sh` call at 40 peers: 204 `jq` forks / ~3.0s → 9 forks / under 0.01s.**
+
+A watcher could also lose its own name by being busy. The heartbeat is refreshed once per loop, outside the poll, so a poll longer than the 15s staleness window made a demonstrably running watcher read `[queued]` — senders were told it was not listening, the badge flipped, and a second session in the same directory could take its name and its read cursor while the live watcher went on consuming the mail. The refusal now keys on the pid that was on disk the whole time, and the beat stays fresh across a long poll.
+
+`peers` takes an optional name and lists just that peer.
+
+- fix(poll): one `jq` for the unread run instead of one per message — past ~1400 unread the delivery hook was killed on every call and delivered nothing, permanently
+- fix(poll): the batched scan chunks its argv, so a deep bus root has no `ARG_MAX` cliff of its own
+- fix(poll): a non-object message is reported instead of being consumed in silence — `jq` exits 0 on a runtime `error()` across a multi-file argv, so the guard was inert for any run of two or more messages
+- fix(poll): one file per seq, scanned in that seq's order — out of order, a wedge marked messages read that had never been delivered
+- fix(poll): a thread that cannot be written no longer wedges in silence
+- fix(identity): a watcher whose process is alive keeps its name through a stale heartbeat; a second session can no longer take a busy watcher's name and cursor
+- fix(identity): the heartbeat stays fresh across a long poll, and only for the watcher — a plain CLI poll must never claim a watcher the session lacks
+- fix(identity): a peer directory whose path contains a newline is refused rather than shifting every field that follows it
+- fix(peers): a record with no directory addresses nothing, instead of answering for every directory on the machine
+- fix(peers): a lock that cannot be taken fails instead of spinning in silence
+- fix(hooks): per-session markers — one session's report no longer silences every other session's waiting mail
+- fix(hooks): badge state never outranks the mail
+- fix(monitor): one bad file no longer 500s the web view
+- perf(identity): the peer registry is read once, not twice per record — `whoami` at 40 peers, 80 `jq` forks → 1
+- perf(hooks): the hooks ask about one peer instead of all of them
+- feat(peers): `bridger peers <name>` lists a single peer
+
+Self-check: 81 assertions, up from 52 at 0.13.0.
+
 ## [0.13.0] — 2026-07-29
 
 A deleted worktree used to leave its peer behind forever: `leave` resolves the peer from `$PWD`, which is impossible once that directory is gone, so the name sat in every listing with no way to remove it.
@@ -138,6 +169,7 @@ Also updated: the bridger skill, `/bridger:peers`, the `SessionStart` guidance, 
   fresh heartbeat, a second session is refused that name; once the holder goes
   away, the name can be taken over — how a restarted session reclaims its role.
 
+[0.14.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.14.0
 [0.13.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.13.0
 [0.12.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.12.0
 [0.11.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.11.0
