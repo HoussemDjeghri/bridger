@@ -1570,12 +1570,21 @@ SHIMEOF
   shimcall='{"hook_event_name":"PostToolUse","cwd":"'"$up/reader"'","session_id":"shim-sess"}'
   started=$(python3 -c 'import time; print(time.time())')
   CLAUDE_PLUGIN_ROOT="$shimroot" bash "$hook" <<<"$shimcall" >/dev/null 2>&1 || true
+  finished=$(python3 -c 'import time; print(time.time())')
   [ -f "$BRIDGER_ROOT/reported-shim-sess" ] || fail "the slow-poll run wrote no marker at all"
-  python3 - "$BRIDGER_ROOT/reported-shim-sess" "$started" <<'PYEOF' \
+  python3 - "$BRIDGER_ROOT/reported-shim-sess" "$started" "$finished" <<'PYEOF' \
     || fail "the marker was stamped after the poll finished — anything that landed during it is suppressed forever"
 import os, sys
-age = os.stat(sys.argv[1]).st_mtime - float(sys.argv[2])
-sys.exit(0 if age < 1.0 else 1)
+marker, started, finished = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+# Which HALF of the run the stamp lands in, not how many seconds it took. The
+# bound used to be a flat 1.0s from the start: normally the stamp lands 0.03s in,
+# but a cold start costs 0.5s and parallel load pushes it over — a red suite for
+# a hook that did exactly the right thing. The shim's 2s poll is the whole width
+# of the window, so "nearer the start than the end" says the same thing and says
+# it the same way on a loaded machine.
+if finished - started < 1.0:
+    sys.exit(1)          # the shim never slept: the fixture would prove nothing
+sys.exit(0 if os.stat(marker).st_mtime - started < (finished - started) / 2 else 1)
 PYEOF
   rm -rf "$shimroot"
 
