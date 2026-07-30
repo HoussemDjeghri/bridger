@@ -42,9 +42,13 @@ payload=$(cat 2>/dev/null || true)
 # the process substitution's status, but `read` then hit EOF and returned 1, and
 # under `set -e` that is what killed the hook. The result was a silent exit 1 for
 # any such tool call, and a session with mail waiting never heard about it.
-IFS=$'\t' read -r event cwd sid cmd < <(
-  jq -r '[.hook_event_name // "", .cwd // "", .session_id // "",
-          ((.tool_input? | objects | .command? | strings) // "" | gsub("\\s+"; " "))] | @tsv' \
+# One field per LINE, not @tsv — see stop.sh. Tab is IFS whitespace even when
+# IFS=$'\t', so an empty field earlier in the row shifts every later one left:
+# an empty .cwd put the tool command in the session id, and the per-session
+# marker this hook keys on then named a command instead of a session.
+{ read -r event; read -r cwd; read -r sid; read -r cmd; } < <(
+  jq -r '.hook_event_name // "", .cwd // "", .session_id // "",
+         ((.tool_input? | objects | .command? | strings) // "" | gsub("\\s+"; " "))' \
     <<<"$payload" 2>/dev/null
 ) || true
 [ -n "${cwd:-}" ] && [ -d "$cwd" ] || cwd="$PWD"

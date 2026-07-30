@@ -26,10 +26,16 @@ BRIDGER_ROOT="${BRIDGER_ROOT:-$HOME/.claude/bridger}"
 command -v jq >/dev/null 2>&1 || exit 0
 
 payload=$(cat 2>/dev/null || true)
-IFS=$'\t' read -r cwd sid active < <(
-  jq -r '[.cwd // "", .session_id // "", (.stop_hook_active // false | tostring)] | @tsv' \
-    <<<"$payload" 2>/dev/null || true
-)
+# One field per LINE, not @tsv. Tab is IFS whitespace even when IFS=$'\t', so a
+# run of tabs collapses and an EMPTY field shifts every later field left: with an
+# empty .cwd the session id became the stop_hook_active flag, identity is per
+# session so whoami answered for nobody, and this hook exited silently — the
+# session went idle deaf having been told nothing. Process substitution, not
+# $( ), because $( ) strips trailing newlines and would eat a final empty field.
+{ read -r cwd; read -r sid; read -r active; } < <(
+  jq -r '.cwd // "", .session_id // "", (.stop_hook_active // false | tostring)' \
+    <<<"$payload" 2>/dev/null
+) || true
 [ "${active:-false}" = "true" ] && exit 0
 [ -n "${cwd:-}" ] && [ -d "$cwd" ] || cwd="$PWD"
 BRIDGER_SESSION_ID="${sid:-}"
@@ -45,11 +51,24 @@ nudge_id=${sid//[!A-Za-z0-9._-]/_}
 nudge_id=${nudge_id:-nosession}
 [ ${#nudge_id} -le 64 ] || nudge_id=${nudge_id: -64}   # see deliver.sh: bash 3.2
 nudged="$BRIDGER_ROOT/armed-nudge-$nudge_id"
-[ -f "$nudged" ] && exit 0
 
+# The "already nudged" test used to short-circuit HERE, above the listening
+# check, which made the marker permanent: a watcher that dies later — killed, a
+# crashed shell, a machine asleep past the staleness window — left the session
+# deaf for the rest of its life and it was never told again, the exact outcome
+# this hook exists to prevent. The state has to be read before the marker can be
+# judged. It costs two bridger calls per turn on a session that has already been
+# nudged; this hook runs once per turn, not per tool call, and the delivery hook
+# is where that budget actually matters.
 me=$(cd "$cwd" && "$bridger" whoami 2>/dev/null) || exit 0
 listed=$(cd "$cwd" && "$bridger" peers "$me" 2>/dev/null) || exit 0   # see deliver.sh: by ONE name
-grep -q "^$me \[listening\]" <<<"$listed" && exit 0
+if grep -q "^$me \[listening\]" <<<"$listed"; then
+  # Reaching [listening] is the one moment the nudge is provably no longer
+  # needed, and the only moment this hook can tell. Drop it on the way out.
+  rm -f "$nudged" 2>/dev/null || true
+  exit 0
+fi
+[ -f "$nudged" ] && exit 0   # nudged already, and still not listening: once, never a nag
 
 # A marker that cannot be written costs a repeated nudge, which `stop_hook_active`
 # already bounds. Letting it propagate costs the nudge itself — a session left

@@ -1521,17 +1521,59 @@ PYEOF
   [ -z "$(printf '{"cwd":"%s","session_id":"solo-sess","stop_hook_active":true}' "$st/solo" | bash "$hook")" ] \
     || fail "Stop must respect stop_hook_active"
 
-  # Watcher armed: the session goes idle listening, nothing to enforce.
+  # An EMPTY field earlier in the payload must not move the ones after it. Tab is
+  # IFS whitespace even when IFS=$'\t', so `read -r cwd sid active` collapses a run
+  # of tabs and an empty .cwd shifts every later field left: the session id becomes
+  # the stop_hook_active flag, identity is per session so whoami then answers for
+  # nobody, and the hook exits silently — the session goes idle deaf having been
+  # told nothing, which is the one thing it exists to prevent. cwd falls back to
+  # $PWD, so the nudge is still owed.
   rm -f "$BRIDGER_ROOT/armed-nudge-solo-sess"
+  shifted=$(cd "$st/solo" && printf '{"cwd":"","session_id":"solo-sess","stop_hook_active":false}' | bash "$hook")
+  [ "$(jq -r .decision <<<"$shifted")" = "block" ] \
+    || fail "an empty cwd shifted the payload fields and cost the deaf-session nudge (got: $shifted)"
+
+  # Watcher armed: the session goes idle listening, nothing to enforce.
+  # The marker is deliberately left in place here: reaching [listening] is the one
+  # moment the nudge is provably no longer needed, so it is the moment to drop it.
+  # Kept, it is permanent — and a watcher that dies later leaves the session deaf
+  # for the rest of its life with nothing ever said, which is the exact outcome
+  # this hook exists to prevent.
+  : > "$BRIDGER_ROOT/armed-nudge-solo-sess"
   (cd "$st/solo"; exec env BRIDGER_SESSION_ID=solo-sess "$bridger" wait --follow >/dev/null 2>&1) &
   w=$!
   await_listening solo || fail "watcher never came up for peer solo"
   [ -z "$(printf '%s' "$payload" | bash "$hook")" ] || fail "Stop must not block once a watcher is listening"
   kill "$w" 2>/dev/null || true
   wait "$w" 2>/dev/null || true
+  rm -f "$BRIDGER_ROOT/peers/solo.beat"      # the watcher is gone, not merely stale
+  revived=$(printf '%s' "$payload" | bash "$hook")
+  [ "$(jq -r .decision <<<"$revived")" = "block" ] \
+    || fail "a session whose watcher died was never warned again (got: $revived)"
 
   pass "Stop hook blocks once until a registered session is actually listening"
   rm -rf "$BRIDGER_ROOT" "$st"
+)
+
+# --- the delivery hook's payload fields must not shift either ------------------
+# Same collapse as above, one field further along: with an empty .cwd the tool
+# command lands in the session id, and this hook's marker — the thing that makes
+# the report per session rather than per machine — is then named after a command.
+# Every session running the same command shares one marker, and the first of them
+# takes the only report.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  dh=$(mktemp -d); mkdir -p "$dh/a" "$dh/b"
+  (cd "$dh/a" && BRIDGER_SESSION_ID=dh-a "$bridger" register dha >/dev/null)
+  (cd "$dh/b" && BRIDGER_SESSION_ID=dh-b "$bridger" register dhb >/dev/null)
+  (cd "$dh/a" && BRIDGER_SESSION_ID=dh-a "$bridger" send dhb chat hello >/dev/null 2>&1)
+  (cd "$dh/b" && printf '%s' \
+    '{"hook_event_name":"PostToolUse","cwd":"","session_id":"dh-b","tool_input":{"command":"echo hi"}}' \
+    | bash "$here/hooks/deliver.sh") >/dev/null 2>&1 || true
+  [ -f "$BRIDGER_ROOT/reported-dh-b" ] \
+    || fail "an empty cwd shifted the payload fields — the marker is named $(ls "$BRIDGER_ROOT" | grep reported || echo 'nothing')"
+  pass "an empty payload field does not shift the delivery hook's session id"
+  rm -rf "$BRIDGER_ROOT" "$dh"
 )
 
 # --- session-start: badge bookkeeping must never outrank the delivery report --
