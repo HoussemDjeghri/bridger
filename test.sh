@@ -330,7 +330,15 @@ pass "same name: live holder refused, dead holder taken over"
   if [ "$beat" -nt "$bw/mark" ]; then
     fail "a plain poll refreshed the heartbeat — a session with no watcher will read [listening]"
   fi
-  (cd "$bw/busy" && BRIDGER_BEAT_KEEP=1 BRIDGER_SESSION_ID=s-first "$bridger" poll --peek) >/dev/null 2>&1 || true
+  # The beat above still names a pid that is not this poll's, which is the whole
+  # credential: refreshing someone else's beat is how a session with no watcher
+  # comes to read [listening].
+  # The watcher's own poll must still refresh it. `exec` so bridger runs as the
+  # very process whose pid is on the beat, which is what cmd_wait's own
+  # `echo $$ > beat` gives it for free.
+  (cd "$bw/busy" && BRIDGER_SESSION_ID=s-first \
+     sh -c 'echo $$ > "$1"; touch -t 202001010000 "$1"; exec "$0" poll --peek' \
+       "$bridger" "$beat") >/dev/null 2>&1 || true
   [ "$beat" -nt "$bw/mark" ] \
     || fail "the watcher's poll did not refresh the heartbeat — a long poll still starves it"
   pass "the beat is kept fresh across a poll, and only for the watcher"
