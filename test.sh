@@ -2080,10 +2080,8 @@ if [ "$(id -u)" -ne 0 ]; then
   out=$(cd "$up/b" && "$bridger" poll 2>"$err" || true)
   grep -q "from-uc" <<<"$out" \
     || fail "an unwritable thread hid every peer sorting after it (got: $out)"
-  grep -q "not writable" <<<"$out" \
-    || fail "an unwritable thread said nothing an agent could act on (got: $out)"
-  grep -q "cannot record the read position" "$err" \
-    || fail "a cursor that could not be written was not reported (stderr: $(cat "$err"))"
+  grep -q "from-ua" <<<"$out" \
+    || fail "the unwritable thread's own message was not delivered (got: $out)"
   # The raw shell diagnostic is not a diagnostic: it names a line number in
   # bin/bridger and says nothing about the bus.
   grep -q "Permission denied" "$err" \
@@ -2092,7 +2090,14 @@ if [ "$(id -u)" -ne 0 ]; then
   again=$(cd "$up/b" && "$bridger" poll 2>/dev/null || true)
   grep -q "from-uc" <<<"$again" \
     && fail "a healthy thread was re-delivered because another thread was unwritable"
-  pass "an unwritable thread neither blinds poll nor replays its healthy peers"
+  # The read position falls back to the bus root, which is provably writable on
+  # this path: a consuming poll only got here because mktemp created
+  # .wedge.XXXXXX there. A read-only thread directory is permanent by
+  # construction, and re-delivering its whole backlog on every 0.5s watcher tick
+  # is 622k agent-facing lines a day — each one re-invoking the session.
+  grep -q "from-ua" <<<"$again" \
+    && fail "an unwritable thread re-delivered a message it had already delivered"
+  pass "an unwritable thread neither blinds poll nor replays anything"
 
   # Same directory, fault at seq 1: there advance_cursor writes nothing at all
   # (`wedge - 1` is 0), so the only thing that can still abort the loop is the
@@ -2107,6 +2112,36 @@ if [ "$(id -u)" -ne 0 ]; then
     || fail "a thread wedged at seq 1 in an unwritable directory hid the peers behind it (got: $out2)"
   chmod 755 "$utd"
   pass "an unwritable directory cannot abort poll through the wedge notice either"
+  rm -rf "$BRIDGER_ROOT"
+)
+fi
+
+# --- …and when the fallback cannot be written either, it must SAY so -----------
+# Only with both places unwritable is the position genuinely unrecordable, and
+# only then do the messages really repeat on every poll. That is the one state the
+# notice describes, and stderr reaches no session, so it has to be on stdout.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  nb="$work/nocursor"; mkdir -p "$nb/a" "$nb/b"
+  "$bridger" register na "$nb/a" >/dev/null
+  "$bridger" register nb "$nb/b" >/dev/null
+  (cd "$nb/a" && "$bridger" send nb chat from-na >/dev/null 2>&1)
+  ntd2="$BRIDGER_ROOT/threads/na--nb"
+  chmod 555 "$ntd2"
+  chmod 555 "$BRIDGER_ROOT"            # no cursors/ either; wedge file via TMPDIR
+  nerr="$nb/poll.err"
+  nout=$(cd "$nb/b" && "$bridger" poll 2>"$nerr" || true)
+  chmod 755 "$BRIDGER_ROOT" "$ntd2"
+  grep -q "not writable" <<<"$nout" \
+    || fail "a position that could not be recorded anywhere said nothing on stdout (got: $nout)"
+  grep -q "cannot record the read position" "$nerr" \
+    || fail "a cursor that could not be written was not reported (stderr: $(cat "$nerr"))"
+  # The raw shell diagnostic is not a diagnostic: it names a line number in
+  # bin/bridger and says nothing about the bus.
+  grep -q "Permission denied" "$nerr" \
+    && fail "poll leaked a raw shell redirection error at the user (stderr: $(cat "$nerr"))"
+  pass "a read position that cannot be recorded anywhere is announced, not leaked"
   rm -rf "$BRIDGER_ROOT"
 )
 fi

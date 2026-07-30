@@ -293,9 +293,15 @@ def read_threads(root, warnings):
             continue
         left, right = names
         messages = _read_messages(directory, pair, warnings)
+        # Two places, highest wins — exactly as unread_in_thread reads it. A
+        # thread directory that cannot be written keeps its cursor under the bus
+        # root instead (bin/bridger advance_cursor), and reading only the primary
+        # would report a whole delivered backlog as queued for a session the CLI
+        # has already handed it to.
         cursors = {
-            left: read_int(os.path.join(directory, "cursor-" + left)),
-            right: read_int(os.path.join(directory, "cursor-" + right)),
+            name: max(read_int(os.path.join(directory, "cursor-" + name)),
+                      read_int(os.path.join(root, "cursors", pair + "--" + name)))
+            for name in (left, right)
         }
         undelivered = {left: 0, right: 0}
         for message in messages:
@@ -791,6 +797,20 @@ def selftest():
     with open(os.path.join(dashed, "cursor-ab-"), "w") as handle:
         handle.write("1\n")
 
+    # A thread directory that could not be written keeps its cursor under the bus
+    # root instead (bin/bridger advance_cursor). Its message is delivered; a
+    # reader that only looks in the thread directory calls it queued forever.
+    # Dated out of both activity windows so the metrics below stay about them.
+    fallback_pair = "roa--rob"
+    fallback_dir = os.path.join(root, "threads", fallback_pair)
+    os.makedirs(fallback_dir)
+    with open(os.path.join(fallback_dir, "00001.json"), "w") as handle:
+        json.dump({"seq": 1, "from": "roa", "to": "rob", "type": "chat",
+                   "body": "hi", "ts": "2020-01-01T00:00:00Z"}, handle)
+    os.makedirs(os.path.join(root, "cursors"), exist_ok=True)
+    with open(os.path.join(root, "cursors", fallback_pair + "--rob"), "w") as handle:
+        handle.write("1\n")
+
     state = snapshot(root, now=now)
     by_name = {peer["name"]: peer for peer in state["peers"]}
     assert by_name["alpha"]["status"] == "listening", by_name["alpha"]
@@ -896,6 +916,10 @@ def selftest():
     # skipped — not resolved to the first split, which puts a name `register` can
     # never issue on one side, whose cursor lookup therefore always misses and
     # whose every message reads as permanently queued.
+    fallback_thread = next(t for t in state["threads"] if t["id"] == "roa--rob")
+    assert fallback_thread["messages"][0]["delivered"] is True, fallback_thread
+    assert fallback_thread["queued"] == 0, fallback_thread
+
     ambiguous = []
     assert _split_pair("a--b--c", ambiguous) is None, ambiguous
     assert any("not a <a>--<b> pair" in w for w in ambiguous), ambiguous

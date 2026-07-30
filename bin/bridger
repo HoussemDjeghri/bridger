@@ -345,7 +345,7 @@ sorted_stems() { # thread_dir
 # from two different instants would let a message that lands in between be
 # marked read without ever being delivered.
 unread_in_thread() {
-  local dir="$1" me="$2" top="$3" cur=0 f s rc stem out batch_ok=1
+  local dir="$1" me="$2" top="$3" cur=0 alt=0 f s rc stem out batch_ok=1
   local -a batch; batch=()
   [ -f "$dir/cursor-$me" ] && cur=$(cat "$dir/cursor-$me")
   # A cursor read as empty or junk must mean "read nothing yet", never "read
@@ -353,6 +353,16 @@ unread_in_thread() {
   # can catch it empty, and `[ "$s" -gt "" ]` would then skip every message and
   # still move the cursor to the top — silent, permanent, unrecoverable loss.
   case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+  # The second place a position can live — see advance_cursor. Whichever is
+  # higher wins: a cursor only ever moves forward, so the max is always the right
+  # answer and neither file can drag the other backwards. No fork on the common
+  # path; the test is a builtin and the file exists only for a thread whose own
+  # directory could not be written.
+  if [ -f "$BRIDGER_ROOT/cursors/${dir##*/}--$me" ]; then
+    alt=$(cat "$BRIDGER_ROOT/cursors/${dir##*/}--$me")
+    case "$alt" in ''|*[!0-9]*) alt=0 ;; esac
+    [ "$alt" -le "$cur" ] || cur=$alt
+  fi
   # Collect the unread run first, decide it second. Selecting inside this loop
   # cost one jq per UNREAD message (~3.6ms), and `poll --peek` pays that on every
   # delivery-hook call without ever consuming anything — so past ~1400 unread the
@@ -472,16 +482,26 @@ advance_cursor() { # thread_dir me top
   # command's own `2>` is applied: `echo … > file 2>/dev/null` still leaks a raw
   # `bin/bridger: line N: …: Permission denied` at the user.
   { echo "$3" > "$1/cursor-$2"; } 2>/dev/null && return 0
+  # Second place to record it: under the bus root, which is provably writable on
+  # this path — a consuming poll only reaches advance_cursor because mktemp
+  # created .wedge.XXXXXX in that root. An unwritable thread directory is
+  # permanent by construction (a read-only mount, a bus restored without write
+  # bits, a root shared between two uids), so with only one place to write, the
+  # whole backlog repeated on every poll — 1.8 ticks/s under a watcher, 622k
+  # agent-facing lines a day, every one of them re-invoking the session. Nothing
+  # is lost either way; this is the difference between delivering the mail once
+  # and delivering it forever.
+  mkdir -p "$BRIDGER_ROOT/cursors" 2>/dev/null || true
+  { echo "$3" > "$BRIDGER_ROOT/cursors/${1##*/}--$2"; } 2>/dev/null && return 0
   echo "bridger: cannot record the read position in $1 — its messages will repeat until it is writable" >&2
   return 1
 }
 
 # Same reason the wedge notice exists: stderr reaches no session, so a permanent
-# fault has to be said on stdout or no agent can act on it. Unlike the wedge
-# notice this one cannot be de-duplicated — the marker that would do it lives in
-# the directory we just failed to write — so it repeats at the caller's poll
-# rate, as do the messages themselves, there being nowhere to record that they
-# were delivered.
+# fault has to be said on stdout or no agent can act on it. This one fires only
+# when advance_cursor could not record the position in EITHER place, which is the
+# one state where the messages really do repeat on every poll — and it repeats
+# with them, there being nowhere left to record that it was said.
 unwritable_thread_notice() { # peer thread_dir json
   [ "$3" -eq 0 ] || return 0   # --json is a parsed stream: `ask` drains it
   echo "bridger: the thread with $1 is not writable, so its messages will repeat on every poll until that is fixed: $2"
