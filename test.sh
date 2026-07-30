@@ -1647,8 +1647,91 @@ fi
   grep -q 'body-100000' <<<"$(sed -n 1p <<<"$rest")" \
     || fail "six-digit seqs deliver out of send order (got: $rest)"
   pass "a six-digit seq breaks neither delivery order nor the wedge bound"
+
+  # The invariant is not "advance below the wedge", it is "one file per seq,
+  # visited in that seq's order" — and sorting the stem STRINGS gave neither.
+  # `$((10#$stem))` is int64, so a 19+ digit stem wraps to a number with no
+  # relation to the sort key: the scan delivered 1..N, then met the fault and
+  # reported a wedge BELOW everything it had just sent, where `wedge - 1` is 0 and
+  # the cursor is never written — the duplicate-delivery storm, restored, at ~1.8
+  # deliveries per message per second. `00007.json` beside `7.json` is the same
+  # break without any overflow.
   rm -rf "$BRIDGER_ROOT"
 )
+
+# Each shape needs its own bus: a cursor left past these seqs by an earlier
+# fixture would skip them and the assertion would pass vacuously.
+if [ "$(id -u)" -ne 0 ]; then
+for shape in overflow duplicate; do
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  dp="$work/dup-$shape"; mkdir -p "$dp/a" "$dp/b"
+  "$bridger" register psend "$dp/a" >/dev/null
+  "$bridger" register precv "$dp/b" >/dev/null
+  ptd="$BRIDGER_ROOT/threads/precv--psend"; mkdir -p "$ptd"
+  for s in 1 2 3; do
+    jq -n --argjson s "$s" \
+      '{seq:$s,from:"psend",to:"precv",type:"chat",
+        body:("dup-"+($s|tostring)),ts:"2026-01-01T00:00:00Z"}' > "$ptd/0000$s.json"
+  done
+  if [ "$shape" = overflow ]; then
+    # 19+ digits: `$((10#…))` wraps to 1 while `sort -n` puts the stem LAST.
+    cp "$ptd/00001.json" "$ptd/18446744073709551617.json"
+    faulty="$ptd/18446744073709551617.json"; marker=dup-1
+  else
+    # Two files at one seq: the scan emitted the padded one, then wedged on the
+    # bare one at the SAME seq, so `wedge - 1` sat below what it had just sent.
+    cp "$ptd/00003.json" "$ptd/3.json"
+    faulty="$ptd/3.json"; marker=dup-3
+  fi
+  chmod 000 "$faulty"
+
+  first=$(cd "$dp/b" && "$bridger" poll 2>/dev/null || true)
+  grep -q "$marker" <<<"$first" \
+    || fail "$shape: the message before the fault was never delivered (got: $first)"
+  second=$(cd "$dp/b" && "$bridger" poll 2>/dev/null || true)
+  grep -q "$marker" <<<"$second" \
+    && fail "$shape: a delivered message is re-delivered on every poll — the storm is back (got: $second)"
+  chmod 644 "$faulty"
+  pass "no filename shape ($shape) makes a wedge repeat what it already delivered"
+  rm -rf "$BRIDGER_ROOT"
+)
+done
+fi
+
+# --- a read-only bus ROOT must not silently reinstate the storm ---------------
+# Making the wedge scratch file optional (so a read-only root stays readable) also
+# turned "I could not learn the wedge seq" into "there was no wedge" on a
+# CONSUMING poll: it skipped both the advance and the notice, so a cursor the
+# thread directory would have accepted never moved and the fault was reported on
+# stderr alone — which reaches no session.
+if [ "$(id -u)" -ne 0 ]; then
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  rr="$work/roroot"; mkdir -p "$rr/a" "$rr/b"
+  "$bridger" register rrsend "$rr/a" >/dev/null
+  "$bridger" register rrrecv "$rr/b" >/dev/null
+  rtd="$BRIDGER_ROOT/threads/rrrecv--rrsend"
+  mkdir -p "$rtd"
+  for s in 1 2 3 4; do
+    jq -n --argjson s "$s" \
+      '{seq:$s,from:"rrsend",to:"rrrecv",type:"chat",
+        body:("r"+($s|tostring)),ts:"2026-01-01T00:00:00Z"}' > "$rtd/0000$s.json"
+  done
+  echo 1 > "$rtd/cursor-rrrecv"          # #1 already read
+  mkdir "$rtd/00003x"; rm -rf "$rtd/00003x"
+  chmod 000 "$rtd/00003.json"            # a genuine wedge at seq 3
+  chmod a-w "$BRIDGER_ROOT"              # the ROOT only; the thread dir stays 755
+  out=$(cd "$rr/b" && "$bridger" poll 2>/dev/null || true)
+  chmod u+w "$BRIDGER_ROOT"; chmod 644 "$rtd/00003.json"
+  grep -q 'stuck' <<<"$out" \
+    || fail "a read-only bus root hid a wedge from the only channel an agent reads (got: $out)"
+  [ "$(cat "$rtd/cursor-rrrecv")" -eq 2 ] \
+    || fail "a read-only bus root blocked an advance the thread directory would have accepted"
+  pass "a read-only bus root neither hides a wedge nor blocks a cursor the thread accepts"
+  rm -rf "$BRIDGER_ROOT"
+)
+fi
 
 # --- an unwritable thread must not hide every peer behind it ------------------
 # All the hardening above is about a message that cannot be READ. Nothing

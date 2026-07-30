@@ -296,6 +296,10 @@ max_seq() {
     # and `send` does three of them, so building a backlog was quadratic.
     stem=${f##*/}; stem=${stem%.json}
     case "$stem" in ''|*[!0-9]*) continue ;; esac
+    # 19+ digits overflows $((10#…)) to a wrapped, meaningless value — which as a
+    # `top` bound also set the cursor to it. Out of range is not a message; the
+    # scan in sorted_stems applies the identical bound so the two agree.
+    case "$stem" in ??????????????????*) continue ;; esac   # SEQ_MAX_DIGITS = 18
     s=$((10#$stem))
     [ "$s" -gt "$max" ] && max=$s
   done
@@ -310,16 +314,29 @@ max_seq() {
 # scan emitted sorts below the message it stopped at. Out of order, a scan that
 # met an unreadable 100000 first reported a wedge above 99998 and 99999, and
 # poll then marked both read without ever delivering them.
-# One `sort` per scan, not per message — 46e10c8 removed the per-message fork
-# because a send into a long thread was quadratic; keep it that way.
+# Two properties, not one, because poll advances to `wedge - 1`: the scan must
+# visit messages in ascending order OF THE SEQ IT ACTS ON, and see one file per
+# seq. Sorting the stem STRINGS gave neither. `$((10#$stem))` is int64, so a stem
+# wider than 18 digits wraps to a value with no relation to the sort key — a
+# 2^64+1 stem evaluates to 1 while sorting last, so the scan emitted 1..5 and then
+# reported a wedge of 1, below everything it had just delivered, and `wedge - 1`
+# being 0 meant the cursor was never written at all: measured at 1.8 duplicate
+# deliveries per message per second, forever, each line re-invoking the agent.
+# And `00007.json` beside `7.json` are two files at one seq, where wedging on the
+# second repeats the first for good. So sort on the number, drop the duplicates,
+# and skip what cannot be evaluated — max_seq applies the same width bound, so
+# such a file is outside `top` and cannot be marked read either.
+# One `sort` and one `awk` per scan, none per message — 46e10c8 removed the
+# per-message fork because a send into a long thread was quadratic; keep it that way.
 sorted_stems() { # thread_dir
   local f stem
   for f in "$1"/[0-9]*.json; do
     [ -e "$f" ] || continue
     stem=${f##*/}; stem=${stem%.json}
     case "$stem" in ''|*[!0-9]*) continue ;; esac   # see max_seq: not a message
-    echo "$stem"
-  done | sort -n
+    case "$stem" in ??????????????????*) continue ;; esac   # see SEQ_MAX_DIGITS
+    printf '%s %s\n' "$((10#$stem))" "$stem"
+  done | sort -n -k1,1 | awk '$1 != seen { seen = $1; print $2 }'
 }
 
 # Print unread messages addressed to $2 in thread $1, one compact JSON per
@@ -1146,8 +1163,13 @@ cmd_poll() {
   # hook runs, and a pure reader must not be stopped by a permission it does not
   # need. Without the file a wedge simply cannot advance, which is the same thing
   # a read-only root already enforces.
+  # TMPDIR as the FALLBACK, not the dependency: a root that cannot be written but
+  # a thread directory that can is a cursor this poll could legitimately advance,
+  # and losing the scratch file silently turned "I could not learn the wedge seq"
+  # into "there was no wedge" — no advance, no notice, storm restored.
   [ "$peek" -eq 1 ] \
-    || BRIDGER_WEDGE_FILE=$(mktemp "$BRIDGER_ROOT/.wedge.XXXXXX" 2>/dev/null || true)
+    || BRIDGER_WEDGE_FILE=$(mktemp "$BRIDGER_ROOT/.wedge.XXXXXX" 2>/dev/null \
+      || mktemp "${TMPDIR:-/tmp}/bridger-wedge.XXXXXX" 2>/dev/null || true)
   trap 'if [ -n "$BRIDGER_WEDGE_FILE" ]; then rm -f "$BRIDGER_WEDGE_FILE"; fi' RETURN
   for peer in $(other_peers "$me"); do
     dir=$(thread_dir "$me" "$peer")
@@ -1176,7 +1198,15 @@ cmd_poll() {
     if [ "$rc" -ne 0 ]; then
       failed=1
       wedge=$(cat "$BRIDGER_WEDGE_FILE" 2>/dev/null || true)
-      case "$wedge" in ''|*[!0-9]*) continue ;; esac
+      case "$wedge" in ''|*[!0-9]*)
+        # Nothing was recorded, or there was nowhere to record it. Either way we
+        # do not know how far we may advance, so advance nothing — but this thread
+        # IS stuck, and stderr reaches no session, so it cannot pass in silence.
+        if [ "$peek" -eq 0 ] && [ "$json" -eq 0 ]; then
+          echo "bridger: the thread with $peer is stuck and will deliver nothing further until $dir can be read and $BRIDGER_ROOT can be written."
+        fi
+        continue ;;
+      esac
       # Advance to just BEFORE the message that could not be read. Refusing to
       # advance at all was the first version of this fix, and it was its own
       # bug: everything before the fault was re-delivered on every 0.5s watcher
