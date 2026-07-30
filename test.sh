@@ -1544,6 +1544,38 @@ if [ "$(id -u)" -ne 0 ]; then
 )
 fi
 
+# --- no peer record may ever be written without a directory ------------------
+# `derive_and_register` refreshed a record by re-reading its own cwd in ARGUMENT
+# position, where a failure is invisible to errexit and expands to "". A record
+# deleted between resolve_identity's read and that one therefore came back with
+# cwd:"" — and identity is resolved with `case "$PWD" in "$cwd"|"$cwd"/*)`, so an
+# empty cwd makes the second pattern a bare `/*`: one peer that answers to every
+# directory on the machine, quietly collecting other directories' mail. The race
+# is timing-dependent; the invariant at the sink is not.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  nd="$work/nodir"; mkdir -p "$nd/wp"
+  # (`register <name> ""` is NOT this case: an empty dir argument falls back to
+  # $PWD by design, which is a real directory.)
+  "$bridger" register wp "$nd/wp" >/dev/null
+  mkdir -p "$nd/elsewhere"
+  # The record such a refresh produced. Four readers accepted it, and every one of
+  # them then matched `case "$PWD" in ""|""/*)` — a bare `/*`.
+  jq '.cwd = ""' "$BRIDGER_ROOT/peers/wp.json" > "$nd/tmp.json"
+  mv "$nd/tmp.json" "$BRIDGER_ROOT/peers/wp.json"
+  [ -z "$(cd "$nd/elsewhere" && "$bridger" whoami 2>/dev/null || true)" ] \
+    || fail "a peer record with an empty cwd answered for an unrelated directory"
+  # And it must not be refreshed back into existence with that cwd either.
+  (cd "$nd/wp" && CLAUDE_BRIDGER_AUTO=1 "$bridger" autoregister >/dev/null 2>&1) || true
+  for f in "$BRIDGER_ROOT"/peers/*.json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r '.cwd // ""' "$f")" = "" ] && [ "$(basename "$f")" != "wp.json" ] \
+      && fail "peer record $f was written with no cwd — it answers for every directory"
+  done
+  pass "a peer record with no directory addresses nothing"
+  rm -rf "$BRIDGER_ROOT"
+)
+
 # --- a record write that CANNOT succeed must fail, not spin forever ----------
 # peer_lock's only exit was a successful `mkdir`, and `2>/dev/null` made "someone
 # holds it" and "this can never succeed" (a full disk, a peers/ without write

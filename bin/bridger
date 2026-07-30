@@ -103,7 +103,14 @@ beat_file() { echo "$BRIDGER_ROOT/peers/$1.beat"; }
 # string path — unreadable, absent, null, or a hand-written list/number all
 # answer "no path here". None of those are evidence that a directory is GONE,
 # and `reap --force` deletes registrations on that answer.
-peer_cwd() { jq -er 'if (.cwd | type) == "string" then .cwd else empty end' "$(peer_file "$1")" 2>/dev/null; }
+# What counts as a peer's address, in one place — four readers had their own copy
+# of this expression and all four accepted an EMPTY string. That is not a harmless
+# blank: identity is resolved with `case "$PWD" in "$cwd"|"$cwd"/*)`, so an empty
+# cwd makes the second pattern a bare `/*` — one record that answers for every
+# directory on the machine and quietly collects other directories' mail. A record
+# without a usable address must not resolve at all.
+CWD_FILTER='if (.cwd | type) == "string" and (.cwd | length) > 0 then .cwd else empty end'
+peer_cwd() { jq -er "$CWD_FILTER" "$(peer_file "$1")" 2>/dev/null; }
 
 # Absence is only evidence when we could actually look. `[ ! -d ]` is also false
 # when a parent turned untraversable (chmod, a revoked mount), and a session may
@@ -532,7 +539,7 @@ resolve_identity() {
     # — skip it quietly rather than leaking three raw jq errors per record on
     # every single command.
     name=$(basename "$f" .json)
-    cwd=$(jq -er 'if (.cwd | type) == "string" then .cwd else empty end' "$f" 2>/dev/null) || continue
+    cwd=$(jq -er "$CWD_FILTER" "$f" 2>/dev/null) || continue
     sess=$(jq -r '.session // ""' "$f" 2>/dev/null || echo "")
     case "$PWD" in
       "$cwd"|"$cwd"/*)
@@ -561,7 +568,7 @@ resolve_my_identity() {
     sess=$(jq -r '.session // ""' "$f" 2>/dev/null || echo "")
     [ "$sess" = "$sid" ] || continue
     name=$(basename "$f" .json)
-    cwd=$(jq -er 'if (.cwd | type) == "string" then .cwd else empty end' "$f" 2>/dev/null) || continue
+    cwd=$(jq -er "$CWD_FILTER" "$f" 2>/dev/null) || continue
     case "$PWD" in
       "$cwd"|"$cwd"/*)
         if [ "${#cwd}" -gt "$bestlen" ]; then best=$name; bestlen=${#cwd}; fi ;;
@@ -650,6 +657,10 @@ drop_peer() { # name
 # also the transcript filename, so a peer can be traced back to its session.
 write_peer() { # name dir
   local name="$1" dir="$2" summary="" created session="${BRIDGER_SESSION_ID:-}"
+  # The sink refuses too, because every caller that lost its directory produced
+  # the same record: identity matches on `case "$PWD" in "$cwd"|"$cwd"/*)`, so an
+  # empty cwd is a peer that answers to every directory on the machine.
+  [ -n "$dir" ] || die "refusing to register '$name' with no directory"
   created=$(now_utc)
   mkdir -p "$BRIDGER_ROOT/peers"
   # This whole function is one read-modify-write on a peer record: it reads
@@ -817,11 +828,21 @@ cmd_join() {
 # per DIRECTORY and persisted, never per session: a per-session name would die
 # with the session, and queued delivery needs an address that outlives it.
 derive_and_register() { # dir [tagged]
-  local dir="$1" existing base name n=2
+  local dir="$1" existing base name cwd n=2
   existing=$(PWD="$dir" resolve_identity) || true
   if [ -n "${existing:-}" ]; then
     # Refresh branch/last_seen — the identity itself stays put.
-    write_peer "$existing" "$(jq -r .cwd "$(peer_file "$existing")")"
+    #
+    # As a COMMAND, not an argument. In argument position a failure here is
+    # discarded — neither errexit nor `|| die` can see it — so a record deleted
+    # between resolve_identity's read and this one expanded to "", and write_peer
+    # then recreated it with cwd:"". That is not a harmless blank: identity is
+    # resolved with `case "$PWD" in "$cwd"|"$cwd"/*)`, and an empty cwd makes the
+    # second pattern a bare `/*` — one record that answers to every directory on
+    # the machine. resolve_identity keeps scanning after it matches, so the window
+    # is milliseconds on a large bus, not microseconds.
+    cwd=$(peer_cwd "$existing") || { echo "$existing"; return 0; }   # gone: nothing to refresh
+    write_peer "$existing" "$cwd"
     echo "$existing"
     return 0
   fi
@@ -851,11 +872,14 @@ derive_and_register() { # dir [tagged]
 # joined). Set CLAUDE_BRIDGER_AUTO=1 to let every session join on its own —
 # peers-style discovery for people who want a machine-wide mesh.
 cmd_autoregister() {
-  local dir="${1:-$PWD}" existing name
+  local dir="${1:-$PWD}" existing name cwd
   dir=$(cd "$dir" && pwd)
   existing=$(PWD="$dir" resolve_identity) || true
   if [ -n "${existing:-}" ]; then
-    write_peer "$existing" "$(jq -r .cwd "$(peer_file "$existing")")"
+    # See derive_and_register: read the cwd as a command, or a record that
+    # vanishes mid-refresh comes back matching every directory on the machine.
+    cwd=$(peer_cwd "$existing") || { echo "$existing"; return 0; }
+    write_peer "$existing" "$cwd"
     statusline_write "$existing"
     echo "$existing"
     return 0
@@ -924,7 +948,7 @@ cmd_peers() {
     # and deliver.sh/stop.sh both do `peers || exit 0`, so one truncated record
     # silenced unread reports for every session on the machine. The type check
     # keeps a list/number cwd from printing across three lines.
-    cwd=$(jq -er 'if (.cwd | type) == "string" then .cwd else empty end' "$f" 2>/dev/null) \
+    cwd=$(jq -er "$CWD_FILTER" "$f" 2>/dev/null) \
       || { echo "bridger: peer '$name' has no readable directory in its record" >&2; cwd=""; }
     repo=$(jq -r '.repo // ""' "$f" 2>/dev/null || echo "")
     branch=$(jq -r '.branch // ""' "$f" 2>/dev/null || echo "")
