@@ -789,7 +789,18 @@ cmd_register() {
     # session id — a plain shell, a script, a cron job, any wrapper that does not
     # export one — is exactly the caller that must not be able to override a
     # watcher that is demonstrably running.
-    if [ -n "$holder" ] && [ "$holder" != "$sid" ] && [ "$status" = "listening" ]; then
+    #
+    # Keyed on the PID, not on `listening`, because `listening` also requires a
+    # beat younger than BEAT_STALE_SECS and the holder goes stale by being BUSY:
+    # a watcher mid-poll read [queued] for the duration, and a second session in
+    # the same directory took its name and its read cursor inside that window
+    # while it kept consuming the mail. The pid is the fact this refusal needs
+    # and it is on disk the whole time. `beat_pid_alive`, not `watcher_alive`:
+    # the latter answers "alive" when it cannot tell, which is right for a
+    # status readout and wrong here — it would make a peer that never armed a
+    # watcher unreclaimable forever.
+    if [ -n "$holder" ] && [ "$holder" != "$sid" ] \
+       && { [ "$status" = "listening" ] || beat_pid_alive "$(beat_file "$name")"; }; then
       die "'$name' is held by a live session — stop it or pick another name"
     fi
 
@@ -1205,6 +1216,17 @@ cmd_poll() {
       || mktemp "${TMPDIR:-/tmp}/bridger-wedge.XXXXXX" 2>/dev/null || true)
   trap 'if [ -n "$BRIDGER_WEDGE_FILE" ]; then rm -f "$BRIDGER_WEDGE_FILE"; fi' RETURN
   for peer in $(other_peers "$me"); do
+    # Keep the watcher's heartbeat fresh WHILE it polls. The loop in cmd_wait
+    # beats once per cycle, outside this call, so a poll longer than
+    # BEAT_STALE_SECS made a running watcher read [queued]: senders were told it
+    # is not listening, the badge flipped, and a second session in its directory
+    # could take its name and its cursor. Only the watcher sets this — a plain
+    # `bridger poll` that wrote a beat would make a session with NO watcher read
+    # [listening], which is the same lie pointed the other way. If the write
+    # fails mid-poll the next cmd_wait cycle writes the beat as a bare
+    # redirection and stops the watcher loudly, so nothing is swallowed for
+    # longer than one poll.
+    if [ -n "${BRIDGER_BEAT_KEEP:-}" ]; then echo $$ > "$(beat_file "$me")"; fi
     dir=$(thread_dir "$me" "$peer")
     [ -d "$dir" ] || continue
     top=$(max_seq "$dir")
@@ -1307,6 +1329,10 @@ cmd_wait() {
     for sig in HUP QUIT PIPE USR1 USR2; do
       trap "watcher_log \"\$me\" signal=$sig; trap - $sig; kill -s $sig \$\$" "$sig"
     done
+    # Dynamically scoped on purpose, exactly as BRIDGER_WEDGE_FILE is: cmd_poll
+    # reads it to keep this beat fresh across a long poll, and it does not leak
+    # to a plain CLI poll, which must never claim a watcher this session lacks.
+    local BRIDGER_BEAT_KEEP=1
     while :; do
       echo $$ > "$(beat_file "$me")"   # pid + mtime: who is listening, and since when
       # `|| return 1` is load-bearing, not defensive. unread_in_thread refuses to

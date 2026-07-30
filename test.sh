@@ -293,6 +293,50 @@ kill "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true
   || fail "takeover must bind the name to the reclaiming session"
 pass "same name: live holder refused, dead holder taken over"
 
+# --- a BUSY watcher keeps its name: pid liveness, not heartbeat freshness -----
+# The watcher refreshes its beat once per loop, outside the poll, so a poll that
+# runs longer than BEAT_STALE_SECS makes a demonstrably running watcher read
+# [queued] — and a second session in the same directory then takes its name and
+# its read cursor, which is the exact outcome cmd_register's refusal exists to
+# prevent. The pid in the beat file is the fact that decides it, and it is on
+# disk the whole time.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  bw=$(mktemp -d); mkdir -p "$bw/busy" "$bw/other"
+  beat="$BRIDGER_ROOT/peers/busy.beat"
+  (cd "$bw/busy" && BRIDGER_SESSION_ID=s-first "$bridger" register busy >/dev/null)
+  (cd "$bw/other" && BRIDGER_SESSION_ID=s-other "$bridger" register other >/dev/null)
+
+  # A live pid behind a stale beat is what a watcher looks like mid-poll, without
+  # having to build a poll that really takes BEAT_STALE_SECS.
+  sleep 30 & alive=$!
+  echo "$alive" > "$beat"
+  touch -t 202001010000 "$beat"
+  err=$( (cd "$bw/busy" && BRIDGER_SESSION_ID=s-second "$bridger" register busy) 2>&1 || true )
+  grep -q 'held by a live session' <<<"$err" \
+    || fail "a second session took the name of a watcher whose process is still running (got: $err)"
+  [ "$(jq -r .session "$BRIDGER_ROOT/peers/busy.json")" = "s-first" ] \
+    || fail "the refused register rewrote the record anyway"
+  kill "$alive" 2>/dev/null || true; wait "$alive" 2>/dev/null || true
+  pass "a watcher whose process is alive keeps its name through a stale beat"
+
+  # The other half: the beat must be refreshed DURING a poll, and only for the
+  # watcher. A beat written by a plain CLI poll makes a session with no watcher
+  # read [listening], and then every sender is told it is live. Absolute mtimes,
+  # so neither half can turn on how fast the machine is.
+  (cd "$bw/other" && BRIDGER_SESSION_ID=s-other "$bridger" send busy chat hi >/dev/null 2>&1)
+  touch -t 202001010000 "$beat"; touch -t 202001010001 "$bw/mark"
+  (cd "$bw/busy" && BRIDGER_SESSION_ID=s-first "$bridger" poll --peek) >/dev/null 2>&1 || true
+  if [ "$beat" -nt "$bw/mark" ]; then
+    fail "a plain poll refreshed the heartbeat — a session with no watcher will read [listening]"
+  fi
+  (cd "$bw/busy" && BRIDGER_BEAT_KEEP=1 BRIDGER_SESSION_ID=s-first "$bridger" poll --peek) >/dev/null 2>&1 || true
+  [ "$beat" -nt "$bw/mark" ] \
+    || fail "the watcher's poll did not refresh the heartbeat — a long poll still starves it"
+  pass "the beat is kept fresh across a poll, and only for the watcher"
+  rm -rf "$BRIDGER_ROOT" "$bw"
+)
+
 # --- a register that is REFUSED must not have destroyed anything first -------
 # The rename block ran before the refusal, so a register that was going to be
 # rejected had already `rm -f`'d the caller's own peer record: the session ended
