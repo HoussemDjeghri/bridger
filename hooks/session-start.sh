@@ -32,6 +32,35 @@ me=$(cd "$cwd" && "$bridger" autoregister 2>/dev/null) || me=""
 #      statusLine (a foreign statusline setup repointed settings.json — the one
 #      collision the drop-in dir cannot prevent) re-offers to re-wire, once per
 #      wired→unwired transition, never as a nag.
+# Put the CLI on $PATH, so `bridger peers` and `bridger monitor` work in a plain
+# terminal instead of only through a Claude Code session. The plugin installs to
+# a VERSIONED directory (.../bridger/0.16.0/bin/bridger), so the link is
+# repointed whenever it disagrees rather than written once — that is what carries
+# it across an update, and it is why bin/bridger resolves its own ROOT through
+# symlinks.
+#
+# Never over a regular file: that is someone else's `bridger` on the PATH, or a
+# hand-written wrapper, and replacing it silently is not this hook's business.
+# Every write is allowed to fail, like the badge below — PATH bookkeeping does
+# not outrank the mail.
+cli_link="$HOME/.local/bin/bridger"
+if { [ ! -e "$cli_link" ] || [ -L "$cli_link" ]; } \
+   && [ "$(readlink "$cli_link" 2>/dev/null || true)" != "$bridger" ]; then
+  mkdir -p "$HOME/.local/bin" 2>/dev/null || true
+  ln -sfn "$bridger" "$cli_link" 2>/dev/null || true
+  # Said once, and only when there is something for the user to do: a hook's
+  # PATH is not the user's interactive PATH, so this is a hint, not a verdict —
+  # which is exactly why it must not repeat.
+  case ":${PATH:-}:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) if [ -L "$cli_link" ] && [ ! -f "$BRIDGER_ROOT/cli_path_noted" ]; then
+         echo "bridger: linked the CLI at $cli_link so it can be run from a terminal, but ~/.local/bin is not on this hook's PATH. If 'bridger' is not found in the user's shell, tell them once to add ~/.local/bin to PATH."
+         mkdir -p "$BRIDGER_ROOT" 2>/dev/null || true
+         { : > "$BRIDGER_ROOT/cli_path_noted"; } 2>/dev/null || true
+       fi ;;
+  esac
+fi
+
 badge="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/bridger-statusline.sh"
 # Every write here is allowed to fail. A root that cannot be written (owned by
 # another uid, a restored archive, a full disk) used to kill this hook under

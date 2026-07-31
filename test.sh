@@ -1966,6 +1966,7 @@ if [ "$(id -u)" -ne 0 ]; then
   BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
   ss=$(mktemp -d); mkdir -p "$ss/a" "$ss/b" "$ss/cfg"
   CLAUDE_CONFIG_DIR="$ss/cfg"; export CLAUDE_CONFIG_DIR   # never the real ~/.claude
+  HOME="$ss/home"; export HOME   # nor the real ~/.local/bin — the hook links the CLI there
   hook="$here/hooks/session-start.sh"
   (cd "$ss/a" && BRIDGER_SESSION_ID=ss-a "$bridger" register ssreader >/dev/null)
   (cd "$ss/b" && BRIDGER_SESSION_ID=ss-b "$bridger" register sswriter >/dev/null)
@@ -2000,6 +2001,7 @@ fi
   BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
   lv=$(mktemp -d); mkdir -p "$lv/a" "$lv/cfg"
   CLAUDE_CONFIG_DIR="$lv/cfg"; export CLAUDE_CONFIG_DIR   # never the real ~/.claude
+  HOME="$lv/home"; export HOME   # nor the real ~/.local/bin — the hook links the CLI there
   hook="$here/hooks/session-start.sh"
   (cd "$lv/a" && BRIDGER_SESSION_ID=lv-a "$bridger" register lvalpha >/dev/null)
   # Tab two: same directory, different session id, no identity of its own.
@@ -3172,6 +3174,68 @@ PY
   pass "monitor reads a real BRIDGER_ROOT"
 else
   pass "monitor (skipped: no python3)"
+fi
+
+# --- the CLI works through a symlink on $PATH ---------------------------------
+# Putting bridger on $PATH is `ln -s .../bin/bridger ~/.local/bin/bridger`, and
+# ROOT off the raw $0 became ~/.local: `monitor` looked for ~/.local/monitor/
+# server.py, `statusline` for a badge that was never installed. Nothing else in
+# this suite catches it — every other command works fine with a wrong ROOT, so
+# the failure only ever showed up on the two that read a shipped file.
+#
+# Two hops, one of them relative, because a link chain is the normal shape of
+# this (a versioned install directory linked to a stable name, linked onto PATH)
+# and a relative link resolves against its own directory, not the caller's cwd.
+# --- session-start puts the CLI on $PATH, and keeps it pointed at this version -
+# The plugin installs to a versioned directory, so a link written once dies at
+# the next update — it is repointed on every start instead. And it is a symlink
+# or nothing: a regular file at that path is another `bridger` on the user's PATH
+# (or their own wrapper), and a hook that silently replaced it would be taking
+# over a name it does not own.
+(
+  BRIDGER_ROOT=$(mktemp -d); export BRIDGER_ROOT
+  cl=$(mktemp -d); mkdir -p "$cl/a" "$cl/cfg" "$cl/home"
+  CLAUDE_CONFIG_DIR="$cl/cfg"; export CLAUDE_CONFIG_DIR
+  HOME="$cl/home"; export HOME
+  hook="$here/hooks/session-start.sh"
+  payload='{"hook_event_name":"SessionStart","cwd":"'"$cl/a"'","session_id":"cl-a"}'
+  link="$cl/home/.local/bin/bridger"
+
+  printf '%s' "$payload" | bash "$hook" >/dev/null || fail "session-start exited nonzero"
+  [ -L "$link" ] || fail "session-start did not link the CLI onto ~/.local/bin"
+  [ "$(readlink "$link")" = "$here/bin/bridger" ] \
+    || fail "the CLI link points at $(readlink "$link"), not this plugin's binary"
+
+  # An update moved the plugin: the stale link must follow it, not be left behind.
+  ln -sfn "$cl/home/nowhere/bin/bridger" "$link"
+  printf '%s' "$payload" | bash "$hook" >/dev/null || fail "session-start exited nonzero on a stale link"
+  [ "$(readlink "$link")" = "$here/bin/bridger" ] \
+    || fail "a link left by an older plugin version was not repointed (still $(readlink "$link"))"
+
+  # Someone else's binary at that path. Untouched, and the hook still delivers.
+  rm -f "$link"; printf '#!/bin/sh\necho not-ours\n' > "$link"; chmod +x "$link"
+  printf '%s' "$payload" | bash "$hook" >/dev/null || fail "session-start exited nonzero over a foreign CLI"
+  grep -q 'not-ours' "$link" || fail "session-start clobbered a regular file it does not own"
+  rm -rf "$BRIDGER_ROOT" "$cl"
+)
+pass "session-start links the CLI onto PATH, repoints it on update, never clobbers"
+
+if command -v python3 >/dev/null 2>&1; then
+  (
+    ln_dir=$(mktemp -d)
+    ln -s "$bridger" "$ln_dir/bridger-real"
+    ln -s "bridger-real" "$ln_dir/bridger"
+    # `cd /` so a ROOT that silently fell back to a relative path cannot be
+    # rescued by the suite happening to run from the repo.
+    out=$( (cd / && "$ln_dir/bridger" monitor --help) 2>&1 ) \
+      || fail "bridger through a symlink cannot find its own files: $out"
+    grep -q "usage: server.py" <<<"$out" \
+      || fail "symlinked bridger resolved the wrong ROOT (got: $out)"
+    rm -rf "$ln_dir"
+  )
+  pass "the CLI resolves its own directory through a symlink chain"
+else
+  pass "symlinked CLI (skipped: no python3)"
 fi
 
 echo "PASS: all bridger self-checks green"

@@ -33,7 +33,25 @@ set -euo pipefail
 
 # The plugin's own directory, so the wiring command can copy the shipped badge
 # and dispatcher out to a stable location that survives plugin updates.
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+#
+# Resolved through symlinks first. Putting this CLI on $PATH is a plain
+# `ln -s .../bin/bridger ~/.local/bin/bridger`, and off the raw $0 that made ROOT
+# ~/.local — so `monitor` looked for ~/.local/monitor/server.py and `statusline`
+# for a badge that was never there, both with an error naming a path the user
+# never typed. `readlink -f` would be one line and is not portable enough: BSD
+# only grew it in macOS 12.3, and this file still runs on older ones. The hop
+# limit is the kernel's own answer to a symlink cycle — without it a loop hangs
+# the CLI with no output at all, which is worse than the bug being fixed.
+self="$0"; hops=0
+while [ -L "$self" ] && [ "$hops" -lt 40 ]; do
+  link=$(readlink "$self")
+  case "$link" in
+    /*) self="$link" ;;
+    *)  self="$(dirname "$self")/$link" ;;   # a relative link is relative to its own directory
+  esac
+  hops=$((hops + 1))
+done
+ROOT="$(cd "$(dirname "$self")/.." && pwd)"
 
 # Claude Code config dir + the statusline wiring under it. The badge is a
 # "fragment" dropped into statusline.d/, which a dispatcher (the user's
