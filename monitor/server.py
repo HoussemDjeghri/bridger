@@ -314,7 +314,14 @@ def read_peers(root, now, warnings):
                             else "missing"
                             if gone and not beat_pid_alive(beat)
                             else "queued")
-        record["last_seen_age"] = _age_of(record.get("last_seen"), now)
+        # `last_seen` is the pre-0.16 name for the same stamp, and records written
+        # by an older bridger are still on disk and still refreshed only when that
+        # peer next registers. Fall back rather than migrate: the value means
+        # exactly what the new name says, so an old record needs no rewriting, and
+        # a missing stamp yields None — which ago() renders as unknown, never as a
+        # peer that is gone.
+        record["last_registered_age"] = _age_of(
+            record.get("last_registered", record.get("last_seen")), now)
         peers.append(record)
     return peers
 
@@ -815,20 +822,27 @@ def selftest():
     # "missing", so pointing these at paths that happen not to exist would make
     # the whole fixture unreachable and the status checks below vacuous.
     worktrees = os.path.join(root, "wt")
-    for name, last_seen in (("alpha", "2026-07-26T11:59:00Z"),
-                            ("beta", "2026-07-26T11:58:00Z"),
-                            ("delta", "2026-07-26T11:57:00Z"),
-                            ("ab-", "2026-07-26T11:56:00Z"),
-                            ("abc", "2026-07-26T11:56:00Z")):
+    for name, registered in (("alpha", "2026-07-26T11:59:00Z"),
+                             ("beta", "2026-07-26T11:58:00Z"),
+                             ("delta", "2026-07-26T11:57:00Z"),
+                             ("ab-", "2026-07-26T11:56:00Z"),
+                             ("abc", "2026-07-26T11:56:00Z")):
         cwd = os.path.join(worktrees, name)
         os.makedirs(cwd)
         with open(os.path.join(peers_dir, name + ".json"), "w") as handle:
             json.dump({"name": name, "cwd": cwd, "branch": "main",
                        "summary": "", "session": name + "-sess",
-                       "created": last_seen, "last_seen": last_seen}, handle)
+                       "created": registered,
+                       "last_registered": registered}, handle)
     # A deleted worktree: the record outlives its directory. `register` refuses a
     # missing directory and identity resolves only from a real cwd, so this name
     # can never be worn again — it must not read as a merely closed session.
+    #
+    # Deliberately still on the pre-0.16 `last_seen` key: records written by an
+    # older bridger stay on disk until their session next registers, and one of
+    # them has to prove the fallback in snapshot() is wired. A record whose stamp
+    # went unread would render an ageless peer, not a wrong one — silent, and the
+    # kind of thing a rename quietly breaks.
     with open(os.path.join(peers_dir, "vanished.json"), "w") as handle:
         json.dump({"name": "vanished", "cwd": os.path.join(worktrees, "vanished"),
                    "branch": "main", "summary": "", "session": "vanished-sess",
@@ -905,6 +919,11 @@ def selftest():
     assert by_name["beta"]["status"] == "queued", by_name["beta"]
     assert by_name["delta"]["status"] == "queued", by_name["delta"]
     assert by_name["vanished"]["status"] == "missing", by_name["vanished"]
+    # Both spellings of the registration stamp reach the UI as one field. alpha
+    # carries the current key, vanished the pre-0.16 one; neither may come back
+    # None, which is what the page renders when it has no stamp at all.
+    assert by_name["alpha"]["last_registered_age"] is not None, by_name["alpha"]
+    assert by_name["vanished"]["last_registered_age"] is not None, by_name["vanished"]
     # Deleting a worktree does not kill the session inside it, and that watcher
     # keeps delivering. A stale beat naming a live pid is still a live reader, so
     # the absent directory must NOT win: this is "queued", never "missing".

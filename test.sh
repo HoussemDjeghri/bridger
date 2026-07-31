@@ -373,6 +373,55 @@ grep -q "plain \[listening\]" <<<"$(cd "$disc/plain" && "$bridger" peers --dir)"
 [ ! -e "$BRIDGER_ROOT/peers/plain.beat" ] || fail "offline must clear the heartbeat"
 pass "heartbeat: listening while watched, queued when stopped or stale"
 
+# --- the registration stamp is named for what refreshes it --------------------
+# Through 0.15.0 this field was called `last_seen`, and nothing but a
+# registration ever wrote it — not a send, not a poll, not the watcher. So a
+# session that registered at startup and then worked for hours carried a stamp
+# hours old while its watcher was beating and delivering the whole time. An agent
+# read it straight off peers/<name>.json, took "seen" at its word, and reported a
+# live peer as dead. `bridger peers` never printed the field, so the CLI had no
+# chance to contradict it. Measured before the rename: 11 minutes under an armed
+# watcher moved the stamp zero seconds while the beat advanced every cycle.
+#
+# The rename is the fix, so the record's own shape is the assertion. Liveness has
+# one source and it is the beat file (peer_status) — a second field that looked
+# like an answer is what caused this.
+plainrec="$BRIDGER_ROOT/peers/plain.json"
+jq -e 'has("last_registered")' "$plainrec" >/dev/null \
+  || fail "peer record must carry last_registered"
+jq -e 'has("last_seen") | not' "$plainrec" >/dev/null \
+  || fail "peer record must not carry last_seen: nothing refreshes it on contact, and the name says otherwise"
+stamp=$(jq -r .last_registered "$plainrec")
+[ "$stamp" != "null" ] && [ -n "$stamp" ] || fail "last_registered must be stamped at registration"
+
+# Held still by a peer that is provably listening AND has just taken delivery —
+# the exact state the misreading happened in. If someone later wires a heartbeat
+# into this field, this is where it is caught: the name would start lying again,
+# in the other direction.
+(cd "$disc/plain"; exec "$bridger" wait --follow >/dev/null 2>&1) &
+watcher=$!
+await_listening plain || fail "watcher never came up for peer plain"
+(cd "$disc/My_Service" && "$bridger" send plain chat ping) >/dev/null
+# One watcher cycle plus slack. The assertion is that a value did NOT change, so
+# a short wait can only weaken it, never flake it — and the listening check below
+# proves the watcher was running through it.
+sleep 2
+grep -q "plain \[listening\]" <<<"$(cd "$disc/plain" && "$bridger" peers --dir)" \
+  || fail "peer must still be listening for this check to mean anything"
+[ "$(jq -r .last_registered "$plainrec")" = "$stamp" ] \
+  || fail "last_registered moved on message delivery — it is the registration stamp, not an activity or liveness signal"
+kill "$watcher" 2>/dev/null || true
+wait "$watcher" 2>/dev/null || true
+
+# And it does move when the thing it is named for happens. now_utc has
+# one-second resolution, so a re-register inside the same second is legitimately
+# equal — sleep past the boundary rather than assert on a coin flip.
+sleep 1
+(cd "$disc/plain" && "$bridger" register plain) >/dev/null
+[ "$(jq -r .last_registered "$plainrec")" != "$stamp" ] \
+  || fail "last_registered must advance when the peer registers again"
+pass "last_registered stamps registration only, and says so in its name"
+
 # Re-registering must not erase the summary, and register records the session id.
 # Explicit register claims the session-less name `join` created — under the
 # per-session model a different session never adopts it implicitly.
@@ -804,7 +853,7 @@ pass "dormant name reclaimed by a new session; queued messages delivered"
   for shape in 'null' 'false' '["/tmp","/x"]' '17' '{}'; do
     jq -n --argjson c "$shape" \
       '{name:"ghost", repo:"", branch:"", summary:"", session:"long-gone",
-        created:"2026-01-01T00:00:00Z", last_seen:"2026-01-01T00:00:00Z"} + (if $c == {} then {} else {cwd:$c} end)' \
+        created:"2026-01-01T00:00:00Z", last_registered:"2026-01-01T00:00:00Z"} + (if $c == {} then {} else {cwd:$c} end)' \
       > "$BRIDGER_ROOT/peers/ghost.json"
     for d in "$gh/real" "$gh/unrelated" /tmp; do
       out=$( (cd "$d" && BRIDGER_SESSION_ID=gh-x "$bridger" dormant) 2>/dev/null || true )

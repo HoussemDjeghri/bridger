@@ -899,6 +899,16 @@ drop_peer() { # name
 # about to destroy — the rename path, which writes a name that has no record of
 # its own, so the preserve branch below cannot see the fields it exists to keep.
 # A record already at $name always wins over them: it is the more recent truth.
+#
+# The stamp this writes is `last_registered`, and the name is load-bearing. It
+# was `last_seen` through 0.15.0, and every write of it is right here — nothing in
+# a send, a poll, or the watcher touches it — so on a session that registered once
+# at startup and then worked for hours it reads hours stale WHILE the peer is
+# listening and delivering. An agent read exactly that, off the raw record, and
+# concluded the peer was dead; `bridger peers` never printed the field, so the CLI
+# gave it nothing to correct the guess with. Liveness is the beat file and only the
+# beat file — see peer_status. This says when the peer last registered, which is
+# what `reap` and the monitor want to know, and now it says so in its name.
 write_peer() { # name dir [summary] [created]
   local name="$1" dir="$2" summary="${3:-}" created="${4:-}" session="${BRIDGER_SESSION_ID:-}"
   # The sink refuses too, because every caller that lost its directory produced
@@ -959,9 +969,10 @@ write_peer() { # name dir [summary] [created]
   tmp=$(mktemp "$(peer_file "$name").XXXXXX")
   jq -n --arg name "$name" --arg cwd "$dir" --arg created "$created" \
         --arg repo "$(repo_id "$dir")" --arg branch "$(git_branch "$dir")" \
-        --arg summary "$summary" --arg seen "$(now_utc)" --arg session "$session" \
+        --arg summary "$summary" --arg registered "$(now_utc)" --arg session "$session" \
     '{name: $name, cwd: $cwd, repo: $repo, branch: $branch,
-      summary: $summary, session: $session, created: $created, last_seen: $seen}' \
+      summary: $summary, session: $session, created: $created,
+      last_registered: $registered}' \
     > "$tmp"
   mv "$tmp" "$(peer_file "$name")"
   peer_unlock "$name"
@@ -1142,7 +1153,7 @@ derive_and_register() { # dir [tagged]
   local dir="$1" existing base name cwd n=2
   existing=$(PWD="$dir" resolve_identity) || true
   if [ -n "${existing:-}" ]; then
-    # Refresh branch/last_seen — the identity itself stays put.
+    # Refresh branch/last_registered — the identity itself stays put.
     #
     # As a COMMAND, not an argument. In argument position a failure here is
     # discarded — neither errexit nor `|| die` can see it — so a record deleted

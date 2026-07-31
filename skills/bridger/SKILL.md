@@ -132,6 +132,17 @@ from a live session that never armed a watch — registration does not start
 one. A `queued` peer is registered, addressable, and receiving. Never skip an
 ask because of it; the only test of reachability is `ask` with a `--timeout`.
 
+**The peer record is not a liveness signal either.** Read peers through
+`bridger peers`, never by opening `~/.claude/bridger/peers/<name>.json`. No
+field in that file tracks contact: `created` and `last_registered` are both
+registration stamps, refreshed when the session registers and at no other time,
+so a peer that has been listening and delivering for hours still carries an
+hours-old stamp. An agent that read the old name for that field (`last_seen`,
+pre-0.16) reported a working peer as dead on the strength of it. Liveness lives
+in `<name>.beat`, which `peers` already reads for you — and even that only
+answers "is a watcher running", not "will this peer reply". Only `ask` answers
+that.
+
 **Arming the watch is not optional, and registering does not do it.**
 `bridger register` makes this session addressable — it can be named, and it can
 send. Receiving is a separate step: `wait --follow`, run as a persistent

@@ -669,7 +669,12 @@ function renderPeers(snapshot) {
           h("span", { class: "status", title: STATUS_HELP[peer.status] || "" },
             h("span", { class: "dot", "data-status": peer.status }),
             peer.status,
-            peer.status === "listening" ? "" : " · seen " + ago(peer.last_seen_age))),
+            // "registered", not "seen": nothing refreshes this stamp but a
+            // registration, so "seen 4h ago" read as "silent for 4h" on a peer
+            // that had been working the whole time.
+            peer.status === "listening"
+              ? ""
+              : " · registered " + ago(peer.last_registered_age))),
         h("span", {
           class: "sub",
           title: peer.cwd || "",
