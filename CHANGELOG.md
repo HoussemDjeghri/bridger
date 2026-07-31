@@ -4,6 +4,26 @@ All notable changes to bridger are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and bridger uses
 [semantic versioning](https://semver.org/).
 
+## [0.15.0] — 2026-07-31
+
+Thirty-two commits of audit work, and the shape of it is one sentence: every failure this plugin has is silent by construction, so the release is mostly about faults that used to pass without a word.
+
+**A dangling symlink where a message should be stopped being invisible.** The scan's `[ -e ]` skipped it, so the message vanished from every listing with no warning. `max_seq` skipped it too, which was worse: the seq stayed "free", the atomic `ln` failed `EEXIST` while `[ -e ]` reported the target absent, and `send` took the not-a-collision branch and died — permanently, for every future message to that peer, with a permissions error that was false.
+
+**A wedged thread now says so where it matters.** A message that cannot be read stops delivery for the whole thread; `poll --peek`, `poll --json` and a blocked `ask` all reported nothing. The delivery hook said "1 unread" for three that would never move, and `ask` waited out its full timeout for an answer that could not arrive. All three now carry the fault, and `status` reports `N+` rather than a floor presented as a fact.
+
+**`ask bob` drained the whole bus.** It polled every thread, so carol's mail was consumed and her cursor advanced while the content went to stderr — which the delivery hook discards. It polls one thread now, and fails fast when that thread is stuck.
+
+**Two sessions in one repository could take each other's identity.** session-start told a second tab that a live session's name was held by nobody, off a missing heartbeat that the rest of the codebase explicitly refuses to read as death; the loser's badge then kept rendering the name in green, off the *new* owner's heartbeat. Reclaiming a `missing` name is still allowed — it is the only way a deleted worktree is ever recovered — but it now says which directory held the name, how much mail moves with it, and that a session still open there has just lost both. It no longer inherits the previous holder's summary, which is the column agents pick a peer by.
+
+**The monitor stopped disagreeing with the CLI about what it is looking at.** One fifo anywhere in the bus blocked a request thread in `open()` forever; the page polls every two seconds, so an open tab leaked roughly 1800 permanently-stuck threads an hour and answered 200 again the moment the fifo was gone. And a thread the CLI refuses to deliver rendered as a routine amber "2 queued" — it now reads `N+`, in red, and names the file.
+
+**Under concurrency, a lock that was merely contended could fail the write.** `peer_lock` inferred "this can never succeed" from the lock being absent when it looked — which is also exactly what a holder releasing between two syscalls looks like. The write then died quoting mkdir's own "File exists", the error that proves the lock *was* held and waiting was right. Load-dependent: one failure per 150–360 writes in a standalone harness, and one self-check run in three. It asks the bus directly now, and a second obstruction can no longer be confused with a lock taken mid-check — 0 failures in 600 concurrent writes to one record.
+
+Also: a derived name can no longer exceed the length its own validator accepts (which made a peer mute in both directions and broke `@all` for everyone else); `dormant` no longer offers an address-less record as reclaimable in every directory on the machine; a rename keeps the summary and the created stamp; a killed `poll` cleans up its scratch file; `send` into an unwritable thread names the bus instead of printing a raw `mkstemp` error; the stuck-thread notice names what was observed rather than asserting a permission that a full disk does not have; and the "this session is now registered" nudge — which fired off any command that merely mentioned the phrase — now claims only what it checked, once per session.
+
+The self-check went from 81 assertions to 101, and the monitor's own from 46 checks to 59. Every fix here was mutation-verified: the guard was reverted in a fresh copy of the tree and the suite confirmed red before the fix was kept. One exception, stated because it is the honest one — the leaked scratch file is a signal race, so an assertion on it would be flaky in the direction that blocks a release; it was verified by hand against a mutant instead (0 leaked with the fix, 2 without, same six kills).
+
 ## [0.14.0] — 2026-07-30
 
 A backlog used to be able to lock a session out of its own mail permanently. The unread scan forked one `jq` per unread message, and the delivery hooks — the only thing that reaches a session with no watcher — call it under a 5s timeout. Past roughly 1400 unread the hook was killed mid-scan on every single invocation, its output discarded, and because `--peek` deliberately never consumes, the backlog could not shrink. Every tool call and every prompt repeated the same timeout with the same zero bytes, with no error anywhere.
@@ -169,6 +189,7 @@ Also updated: the bridger skill, `/bridger:peers`, the `SessionStart` guidance, 
   fresh heartbeat, a second session is refused that name; once the holder goes
   away, the name can be taken over — how a restarted session reclaims its role.
 
+[0.15.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.15.0
 [0.14.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.14.0
 [0.13.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.13.0
 [0.12.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.12.0
