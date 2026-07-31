@@ -4,6 +4,12 @@ All notable changes to bridger are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and bridger uses
 [semantic versioning](https://semver.org/).
 
+## [0.16.0] — 2026-07-31
+
+**The peer record's `last_seen` is now `last_registered`.** Nothing but a registration ever wrote that field — not a send, not a poll, not the watcher — so a session that registered at startup and then worked for hours carried a stamp hours old while its watcher was beating and delivering the whole time. Measured before the rename: eleven minutes under an armed watcher, status `[listening]` throughout, beat advancing every cycle, stamp unmoved. `bridger peers` never printed the field, so an agent that read it straight off `peers/<name>.json` had nothing to correct it with, took "seen" at its word, and reported a live peer as dead — the one conclusion no bridger status is entitled to. The field kept its value and its refresh rule; only the name changed, to the thing that actually refreshes it. Liveness was, and remains, the beat file alone.
+
+Records written by an older bridger keep working: the monitor reads `last_registered` and falls back to `last_seen`, and a record with neither renders an unknown age, never a dead peer. No migration, no dual-write — the value means exactly what the new name says, and the old records get the new key when their session next registers.
+
 ## [0.15.0] — 2026-07-31
 
 Thirty-two commits of audit work, and the shape of it is one sentence: every failure this plugin has is silent by construction, so the release is mostly about faults that used to pass without a word.
@@ -189,6 +195,7 @@ Also updated: the bridger skill, `/bridger:peers`, the `SessionStart` guidance, 
   fresh heartbeat, a second session is refused that name; once the holder goes
   away, the name can be taken over — how a restarted session reclaims its role.
 
+[0.16.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.16.0
 [0.15.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.15.0
 [0.14.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.14.0
 [0.13.0]: https://github.com/HoussemDjeghri/bridger/releases/tag/v0.13.0
